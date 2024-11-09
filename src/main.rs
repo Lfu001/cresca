@@ -104,7 +104,16 @@ fn is_review_branch() -> bool {
     branch_name.starts_with("review")
 }
 
-/// Prepare the review branch by merging the development branch without committing
+/// Prepare the review branch by merging the development branch without committing.
+///
+/// # Arguments
+///
+/// * `to_branch` - The branch where the PR is planned to be merged into.
+/// * `from_branch` - The development branch to be reviewed.
+///
+/// # Panics
+///
+/// Panics if the git command fails.
 fn prepare_review_branch(to_branch: &str, from_branch: &str) {
     let review_branch = format!("review-{}-{}", to_branch, from_branch);
 
@@ -173,6 +182,15 @@ fn prepare_review_branch(to_branch: &str, from_branch: &str) {
 }
 
 /// Commit reviewed changes and discard unreviewed ones
+///
+/// # Panics
+///
+/// Panics if the git command fails.
+///
+/// # Returns
+///
+/// * `Ok(())` - If there are staged changes
+/// * `Err(())` - If there are no staged changes
 fn approve_changes() -> Result<(), ()> {
     // Check if there are staged changes
     let has_staged_changes = Command::new("git")
