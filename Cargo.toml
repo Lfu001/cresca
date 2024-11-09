@@ -1,6 +1,10 @@
 [package]
 name = "cresca"
 version = "0.1.0"
+authors = ["Lfu001 <goodspeed913@gmail.com>"]
+description = "A tool to partially review the pull requests."
+repository = "https://github.com/Lfu001/cresca"
+license = "MIT"
 edition = "2021"
 
 [dependencies]
