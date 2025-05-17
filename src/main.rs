@@ -89,15 +89,16 @@ fn main() {
 ///
 /// * `description` - The description of the git command.
 /// * `args` - The arguments to pass to the git command.
+/// * `maybe_error` - Whether the git command might fail intentionally.
 ///
 /// # Returns
 ///
 /// * `std::process::Output` - The output of the git command.
-fn run_git_command(description: &str, args: &[&str]) -> Output {
+fn run_git_command(description: &str, args: &[&str], maybe_error: bool) -> Output {
     let output = Command::new("git").args(args).output();
     match output {
         Ok(output) => {
-            if !output.status.success() {
+            if !output.status.success() && !maybe_error {
                 eprintln!("{}: Failed to {}.", "error".red().bold(), description);
                 eprintln!("Original error from git:");
                 eprintln!("\t{}", String::from_utf8_lossy(&output.stderr));
@@ -115,14 +116,22 @@ fn run_git_command(description: &str, args: &[&str]) -> Output {
 
 /// Check if the working directory is clean
 fn is_clean() -> bool {
-    run_git_command("check working directory status", &["status", "--porcelain"])
-        .stdout
-        .is_empty()
+    run_git_command(
+        "check working directory status",
+        &["status", "--porcelain"],
+        false,
+    )
+    .stdout
+    .is_empty()
 }
 
 /// Check if the current branch is a review branch
 fn is_review_branch() -> bool {
-    let output = run_git_command("get current branch", &["rev-parse", "--abbrev-ref", "HEAD"]);
+    let output = run_git_command(
+        "get current branch",
+        &["rev-parse", "--abbrev-ref", "HEAD"],
+        false,
+    );
     let branch_name = String::from_utf8_lossy(&output.stdout).trim().to_string();
     branch_name.starts_with("review")
 }
@@ -140,33 +149,50 @@ fn prepare_review_branch(to_branch: &str, from_branch: &str) {
     run_git_command(
         &format!("switch to {} branch", from_branch),
         &["switch", from_branch],
+        false,
     );
     run_git_command(
         &format!("pull {} branch", from_branch),
         &["pull", "origin", from_branch],
+        false,
     );
     run_git_command(
         &format!("switch to {} branch", to_branch),
         &["switch", to_branch],
+        false,
     );
     run_git_command(
         &format!("pull {} branch", to_branch),
         &["pull", "origin", to_branch],
+        false,
     );
 
     // Check if review branch exists
     let review_branch_exists = run_git_command(
-        "verify review branch",
-        &["rev-parse", "--verify", &review_branch],
+        "check existence of review branch",
+        &[
+            "show-ref",
+            "--verify",
+            &format!("refs/heads/{}", review_branch),
+        ],
+        true,
     )
     .status
     .success();
 
     // Create or switch to review branch
     if review_branch_exists {
-        run_git_command("switch to review branch", &["switch", &review_branch]);
+        run_git_command(
+            "switch to review branch",
+            &["switch", &review_branch],
+            false,
+        );
     } else {
-        run_git_command("create review branch", &["checkout", "-b", &review_branch]);
+        run_git_command(
+            "create review branch",
+            &["checkout", "-b", &review_branch],
+            false,
+        );
     }
 
     // Merge unreviewed changes
@@ -182,10 +208,11 @@ fn prepare_review_branch(to_branch: &str, from_branch: &str) {
             "theirs",
             from_branch,
         ],
+        false,
     );
 
     // Unstage changes
-    run_git_command("unstage changes", &["reset"]);
+    run_git_command("unstage changes", &["reset"], false);
 }
 
 /// Commit reviewed changes and discard unreviewed ones
@@ -196,7 +223,7 @@ fn prepare_review_branch(to_branch: &str, from_branch: &str) {
 /// * `Err(())` - If there are no staged changes
 fn approve_changes() -> Result<(), ()> {
     // Check if there are staged changes
-    let has_staged_changes = run_git_command("check staged changes", &["diff", "--cached"])
+    let has_staged_changes = run_git_command("check staged changes", &["diff", "--cached"], false)
         .stdout
         .is_empty()
         .not();
@@ -205,14 +232,16 @@ fn approve_changes() -> Result<(), ()> {
         run_git_command(
             "commit reviewed changes",
             &["commit", "--quiet", "-m", "Approve reviewed changes"],
+            false,
         );
     }
 
     run_git_command(
         "discard unreviewed changes",
         &["restore", "--source=HEAD", "--worktree", "--", "."],
+        false,
     );
-    run_git_command("discard untracked files", &["clean", "-fd"]);
+    run_git_command("discard untracked files", &["clean", "-fd"], false);
 
     match has_staged_changes {
         true => Ok(()),
