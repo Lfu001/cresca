@@ -153,28 +153,6 @@ fn prepare_review_branch(to_branch: &str, from_branch: &str) {
         &format!("pull {} branch", to_branch),
         &["pull", "origin", to_branch],
     );
-    run_git_command(
-        "switch to review branch",
-        &["checkout", "-b", &review_branch],
-    );
-    run_git_command(
-        &format!("merge {} branch", from_branch),
-        &[
-            "merge",
-            "--quiet",
-            "--no-stat",
-            "--no-commit",
-            "--no-ff",
-            "-X",
-            "theirs",
-            from_branch,
-        ],
-    );
-    run_git_command("reset changes", &["reset"]);
-    run_git_command(
-        &format!("pull {} branch", to_branch),
-        &["pull", "origin", to_branch],
-    );
 
     // Check if review branch exists
     let review_branch_exists = run_git_command(
