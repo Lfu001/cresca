@@ -2,7 +2,7 @@ use clap::builder::styling::{AnsiColor, Effects};
 use clap::{builder::Styles, Args, Parser, Subcommand};
 use colored::Colorize;
 use std::ops::Not;
-use std::process::{exit, Command};
+use std::process::{exit, Command, Output};
 
 const STYLES: Styles = Styles::styled()
     .header(AnsiColor::Green.on_default().effects(Effects::BOLD))
@@ -83,23 +83,55 @@ fn main() {
     }
 }
 
+/// Run a git command and return the output
+///
+/// # Arguments
+///
+/// * `description` - The description of the git command.
+/// * `args` - The arguments to pass to the git command.
+/// * `maybe_error` - Whether the git command might fail intentionally.
+///
+/// # Returns
+///
+/// * `std::process::Output` - The output of the git command.
+fn run_git_command(description: &str, args: &[&str], maybe_error: bool) -> Output {
+    let output = Command::new("git").args(args).output();
+    match output {
+        Ok(output) => {
+            if !output.status.success() && !maybe_error {
+                eprintln!("{}: Failed to {}.", "error".red().bold(), description);
+                eprintln!("Original error from git:");
+                eprintln!("\t{}", String::from_utf8_lossy(&output.stderr));
+                exit(1);
+            }
+            output
+        }
+        Err(e) => {
+            eprintln!("{}: Failed to {}.", "error".red().bold(), description);
+            eprintln!("{}", e);
+            exit(1);
+        }
+    }
+}
+
 /// Check if the working directory is clean
 fn is_clean() -> bool {
-    Command::new("git")
-        .args(["status", "--porcelain"])
-        .output()
-        .expect("Failed to check working directory status")
-        .stdout
-        .is_empty()
+    run_git_command(
+        "check working directory status",
+        &["status", "--porcelain"],
+        false,
+    )
+    .stdout
+    .is_empty()
 }
 
 /// Check if the current branch is a review branch
 fn is_review_branch() -> bool {
-    let output = Command::new("git")
-        .args(["rev-parse", "--abbrev-ref", "HEAD"])
-        .stdout(std::process::Stdio::piped())
-        .output()
-        .expect("Failed to get current branch");
+    let output = run_git_command(
+        "get current branch",
+        &["rev-parse", "--abbrev-ref", "HEAD"],
+        false,
+    );
     let branch_name = String::from_utf8_lossy(&output.stdout).trim().to_string();
     branch_name.starts_with("review")
 }
@@ -110,56 +142,63 @@ fn is_review_branch() -> bool {
 ///
 /// * `to_branch` - The branch where the PR is planned to be merged into.
 /// * `from_branch` - The development branch to be reviewed.
-///
-/// # Panics
-///
-/// Panics if the git command fails.
 fn prepare_review_branch(to_branch: &str, from_branch: &str) {
     let review_branch = format!("review-{}-{}", to_branch, from_branch);
 
     // Pull both branches
-    let _ = Command::new("git")
-        .args(["switch", "--quiet", from_branch])
-        .status()
-        .expect("Failed to switch to development branch");
-    let _ = Command::new("git")
-        .args(["pull", "--quiet", "origin", from_branch])
-        .status()
-        .expect("Failed to pull development branch");
-    let _ = Command::new("git")
-        .args(["switch", "--quiet", to_branch])
-        .status()
-        .expect("Failed to switch to main branch");
-    let _ = Command::new("git")
-        .args(["pull", "--quiet", "origin", to_branch])
-        .status()
-        .expect("Failed to pull main branch");
+    run_git_command(
+        &format!("switch to {} branch", from_branch),
+        &["switch", from_branch],
+        false,
+    );
+    run_git_command(
+        &format!("pull {} branch", from_branch),
+        &["pull", "origin", from_branch],
+        false,
+    );
+    run_git_command(
+        &format!("switch to {} branch", to_branch),
+        &["switch", to_branch],
+        false,
+    );
+    run_git_command(
+        &format!("pull {} branch", to_branch),
+        &["pull", "origin", to_branch],
+        false,
+    );
 
     // Check if review branch exists
-    let review_branch_exists = Command::new("git")
-        .args(["rev-parse", "--verify", &review_branch])
-        .stdout(std::process::Stdio::null())
-        .status()
-        .expect("Failed to verify review branch")
-        .success();
+    let review_branch_exists = run_git_command(
+        "check existence of review branch",
+        &[
+            "show-ref",
+            "--verify",
+            &format!("refs/heads/{}", review_branch),
+        ],
+        true,
+    )
+    .status
+    .success();
 
     // Create or switch to review branch
     if review_branch_exists {
-        Command::new("git")
-            .args(["switch", "--quiet", &review_branch])
-            .status()
-            .expect("Failed to switch to review branch");
+        run_git_command(
+            "switch to review branch",
+            &["switch", &review_branch],
+            false,
+        );
     } else {
-        Command::new("git")
-            .args(["checkout", "--quiet", "-b", &review_branch])
-            .stdout(std::process::Stdio::null())
-            .status()
-            .expect("Failed to create review branch");
+        run_git_command(
+            "create review branch",
+            &["checkout", "-b", &review_branch],
+            false,
+        );
     }
 
     // Merge unreviewed changes
-    Command::new("git")
-        .args([
+    run_git_command(
+        "merge unreviewed changes",
+        &[
             "merge",
             "--quiet",
             "--no-stat",
@@ -168,24 +207,15 @@ fn prepare_review_branch(to_branch: &str, from_branch: &str) {
             "-X",
             "theirs",
             from_branch,
-        ])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .expect("Failed to collect unreviewed changes");
+        ],
+        false,
+    );
 
     // Unstage changes
-    Command::new("git")
-        .args(["reset", "--quiet"])
-        .status()
-        .expect("Failed to unstage changes");
+    run_git_command("unstage changes", &["reset"], false);
 }
 
 /// Commit reviewed changes and discard unreviewed ones
-///
-/// # Panics
-///
-/// Panics if the git command fails.
 ///
 /// # Returns
 ///
@@ -193,36 +223,25 @@ fn prepare_review_branch(to_branch: &str, from_branch: &str) {
 /// * `Err(())` - If there are no staged changes
 fn approve_changes() -> Result<(), ()> {
     // Check if there are staged changes
-    let has_staged_changes = Command::new("git")
-        .args(["diff", "--cached"])
-        .output()
-        .expect("Failed to check staged changes")
+    let has_staged_changes = run_git_command("check staged changes", &["diff", "--cached"], false)
         .stdout
         .is_empty()
         .not();
 
     if has_staged_changes {
-        Command::new("git")
-            .args(["commit", "--quiet", "-m", "Approve reviewed changes"])
-            .status()
-            .expect("Failed to commit reviewed changes");
+        run_git_command(
+            "commit reviewed changes",
+            &["commit", "--quiet", "-m", "Approve reviewed changes"],
+            false,
+        );
     }
 
-    Command::new("git")
-        .args([
-            "restore",
-            "--quiet",
-            "--source=HEAD",
-            "--worktree",
-            "--",
-            ".",
-        ])
-        .status()
-        .expect("Failed to discard unreviewed changes");
-    Command::new("git")
-        .args(["clean", "-fd", "--quiet"])
-        .status()
-        .expect("Failed to discard untracked files");
+    run_git_command(
+        "discard unreviewed changes",
+        &["restore", "--source=HEAD", "--worktree", "--", "."],
+        false,
+    );
+    run_git_command("discard untracked files", &["clean", "-fd"], false);
 
     match has_staged_changes {
         true => Ok(()),
