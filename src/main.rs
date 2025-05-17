@@ -71,7 +71,7 @@ fn main() {
             }
         }
         Commands::Review(args) => {
-            if !is_clean() {
+            if !is_clean(cli.verbose) {
                 eprintln!("{}: Uncommitted changes found. Please commit or stash them before starting review.", "error".red().bold());
                 exit(1);
             }
