@@ -46,6 +46,10 @@ struct ReviewArgs {
     to: String,
     /// The development branch to be reviewed.
     from: String,
+    /// Skip to this commit (auto-approve earlier commits).
+    /// Use `git log --oneline <to>..<from>` to see available commits.
+    #[arg(long = "skip-to")]
+    skip_to: Option<String>,
 }
 
 fn main() {
@@ -76,7 +80,7 @@ fn main() {
                 exit(1);
             }
 
-            prepare_review_branch(&args.to, &args.from, cli.verbose);
+            prepare_review_branch(&args.to, &args.from, args.skip_to.as_deref(), cli.verbose);
             if is_clean(cli.verbose) {
                 println!("Review branch prepared successfully. However, it seems like there are no unreviewed changes.");
             } else {
@@ -156,17 +160,18 @@ fn is_review_branch(verbose: bool) -> bool {
     branch_name.starts_with("review")
 }
 
-/// Prepare the review branch by merging the development branch without committing.
+/// Prepare the review branch using Squash Merge approach.
 ///
 /// # Arguments
 ///
 /// * `to_branch` - The branch where the PR is planned to be merged into.
 /// * `from_branch` - The development branch to be reviewed.
+/// * `skip_to` - Optional commit hash to skip to (auto-approve earlier commits).
 /// * `verbose` - Whether to print the git command and its output.
-fn prepare_review_branch(to_branch: &str, from_branch: &str, verbose: bool) {
+fn prepare_review_branch(to_branch: &str, from_branch: &str, skip_to: Option<&str>, verbose: bool) {
     let review_branch = format!("review-{}-{}", to_branch, from_branch);
 
-    // Pull both branches
+    // Fetch and update both branches
     run_git_command(
         &format!("switch to {} branch", from_branch),
         &["switch", from_branch],
@@ -192,6 +197,39 @@ fn prepare_review_branch(to_branch: &str, from_branch: &str, verbose: bool) {
         verbose,
     );
 
+    // Get merge-base
+    let merge_base_output = run_git_command(
+        "get merge base",
+        &["merge-base", to_branch, from_branch],
+        false,
+        verbose,
+    );
+    let merge_base = String::from_utf8_lossy(&merge_base_output.stdout)
+        .trim()
+        .to_string();
+
+    // Validate skip_to if provided
+    if let Some(hash) = skip_to {
+        let valid_commits = run_git_command(
+            "get valid commit range",
+            &["rev-list", &format!("{}..{}", merge_base, from_branch)],
+            false,
+            verbose,
+        );
+        let valid_list = String::from_utf8_lossy(&valid_commits.stdout);
+        let is_valid = valid_list.lines().any(|line| line.starts_with(hash));
+        if !is_valid {
+            eprintln!(
+                "{}: Commit {} is not in the range {}..{}",
+                "error".red().bold(),
+                hash,
+                to_branch,
+                from_branch
+            );
+            exit(1);
+        }
+    }
+
     // Check if review branch exists
     let review_branch_exists = run_git_command(
         "check existence of review branch",
@@ -206,8 +244,8 @@ fn prepare_review_branch(to_branch: &str, from_branch: &str, verbose: bool) {
     .status
     .success();
 
-    // Create or switch to review branch
     if review_branch_exists {
+        // Switch to existing review branch
         run_git_command(
             "switch to review branch",
             &["switch", &review_branch],
@@ -215,33 +253,74 @@ fn prepare_review_branch(to_branch: &str, from_branch: &str, verbose: bool) {
             verbose,
         );
     } else {
+        // Create review branch from merge-base
         run_git_command(
-            "create review branch",
-            &["checkout", "-b", &review_branch],
+            "create review branch from merge-base",
+            &["checkout", "-b", &review_branch, &merge_base],
             false,
             verbose,
         );
     }
 
-    // Merge unreviewed changes
+    // Determine target commit for squash merge
+    let target_commit = if let Some(hash) = skip_to {
+        // Auto-approve commits before skip_to by squash merging them
+        let parent = format!("{}^", hash);
+
+        // Check if there are commits before skip_to
+        let has_earlier = run_git_command(
+            "check earlier commits",
+            &["rev-list", &format!("{}..{}", merge_base, &parent)],
+            true,
+            verbose,
+        );
+
+        if !has_earlier.stdout.is_empty() {
+            run_git_command(
+                "auto-approve earlier commits",
+                &[
+                    "merge",
+                    "--squash",
+                    "--quiet",
+                    "--no-stat",
+                    "-X",
+                    "theirs",
+                    &parent,
+                ],
+                false,
+                verbose,
+            );
+            run_git_command(
+                "commit auto-approved changes",
+                &["commit", "--quiet", "-m", "Auto-approve earlier commits"],
+                false,
+                verbose,
+            );
+        }
+
+        from_branch.to_string()
+    } else {
+        from_branch.to_string()
+    };
+
+    // Squash merge remaining changes
     run_git_command(
-        "merge unreviewed changes",
+        "squash merge remaining changes",
         &[
             "merge",
+            "--squash",
             "--quiet",
             "--no-stat",
-            "--no-commit",
-            "--no-ff",
             "-X",
             "theirs",
-            from_branch,
+            &target_commit,
         ],
         false,
         verbose,
     );
 
-    // Unstage changes
-    run_git_command("unstage changes", &["reset"], false, verbose);
+    // Unstage changes for review
+    run_git_command("unstage changes for review", &["reset"], false, verbose);
 }
 
 /// Commit reviewed changes and discard unreviewed ones

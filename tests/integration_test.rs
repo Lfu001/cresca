@@ -208,3 +208,106 @@ fn test_review_updates_existing_branch() {
         "file2.txt should appear as new unreviewed change"
     );
 }
+
+/// Test that `cresca review --skip-to` auto-approves earlier commits.
+#[test]
+fn test_review_with_skip_to_option() {
+    let repo = TempGitRepo::new();
+
+    // Create develop branch with multiple commits
+    repo.create_branch("develop");
+    repo.write_file("file1.txt", "content 1");
+    repo.git(&["add", "."]);
+    repo.commit("Add file1");
+
+    repo.write_file("file2.txt", "content 2");
+    repo.git(&["add", "."]);
+    repo.commit("Add file2");
+
+    repo.write_file("file3.txt", "content 3");
+    repo.git(&["add", "."]);
+    repo.commit("Add file3");
+
+    repo.git(&["push", "-u", "origin", "develop"]);
+
+    // Get the hash of second commit (file2)
+    let log_output = repo.git(&["log", "--oneline", "main..develop"]);
+    let log_str = String::from_utf8_lossy(&log_output.stdout);
+    let commits: Vec<&str> = log_str.lines().collect();
+    // commits[0] = file3, commits[1] = file2, commits[2] = file1
+    let file2_hash = commits[1].split_whitespace().next().unwrap();
+
+    // Switch back to main
+    repo.switch_branch("main");
+
+    // Run cresca review with --skip-to option (skip to file2 commit)
+    let output = repo.run_cresca(&["review", "main", "develop", "--skip-to", file2_hash]);
+    assert!(
+        output.status.success(),
+        "cresca review --skip-to should succeed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Verify: file1.txt should be auto-approved (committed)
+    let files_in_head = repo.git(&["ls-tree", "--name-only", "HEAD"]);
+    let files_str = String::from_utf8_lossy(&files_in_head.stdout);
+    assert!(
+        files_str.contains("file1.txt"),
+        "file1.txt should be auto-approved and committed"
+    );
+
+    // Verify: file2.txt and file3.txt should be unstaged changes
+    let status = repo.git(&["status", "--porcelain"]);
+    let status_str = String::from_utf8_lossy(&status.stdout);
+    assert!(
+        status_str.contains("file2.txt"),
+        "file2.txt should be an unstaged change"
+    );
+    assert!(
+        status_str.contains("file3.txt"),
+        "file3.txt should be an unstaged change"
+    );
+}
+
+/// Test that `cresca review --skip-to` with already approved commits works correctly.
+#[test]
+fn test_review_with_skip_to_already_approved() {
+    let repo = TempGitRepo::new();
+
+    // Create develop branch with multiple commits
+    repo.create_branch("develop");
+    repo.write_file("file1.txt", "content 1");
+    repo.git(&["add", "."]);
+    repo.commit("Add file1");
+
+    repo.write_file("file2.txt", "content 2");
+    repo.git(&["add", "."]);
+    repo.commit("Add file2");
+
+    repo.git(&["push", "-u", "origin", "develop"]);
+
+    // Get hashes
+    let log_output = repo.git(&["log", "--oneline", "main..develop"]);
+    let log_str = String::from_utf8_lossy(&log_output.stdout);
+    let commits: Vec<&str> = log_str.lines().collect();
+    let file2_hash = commits[0].split_whitespace().next().unwrap();
+    let file1_hash = commits[1].split_whitespace().next().unwrap();
+
+    // Switch back to main and do first review with --skip-to file2 (file1 auto-approved)
+    repo.switch_branch("main");
+    repo.run_cresca(&["review", "main", "develop", "--skip-to", file2_hash]);
+
+    // Approve file2
+    repo.git(&["add", "."]);
+    repo.run_cresca(&["approve"]);
+
+    // Now try to run review again with --skip-to file1 (file1 already committed)
+    let output = repo.run_cresca(&["review", "main", "develop", "--skip-to", file1_hash]);
+    assert!(
+        output.status.success(),
+        "cresca review --skip-to with already approved commits should succeed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
