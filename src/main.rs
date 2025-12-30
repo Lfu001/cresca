@@ -56,6 +56,10 @@ struct ReviewArgs {
     /// Use `git log --oneline <to>..<from>` to see available commits.
     #[arg(long = "skip-to")]
     skip_to: Option<String>,
+    /// Stop at this commit (exclude later commits from review).
+    /// Use `git log --oneline <to>..<from>` to see available commits.
+    #[arg(long = "stop-at")]
+    stop_at: Option<String>,
 }
 
 fn main() {
@@ -86,7 +90,13 @@ fn main() {
                 exit(1);
             }
 
-            prepare_review_branch(&args.to, &args.from, args.skip_to.as_deref(), cli.verbose);
+            prepare_review_branch(
+                &args.to,
+                &args.from,
+                args.skip_to.as_deref(),
+                args.stop_at.as_deref(),
+                cli.verbose,
+            );
             if is_clean(cli.verbose) {
                 println!("Review branch prepared successfully. However, it seems like there are no unreviewed changes.");
             } else {
