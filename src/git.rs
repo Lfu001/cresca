@@ -75,3 +75,35 @@ pub fn is_review_branch(verbose: bool) -> bool {
     let branch_name = String::from_utf8_lossy(&output.stdout).trim().to_string();
     branch_name.starts_with("review")
 }
+
+/// Get review branch info (to_branch, from_branch) from current branch name
+///
+/// # Arguments
+///
+/// * `verbose` - Whether to print the git command and its output.
+///
+/// # Returns
+///
+/// * `Option<(String, String)>` - (to_branch, from_branch) if on a review branch, None otherwise
+pub fn get_review_branch_info(verbose: bool) -> Option<(String, String)> {
+    let output = run_git_command(
+        "get current branch",
+        &["rev-parse", "--abbrev-ref", "HEAD"],
+        false,
+        verbose,
+    );
+    let branch_name = String::from_utf8_lossy(&output.stdout).trim().to_string();
+
+    if !branch_name.starts_with("review-") {
+        return None;
+    }
+
+    // Parse "review-{to}-{from}" format
+    let rest = branch_name.strip_prefix("review-")?;
+    let parts: Vec<&str> = rest.splitn(2, '-').collect();
+    if parts.len() == 2 {
+        Some((parts[0].to_string(), parts[1].to_string()))
+    } else {
+        None
+    }
+}
