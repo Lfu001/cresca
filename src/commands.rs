@@ -215,3 +215,78 @@ pub fn approve_changes(verbose: bool) -> Result<(), ()> {
         false => Err(()),
     }
 }
+
+/// Review status information
+pub struct ReviewStatus {
+    pub from_branch: String,
+    pub file_count: usize,
+    pub insertions: usize,
+    pub deletions: usize,
+    pub files: Vec<String>,
+}
+
+/// Get review status (remaining diff stats)
+///
+/// # Arguments
+///
+/// * `from_branch` - The development branch to compare against.
+/// * `verbose` - Whether to print the git command and its output.
+///
+/// # Returns
+///
+/// * `ReviewStatus` - The remaining diff statistics
+pub fn get_review_status(from_branch: &str, verbose: bool) -> ReviewStatus {
+    // Get diff stats summary (use HEAD..branch for direct comparison, not HEAD...branch)
+    let stat_output = run_git_command(
+        "get diff stats",
+        &["diff", "--stat", "HEAD", from_branch],
+        false,
+        verbose,
+    );
+    let stat_str = String::from_utf8_lossy(&stat_output.stdout);
+
+    // Parse stats from last line (e.g., " 4 files changed, 7 insertions(+), 2 deletions(-)")
+    let mut file_count = 0;
+    let mut insertions = 0;
+    let mut deletions = 0;
+
+    if let Some(last_line) = stat_str.lines().last() {
+        for part in last_line.split(',') {
+            let part = part.trim();
+            if part.contains("file") {
+                if let Some(num) = part.split_whitespace().next() {
+                    file_count = num.parse().unwrap_or(0);
+                }
+            } else if part.contains("insertion") {
+                if let Some(num) = part.split_whitespace().next() {
+                    insertions = num.parse().unwrap_or(0);
+                }
+            } else if part.contains("deletion") {
+                if let Some(num) = part.split_whitespace().next() {
+                    deletions = num.parse().unwrap_or(0);
+                }
+            }
+        }
+    }
+
+    // Get list of changed files
+    let files_output = run_git_command(
+        "get changed files",
+        &["diff", "--name-only", "HEAD", from_branch],
+        false,
+        verbose,
+    );
+    let files: Vec<String> = String::from_utf8_lossy(&files_output.stdout)
+        .lines()
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .collect();
+
+    ReviewStatus {
+        from_branch: from_branch.to_string(),
+        file_count,
+        insertions,
+        deletions,
+        files,
+    }
+}

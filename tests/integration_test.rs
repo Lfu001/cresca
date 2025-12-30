@@ -311,3 +311,114 @@ fn test_review_with_skip_to_already_approved() {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+/// Test that `cresca status` shows remaining diff statistics on a review branch.
+#[test]
+fn test_status_shows_diff_stats() {
+    let repo = TempGitRepo::new();
+
+    // Create a develop branch with some changes
+    repo.create_branch("develop");
+    repo.write_file("feature1.txt", "new feature 1");
+    repo.write_file("feature2.txt", "new feature 2");
+    repo.git(&["add", "."]);
+    repo.commit("Add features");
+    repo.git(&["push", "-u", "origin", "develop"]);
+
+    // Switch back to main and run review
+    repo.switch_branch("main");
+    repo.run_cresca(&["review", "main", "develop"]);
+
+    // Run status
+    let output = repo.run_cresca(&["status"]);
+    assert!(
+        output.status.success(),
+        "cresca status should succeed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("Review status"),
+        "Should show review status header"
+    );
+    assert!(
+        stdout.contains("Remaining diff to develop"),
+        "Should mention develop branch"
+    );
+    assert!(stdout.contains("2 file(s)"), "Should show 2 files changed");
+    assert!(stdout.contains("feature1.txt"), "Should list feature1.txt");
+    assert!(stdout.contains("feature2.txt"), "Should list feature2.txt");
+}
+
+/// Test that `cresca status` fails on a non-review branch.
+#[test]
+fn test_status_on_non_review_branch() {
+    let repo = TempGitRepo::new();
+
+    // Try to run status on main (not a review branch)
+    let output = repo.run_cresca(&["status"]);
+
+    assert!(
+        !output.status.success(),
+        "cresca status should fail on non-review branch"
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("error") || stderr.contains("Not on a review branch"),
+        "Should show error message about not being on review branch"
+    );
+}
+
+/// Test that `cresca status` updates after partial approval.
+#[test]
+fn test_status_after_partial_approval() {
+    let repo = TempGitRepo::new();
+
+    // Create develop branch with multiple files
+    repo.create_branch("develop");
+    repo.write_file("file1.txt", "content 1");
+    repo.write_file("file2.txt", "content 2");
+    repo.write_file("file3.txt", "content 3");
+    repo.git(&["add", "."]);
+    repo.commit("Add three files");
+    repo.git(&["push", "-u", "origin", "develop"]);
+
+    // Switch back to main and run review
+    repo.switch_branch("main");
+    repo.run_cresca(&["review", "main", "develop"]);
+
+    // Initial status should show 3 files
+    let output = repo.run_cresca(&["status"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("3 file(s)"),
+        "Should initially show 3 files, got: {}",
+        stdout
+    );
+
+    // Approve only one file
+    repo.git(&["add", "file1.txt"]);
+    repo.run_cresca(&["approve"]);
+
+    // Run review again to see remaining changes
+    repo.run_cresca(&["review", "main", "develop"]);
+
+    // Status should show remaining files (file2.txt and file3.txt)
+    let output = repo.run_cresca(&["status"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    // After partial approval, approved file should not appear in unstaged diff
+    assert!(
+        stdout.contains("file2.txt"),
+        "file2.txt should be in remaining files, got: {}",
+        stdout
+    );
+    assert!(
+        stdout.contains("file3.txt"),
+        "file3.txt should be in remaining files, got: {}",
+        stdout
+    );
+}

@@ -4,8 +4,8 @@ mod git;
 use clap::builder::styling::{AnsiColor, Effects};
 use clap::{builder::Styles, ArgAction, Args, Parser, Subcommand};
 use colored::Colorize;
-use commands::{approve_changes, prepare_review_branch};
-use git::{is_clean, is_review_branch};
+use commands::{approve_changes, get_review_status, prepare_review_branch};
+use git::{get_review_branch_info, is_clean, is_review_branch};
 use std::process::exit;
 
 const STYLES: Styles = Styles::styled()
@@ -42,6 +42,8 @@ enum Commands {
     Approve,
     /// Prepare a review branch.
     Review(ReviewArgs),
+    /// Show remaining diff statistics.
+    Status,
 }
 
 #[derive(Args)]
@@ -89,6 +91,39 @@ fn main() {
                 println!("Review branch prepared successfully. However, it seems like there are no unreviewed changes.");
             } else {
                 println!("Review branch prepared successfully. Stage the changes you have reviewed and run `{}` to approve them.", "cresca approve".green());
+            }
+        }
+        Commands::Status => {
+            if let Some((_, from_branch)) = get_review_branch_info(cli.verbose) {
+                let status = get_review_status(&from_branch, cli.verbose);
+                println!("📋 Review status:");
+                println!(
+                    "  Remaining diff to {}: {} file(s), {} insertion(s), {} deletion(s)",
+                    status.from_branch.green(),
+                    status.file_count.to_string().yellow(),
+                    format!("+{}", status.insertions).green(),
+                    format!("-{}", status.deletions).red()
+                );
+                if !status.files.is_empty() {
+                    const MAX_FILES: usize = 10;
+                    println!("  Files remaining:");
+                    for file in status.files.iter().take(MAX_FILES) {
+                        println!("    - {}", file);
+                    }
+                    if status.files.len() > MAX_FILES {
+                        println!(
+                            "    ... and {} more file(s)",
+                            status.files.len() - MAX_FILES
+                        );
+                    }
+                }
+            } else {
+                eprintln!(
+                    "{}: Not on a review branch; run `{}` to prepare a review branch.",
+                    "error".red().bold(),
+                    "cresca review".green()
+                );
+                exit(1);
             }
         }
     }
