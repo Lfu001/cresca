@@ -1,6 +1,6 @@
 [package]
 name = "cresca"
-version = "0.2.0"
+version = "0.3.0"
 authors = ["Lfu001 <goodspeed913@gmail.com>"]
 description = "A tool to partially review the pull requests."
 repository = "https://github.com/Lfu001/cresca"
