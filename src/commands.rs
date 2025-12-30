@@ -10,11 +10,13 @@ use std::process::exit;
 /// * `to_branch` - The branch where the PR is planned to be merged into.
 /// * `from_branch` - The development branch to be reviewed.
 /// * `skip_to` - Optional commit hash to skip to (auto-approve earlier commits).
+/// * `stop_at` - Optional commit hash to stop at (exclude later commits from review).
 /// * `verbose` - Whether to print the git command and its output.
 pub fn prepare_review_branch(
     to_branch: &str,
     from_branch: &str,
     skip_to: Option<&str>,
+    stop_at: Option<&str>,
     verbose: bool,
 ) {
     let review_branch = format!("review-{}-{}", to_branch, from_branch);
@@ -56,16 +58,19 @@ pub fn prepare_review_branch(
         .trim()
         .to_string();
 
+    // Get valid commit range (merge_base..from_branch)
+    let valid_commits = run_git_command(
+        "get valid commit range",
+        &["rev-list", &format!("{}..{}", merge_base, from_branch)],
+        false,
+        verbose,
+    );
+    let valid_list = String::from_utf8_lossy(&valid_commits.stdout);
+    let valid_hashes: Vec<&str> = valid_list.lines().collect();
+
     // Validate skip_to if provided
     if let Some(hash) = skip_to {
-        let valid_commits = run_git_command(
-            "get valid commit range",
-            &["rev-list", &format!("{}..{}", merge_base, from_branch)],
-            false,
-            verbose,
-        );
-        let valid_list = String::from_utf8_lossy(&valid_commits.stdout);
-        let is_valid = valid_list.lines().any(|line| line.starts_with(hash));
+        let is_valid = valid_hashes.iter().any(|line| line.starts_with(hash));
         if !is_valid {
             eprintln!(
                 "{}: Commit {} is not in the range {}..{}",
@@ -75,6 +80,52 @@ pub fn prepare_review_branch(
                 from_branch
             );
             exit(1);
+        }
+    }
+
+    // Validate stop_at if provided
+    if let Some(hash) = stop_at {
+        // stop_at must be in the valid range
+        let is_valid = valid_hashes.iter().any(|line| line.starts_with(hash));
+        if !is_valid {
+            eprintln!(
+                "{}: Commit {} is not in the range {}..{}",
+                "error".red().bold(),
+                hash,
+                to_branch,
+                from_branch
+            );
+            exit(1);
+        }
+
+        // If skip_to is also specified, stop_at must be at or after skip_to
+        if let Some(skip_hash) = skip_to {
+            let skip_to_commits = run_git_command(
+                "get commits after skip_to",
+                &["rev-list", &format!("{}..{}", skip_hash, from_branch)],
+                false,
+                verbose,
+            );
+            let skip_to_list = String::from_utf8_lossy(&skip_to_commits.stdout);
+            let is_after_skip = skip_to_list.lines().any(|line| line.starts_with(hash))
+                || valid_hashes
+                    .iter()
+                    .any(|line| line.starts_with(hash) && line.starts_with(skip_hash));
+
+            // Check if stop_at equals skip_to (valid) or is after skip_to
+            let stop_at_equals_skip_to = valid_hashes
+                .iter()
+                .any(|line| line.starts_with(hash) && line.starts_with(skip_hash));
+
+            if !is_after_skip && !stop_at_equals_skip_to {
+                eprintln!(
+                    "{}: --stop-at ({}) must be at or after --skip-to ({})",
+                    "error".red().bold(),
+                    hash,
+                    skip_hash
+                );
+                exit(1);
+            }
         }
     }
 
@@ -146,9 +197,11 @@ pub fn prepare_review_branch(
             );
         }
 
-        from_branch.to_string()
+        // Use stop_at if specified, otherwise from_branch
+        stop_at.unwrap_or(from_branch).to_string()
     } else {
-        from_branch.to_string()
+        // Use stop_at if specified, otherwise from_branch
+        stop_at.unwrap_or(from_branch).to_string()
     };
 
     // Squash merge remaining changes

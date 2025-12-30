@@ -422,3 +422,237 @@ fn test_status_after_partial_approval() {
         stdout
     );
 }
+
+/// Test that `cresca review --stop-at` excludes later commits from review.
+#[test]
+fn test_review_with_stop_at_option() {
+    let repo = TempGitRepo::new();
+
+    // Create develop branch with multiple commits
+    repo.create_branch("develop");
+    repo.write_file("file1.txt", "content 1");
+    repo.git(&["add", "."]);
+    repo.commit("Add file1");
+
+    repo.write_file("file2.txt", "content 2");
+    repo.git(&["add", "."]);
+    repo.commit("Add file2");
+
+    repo.write_file("file3.txt", "content 3");
+    repo.git(&["add", "."]);
+    repo.commit("Add file3");
+
+    repo.git(&["push", "-u", "origin", "develop"]);
+
+    // Get the hash of second commit (file2)
+    let log_output = repo.git(&["log", "--oneline", "main..develop"]);
+    let log_str = String::from_utf8_lossy(&log_output.stdout);
+    let commits: Vec<&str> = log_str.lines().collect();
+    // commits[0] = file3, commits[1] = file2, commits[2] = file1
+    let file2_hash = commits[1].split_whitespace().next().unwrap();
+
+    // Switch back to main
+    repo.switch_branch("main");
+
+    // Run cresca review with --stop-at option (stop at file2 commit)
+    let output = repo.run_cresca(&["review", "main", "develop", "--stop-at", file2_hash]);
+    assert!(
+        output.status.success(),
+        "cresca review --stop-at should succeed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Verify: file1.txt and file2.txt should be unstaged changes (in review)
+    let status = repo.git(&["status", "--porcelain"]);
+    let status_str = String::from_utf8_lossy(&status.stdout);
+    assert!(
+        status_str.contains("file1.txt"),
+        "file1.txt should be an unstaged change"
+    );
+    assert!(
+        status_str.contains("file2.txt"),
+        "file2.txt should be an unstaged change"
+    );
+
+    // Verify: file3.txt should NOT appear (excluded from review)
+    assert!(
+        !status_str.contains("file3.txt"),
+        "file3.txt should NOT appear (excluded by --stop-at)"
+    );
+}
+
+/// Test that `cresca review --skip-to --stop-at` limits review to specific range.
+#[test]
+fn test_review_with_skip_to_and_stop_at() {
+    let repo = TempGitRepo::new();
+
+    // Create develop branch with multiple commits: A -> B -> C -> D
+    repo.create_branch("develop");
+    repo.write_file("fileA.txt", "content A");
+    repo.git(&["add", "."]);
+    repo.commit("Add fileA");
+
+    repo.write_file("fileB.txt", "content B");
+    repo.git(&["add", "."]);
+    repo.commit("Add fileB");
+
+    repo.write_file("fileC.txt", "content C");
+    repo.git(&["add", "."]);
+    repo.commit("Add fileC");
+
+    repo.write_file("fileD.txt", "content D");
+    repo.git(&["add", "."]);
+    repo.commit("Add fileD");
+
+    repo.git(&["push", "-u", "origin", "develop"]);
+
+    // Get commit hashes
+    // Log order: D (newest) -> C -> B -> A (oldest)
+    let log_output = repo.git(&["log", "--oneline", "main..develop"]);
+    let log_str = String::from_utf8_lossy(&log_output.stdout);
+    let commits: Vec<&str> = log_str.lines().collect();
+    let _file_d_hash = commits[0].split_whitespace().next().unwrap();
+    let file_c_hash = commits[1].split_whitespace().next().unwrap();
+    let file_b_hash = commits[2].split_whitespace().next().unwrap();
+    let _file_a_hash = commits[3].split_whitespace().next().unwrap();
+
+    // Switch back to main
+    repo.switch_branch("main");
+
+    // Run cresca review: skip A, review B and C, exclude D
+    let output = repo.run_cresca(&[
+        "review",
+        "main",
+        "develop",
+        "--skip-to",
+        file_b_hash,
+        "--stop-at",
+        file_c_hash,
+    ]);
+    assert!(
+        output.status.success(),
+        "cresca review --skip-to --stop-at should succeed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Verify: fileA.txt should be auto-approved (committed)
+    let files_in_head = repo.git(&["ls-tree", "--name-only", "HEAD"]);
+    let files_str = String::from_utf8_lossy(&files_in_head.stdout);
+    assert!(
+        files_str.contains("fileA.txt"),
+        "fileA.txt should be auto-approved and committed"
+    );
+
+    // Verify: fileB.txt and fileC.txt should be unstaged changes (in review)
+    let status = repo.git(&["status", "--porcelain"]);
+    let status_str = String::from_utf8_lossy(&status.stdout);
+    assert!(
+        status_str.contains("fileB.txt"),
+        "fileB.txt should be an unstaged change"
+    );
+    assert!(
+        status_str.contains("fileC.txt"),
+        "fileC.txt should be an unstaged change"
+    );
+
+    // Verify: fileD.txt should NOT appear (excluded by --stop-at)
+    assert!(
+        !status_str.contains("fileD.txt"),
+        "fileD.txt should NOT appear (excluded by --stop-at), got: {}",
+        status_str
+    );
+
+    // Additional check: fileD.txt should not be committed either
+    assert!(
+        !files_str.contains("fileD.txt"),
+        "fileD.txt should not be in HEAD"
+    );
+}
+
+/// Test that `cresca review --stop-at` fails with invalid commit hash.
+#[test]
+fn test_review_with_invalid_stop_at() {
+    let repo = TempGitRepo::new();
+
+    // Create develop branch with a commit
+    repo.create_branch("develop");
+    repo.write_file("file1.txt", "content 1");
+    repo.git(&["add", "."]);
+    repo.commit("Add file1");
+    repo.git(&["push", "-u", "origin", "develop"]);
+
+    // Switch back to main
+    repo.switch_branch("main");
+
+    // Run cresca review with invalid --stop-at hash
+    let output = repo.run_cresca(&["review", "main", "develop", "--stop-at", "invalidhash"]);
+
+    assert!(
+        !output.status.success(),
+        "cresca review --stop-at with invalid hash should fail"
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("error") && stderr.contains("invalidhash"),
+        "Should show error about invalid commit hash, got: {}",
+        stderr
+    );
+}
+
+/// Test that `cresca review` fails when --stop-at is before --skip-to.
+#[test]
+fn test_review_with_stop_at_before_skip_to() {
+    let repo = TempGitRepo::new();
+
+    // Create develop branch with multiple commits
+    repo.create_branch("develop");
+    repo.write_file("file1.txt", "content 1");
+    repo.git(&["add", "."]);
+    repo.commit("Add file1");
+
+    repo.write_file("file2.txt", "content 2");
+    repo.git(&["add", "."]);
+    repo.commit("Add file2");
+
+    repo.write_file("file3.txt", "content 3");
+    repo.git(&["add", "."]);
+    repo.commit("Add file3");
+
+    repo.git(&["push", "-u", "origin", "develop"]);
+
+    // Get commit hashes: file3 (newest), file2, file1 (oldest)
+    let log_output = repo.git(&["log", "--oneline", "main..develop"]);
+    let log_str = String::from_utf8_lossy(&log_output.stdout);
+    let commits: Vec<&str> = log_str.lines().collect();
+    let file3_hash = commits[0].split_whitespace().next().unwrap();
+    let file1_hash = commits[2].split_whitespace().next().unwrap();
+
+    // Switch back to main
+    repo.switch_branch("main");
+
+    // Run cresca review with --stop-at BEFORE --skip-to (invalid)
+    let output = repo.run_cresca(&[
+        "review",
+        "main",
+        "develop",
+        "--skip-to",
+        file3_hash,
+        "--stop-at",
+        file1_hash,
+    ]);
+
+    assert!(
+        !output.status.success(),
+        "cresca review should fail when --stop-at is before --skip-to"
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("error") && stderr.contains("--stop-at"),
+        "Should show error about --stop-at being before --skip-to, got: {}",
+        stderr
+    );
+}
