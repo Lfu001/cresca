@@ -1,4 +1,4 @@
-use crate::git::run_git_command;
+use crate::git::{resolve_remote_tracking_branch, run_git_command};
 use colored::Colorize;
 use std::ops::Not;
 use std::process::exit;
@@ -19,14 +19,26 @@ pub fn prepare_review_branch(
     stop_at: Option<&str>,
     verbose: bool,
 ) {
-    let review_branch = format!("review-{}-{}", to_branch, from_branch);
-    let origin_to = format!("origin/{}", to_branch);
-    let origin_from = format!("origin/{}", from_branch);
+    let review_branch = format!("review-{}-{}", to_branch, from_branch).replace("/", "_");
 
-    // Fetch both branches from origin
+    let resolved_to = resolve_remote_tracking_branch(to_branch, verbose);
+    let resolved_from = resolve_remote_tracking_branch(from_branch, verbose);
+
+    let tracking_to = resolved_to.tracking_ref;
+    let tracking_from = resolved_from.tracking_ref;
+
+    // Fetch the target branch
     run_git_command(
-        "fetch origin branches",
-        &["fetch", "origin", to_branch, from_branch],
+        &format!("fetch target branch from {}", resolved_to.remote),
+        &["fetch", &resolved_to.remote, &resolved_to.remote_branch],
+        false,
+        verbose,
+    );
+
+    // Fetch the source branch
+    run_git_command(
+        &format!("fetch source branch from {}", resolved_from.remote),
+        &["fetch", &resolved_from.remote, &resolved_from.remote_branch],
         false,
         verbose,
     );
@@ -34,7 +46,7 @@ pub fn prepare_review_branch(
     // Get merge-base
     let merge_base_output = run_git_command(
         "get merge base",
-        &["merge-base", &origin_to, &origin_from],
+        &["merge-base", &tracking_to, &tracking_from],
         false,
         verbose,
     );
@@ -42,10 +54,10 @@ pub fn prepare_review_branch(
         .trim()
         .to_string();
 
-    // Get valid commit range (merge_base..origin_from)
+    // Get valid commit range (merge_base..tracking_from)
     let valid_commits = run_git_command(
         "get valid commit range",
-        &["rev-list", &format!("{}..{}", merge_base, origin_from)],
+        &["rev-list", &format!("{}..{}", merge_base, tracking_from)],
         false,
         verbose,
     );
@@ -86,7 +98,7 @@ pub fn prepare_review_branch(
         if let Some(skip_hash) = skip_to {
             let skip_to_commits = run_git_command(
                 "get commits after skip_to",
-                &["rev-list", &format!("{}..{}", skip_hash, origin_from)],
+                &["rev-list", &format!("{}..{}", skip_hash, tracking_from)],
                 false,
                 verbose,
             );
@@ -182,11 +194,11 @@ pub fn prepare_review_branch(
             );
         }
 
-        // Use stop_at if specified, otherwise origin_from
-        stop_at.unwrap_or(&origin_from).to_string()
+        // Use stop_at if specified, otherwise tracking_from
+        stop_at.unwrap_or(&tracking_from).to_string()
     } else {
-        // Use stop_at if specified, otherwise origin_from
-        stop_at.unwrap_or(&origin_from).to_string()
+        // Use stop_at if specified, otherwise tracking_from
+        stop_at.unwrap_or(&tracking_from).to_string()
     };
 
     // Squash merge remaining changes
@@ -275,12 +287,13 @@ pub struct ReviewStatus {
 ///
 /// * `ReviewStatus` - The remaining diff statistics
 pub fn get_review_status(from_branch: &str, verbose: bool) -> ReviewStatus {
-    let origin_from = format!("origin/{}", from_branch);
+    let resolved_from = resolve_remote_tracking_branch(from_branch, verbose);
+    let tracking_from = resolved_from.tracking_ref;
 
     // Get diff stats summary (use HEAD..branch for direct comparison, not HEAD...branch)
     let stat_output = run_git_command(
         "get diff stats",
-        &["diff", "--stat", "HEAD", &origin_from],
+        &["diff", "--stat", "HEAD", &tracking_from],
         false,
         verbose,
     );
@@ -313,7 +326,7 @@ pub fn get_review_status(from_branch: &str, verbose: bool) -> ReviewStatus {
     // Get list of changed files
     let files_output = run_git_command(
         "get changed files",
-        &["diff", "--name-only", "HEAD", &origin_from],
+        &["diff", "--name-only", "HEAD", &tracking_from],
         false,
         verbose,
     );

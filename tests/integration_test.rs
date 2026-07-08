@@ -656,3 +656,94 @@ fn test_review_with_stop_at_before_skip_to() {
         stderr
     );
 }
+
+/// Test that `cresca review` works with branch names containing slashes.
+#[test]
+fn test_review_with_slash_in_branch_name() {
+    let repo = TempGitRepo::new();
+    repo.create_branch("feature/login-page");
+    repo.write_file("login.txt", "login stuff");
+    repo.git(&["add", "."]);
+    repo.commit("Add login");
+    repo.git(&["push", "-u", "origin", "feature/login-page"]);
+
+    repo.switch_branch("main");
+    let output = repo.run_cresca(&["review", "main", "feature/login-page"]);
+    assert!(
+        output.status.success(),
+        "cresca review should succeed with slash in branch name\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// Test that `cresca review` works when the local branch does not exist.
+#[test]
+fn test_review_without_local_branch() {
+    let repo = TempGitRepo::new();
+    // Simulate another user pushing a branch
+    repo.create_branch("other-users-feature");
+    repo.write_file("other.txt", "other stuff");
+    repo.git(&["add", "."]);
+    repo.commit("Add other stuff");
+    repo.git(&["push", "-u", "origin", "other-users-feature"]);
+
+    // Switch to main and completely delete the local branch
+    repo.switch_branch("main");
+    repo.git(&["branch", "-D", "other-users-feature"]);
+
+    let output = repo.run_cresca(&["review", "main", "other-users-feature"]);
+    assert!(
+        output.status.success(),
+        "cresca review should succeed even if local branch does not exist\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// Test that `cresca review` works with a custom remote name (e.g. upstream).
+#[test]
+fn test_review_with_custom_remote() {
+    // This is tricky with TempGitRepo since it sets up 'origin' by default.
+    // We will rename the remote to 'upstream' for this test.
+    let repo = TempGitRepo::new();
+    repo.git(&["remote", "rename", "origin", "upstream"]);
+
+    repo.create_branch("develop");
+    repo.write_file("dev.txt", "dev stuff");
+    repo.git(&["add", "."]);
+    repo.commit("Add dev stuff");
+    // Push setting upstream explicitly
+    repo.git(&["push", "-u", "upstream", "develop"]);
+    repo.git(&["push", "-u", "upstream", "main"]);
+
+    repo.switch_branch("main");
+    let output = repo.run_cresca(&["review", "main", "develop"]);
+    assert!(
+        output.status.success(),
+        "cresca review should succeed with a custom remote named 'upstream'\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// Test that `cresca review` works when given remote tracking branch explicitly.
+#[test]
+fn test_review_with_explicit_remote_tracking_branch() {
+    let repo = TempGitRepo::new();
+    repo.create_branch("develop");
+    repo.write_file("dev.txt", "dev stuff");
+    repo.git(&["add", "."]);
+    repo.commit("Add dev stuff");
+    repo.git(&["push", "-u", "origin", "develop"]);
+
+    repo.switch_branch("main");
+    // Pass 'origin/develop' instead of 'develop'
+    let output = repo.run_cresca(&["review", "main", "origin/develop"]);
+    assert!(
+        output.status.success(),
+        "cresca review should succeed with explicit remote tracking branch\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
