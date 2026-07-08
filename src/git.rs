@@ -146,10 +146,10 @@ pub fn resolve_remote_tracking_branch(branch_or_ref: &str, verbose: bool) -> Res
         let mut best_remote = String::new();
         for remote in remotes_str.lines() {
             let remote = remote.trim();
-            if branch_or_ref.starts_with(&format!("{}/", remote)) {
-                if remote.len() > best_remote.len() {
-                    best_remote = remote.to_string();
-                }
+            if branch_or_ref.starts_with(&format!("{}/", remote))
+                && remote.len() > best_remote.len()
+            {
+                best_remote = remote.to_string();
             }
         }
 
