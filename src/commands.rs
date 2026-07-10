@@ -1,4 +1,4 @@
-use crate::git::run_git_command;
+use crate::git::{resolve_remote_tracking_branch, run_git_command};
 use colored::Colorize;
 use std::ops::Not;
 use std::process::exit;
@@ -19,30 +19,26 @@ pub fn prepare_review_branch(
     stop_at: Option<&str>,
     verbose: bool,
 ) {
-    let review_branch = format!("review-{}-{}", to_branch, from_branch);
+    let review_branch = format!("review-{}-{}", to_branch, from_branch).replace("/", "_");
 
-    // Fetch and update both branches
+    let resolved_to = resolve_remote_tracking_branch(to_branch, verbose);
+    let resolved_from = resolve_remote_tracking_branch(from_branch, verbose);
+
+    let tracking_to = resolved_to.tracking_ref;
+    let tracking_from = resolved_from.tracking_ref;
+
+    // Fetch the target branch
     run_git_command(
-        &format!("switch to {} branch", from_branch),
-        &["switch", from_branch],
+        &format!("fetch target branch from {}", resolved_to.remote),
+        &["fetch", &resolved_to.remote, &resolved_to.remote_branch],
         false,
         verbose,
     );
+
+    // Fetch the source branch
     run_git_command(
-        &format!("pull {} branch", from_branch),
-        &["pull", "origin", from_branch],
-        false,
-        verbose,
-    );
-    run_git_command(
-        &format!("switch to {} branch", to_branch),
-        &["switch", to_branch],
-        false,
-        verbose,
-    );
-    run_git_command(
-        &format!("pull {} branch", to_branch),
-        &["pull", "origin", to_branch],
+        &format!("fetch source branch from {}", resolved_from.remote),
+        &["fetch", &resolved_from.remote, &resolved_from.remote_branch],
         false,
         verbose,
     );
@@ -50,7 +46,7 @@ pub fn prepare_review_branch(
     // Get merge-base
     let merge_base_output = run_git_command(
         "get merge base",
-        &["merge-base", to_branch, from_branch],
+        &["merge-base", &tracking_to, &tracking_from],
         false,
         verbose,
     );
@@ -58,10 +54,10 @@ pub fn prepare_review_branch(
         .trim()
         .to_string();
 
-    // Get valid commit range (merge_base..from_branch)
+    // Get valid commit range (merge_base..tracking_from)
     let valid_commits = run_git_command(
         "get valid commit range",
-        &["rev-list", &format!("{}..{}", merge_base, from_branch)],
+        &["rev-list", &format!("{}..{}", merge_base, tracking_from)],
         false,
         verbose,
     );
@@ -102,7 +98,7 @@ pub fn prepare_review_branch(
         if let Some(skip_hash) = skip_to {
             let skip_to_commits = run_git_command(
                 "get commits after skip_to",
-                &["rev-list", &format!("{}..{}", skip_hash, from_branch)],
+                &["rev-list", &format!("{}..{}", skip_hash, tracking_from)],
                 false,
                 verbose,
             );
@@ -180,6 +176,7 @@ pub fn prepare_review_branch(
                 &[
                     "merge",
                     "--squash",
+                    "--ff",
                     "--quiet",
                     "--no-stat",
                     "-X",
@@ -197,11 +194,11 @@ pub fn prepare_review_branch(
             );
         }
 
-        // Use stop_at if specified, otherwise from_branch
-        stop_at.unwrap_or(from_branch).to_string()
+        // Use stop_at if specified, otherwise tracking_from
+        stop_at.unwrap_or(&tracking_from).to_string()
     } else {
-        // Use stop_at if specified, otherwise from_branch
-        stop_at.unwrap_or(from_branch).to_string()
+        // Use stop_at if specified, otherwise tracking_from
+        stop_at.unwrap_or(&tracking_from).to_string()
     };
 
     // Squash merge remaining changes
@@ -210,6 +207,7 @@ pub fn prepare_review_branch(
         &[
             "merge",
             "--squash",
+            "--ff",
             "--quiet",
             "--no-stat",
             "-X",
@@ -289,10 +287,13 @@ pub struct ReviewStatus {
 ///
 /// * `ReviewStatus` - The remaining diff statistics
 pub fn get_review_status(from_branch: &str, verbose: bool) -> ReviewStatus {
+    let resolved_from = resolve_remote_tracking_branch(from_branch, verbose);
+    let tracking_from = resolved_from.tracking_ref;
+
     // Get diff stats summary (use HEAD..branch for direct comparison, not HEAD...branch)
     let stat_output = run_git_command(
         "get diff stats",
-        &["diff", "--stat", "HEAD", from_branch],
+        &["diff", "--stat", "HEAD", &tracking_from],
         false,
         verbose,
     );
@@ -325,7 +326,7 @@ pub fn get_review_status(from_branch: &str, verbose: bool) -> ReviewStatus {
     // Get list of changed files
     let files_output = run_git_command(
         "get changed files",
-        &["diff", "--name-only", "HEAD", from_branch],
+        &["diff", "--name-only", "HEAD", &tracking_from],
         false,
         verbose,
     );
