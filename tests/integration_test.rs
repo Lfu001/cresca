@@ -127,27 +127,51 @@ fn test_review_materializes_exact_three_dot_diff() {
     assert!(output.stderr.is_empty());
 }
 
-/// Test that `cresca approve` commits staged changes and discards unstaged ones.
+/// Test that `cresca approve` commits exactly the staged tree and discards everything else.
 #[test]
 fn test_approve_commits_staged() {
     let repo = TempGitRepo::new();
 
-    // Setup: create develop with two files
-    repo.create_branch("develop");
-    repo.write_file("reviewed.txt", "reviewed content");
-    repo.write_file("not_reviewed.txt", "not reviewed content");
+    let base_content = "line 1\nline 2\nline 3\nline 4\nline 5\nline 6\nline 7\nline 8\n";
+    let partial_expected_content =
+        "line 1\nreviewed line 2\nline 3\nline 4\nline 5\nline 6\nline 7\nline 8\n";
+    let full_develop_content =
+        "line 1\nreviewed line 2\nline 3\nline 4\nline 5\nline 6\nreviewed line 7\nline 8\n";
+    let approved_content = "approved addition\n";
+
+    repo.write_file("reviewed.txt", base_content);
+    repo.write_file("kept.txt", "keep this file\n");
     repo.git(&["add", "."]);
-    repo.commit("Add features");
+    repo.commit("Add approval base files");
+    repo.git(&["push", "origin", "main"]);
+
+    repo.create_branch("develop");
+    repo.write_file("reviewed.txt", full_develop_content);
+    repo.write_file("approved.txt", approved_content);
+    repo.write_file("unreviewed.txt", "unreviewed addition\n");
+    repo.git(&["rm", "kept.txt"]);
+    repo.git(&["add", "."]);
+    repo.commit("Add mixed approval changes");
     repo.git(&["push", "-u", "origin", "develop"]);
 
-    // Switch back to main and run review
     repo.switch_branch("main");
-    repo.run_cresca(&["review", "main", "develop"]);
+    let review_output = repo.run_cresca(&["review", "main", "develop"]);
+    assert!(
+        review_output.status.success(),
+        "cresca review should succeed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&review_output.stdout),
+        String::from_utf8_lossy(&review_output.stderr)
+    );
 
-    // Stage only one file (simulating partial review)
+    repo.git(&["add", "approved.txt"]);
+    repo.write_file("reviewed.txt", partial_expected_content);
     repo.git(&["add", "reviewed.txt"]);
+    repo.write_file("reviewed.txt", full_develop_content);
 
-    // Run approve
+    let expected_tree = repo.git_stdout(&["write-tree"]);
+    let expected_commit_diff = repo.cached_diff();
+    let parent = repo.rev_parse("HEAD");
+
     let output = repo.run_cresca(&["approve"]);
     assert!(
         output.status.success(),
@@ -155,27 +179,87 @@ fn test_approve_commits_staged() {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-
-    // Verify: reviewed.txt should be committed
-    let files_in_head = repo.git(&["ls-tree", "--name-only", "HEAD"]);
-    let files_str = String::from_utf8_lossy(&files_in_head.stdout);
-    assert!(
-        files_str.contains("reviewed.txt"),
-        "reviewed.txt should be committed"
+    assert_eq!(
+        repo.git_stdout(&["show", "-s", "--format=%s", "HEAD"]),
+        "Approve reviewed changes"
     );
-
-    // Verify: not_reviewed.txt should NOT exist (discarded)
-    let not_reviewed_path = repo.path().join("not_reviewed.txt");
-    assert!(
-        !not_reviewed_path.exists(),
-        "not_reviewed.txt should be discarded"
+    assert_eq!(repo.rev_parse("HEAD^"), parent);
+    assert_eq!(repo.rev_parse("HEAD^{tree}"), expected_tree);
+    assert_eq!(
+        repo.git(&[
+            "show",
+            "--format=",
+            "--binary",
+            "--no-ext-diff",
+            "--no-renames",
+            "HEAD",
+        ])
+        .stdout,
+        expected_commit_diff
     );
+    assert!(repo.cached_diff().is_empty());
+    assert!(repo.worktree_diff().is_empty());
+    assert_eq!(repo.read_file("reviewed.txt"), partial_expected_content);
+    assert_eq!(repo.read_file("approved.txt"), approved_content);
+    assert!(!repo.path().join("unreviewed.txt").exists());
+    assert!(repo.path().join("kept.txt").exists());
+    assert!(String::from_utf8_lossy(&output.stdout)
+        .contains("Reviewed changes were approved successfully"));
+    assert!(output.stderr.is_empty());
+}
 
-    // Verify: working directory is clean
+/// Test that an empty approval ends the work session without approving any source change.
+#[test]
+fn test_approve_with_no_staged_changes_approves_nothing() {
+    let repo = TempGitRepo::new();
+
+    repo.write_file("tracked.txt", "base content\n");
+    repo.git(&["add", "."]);
+    repo.commit("Add empty approval base");
+    repo.git(&["push", "origin", "main"]);
+
+    repo.create_branch("develop");
+    repo.write_file("tracked.txt", "develop content\n");
+    repo.write_file("added.txt", "new source file\n");
+    repo.git(&["add", "."]);
+    repo.commit("Add empty approval source changes");
+    repo.git(&["push", "-u", "origin", "develop"]);
+
+    let expected_source_diff = repo.diff("main", "develop");
+    repo.switch_branch("main");
+    let review_output = repo.run_cresca(&["review", "main", "develop"]);
     assert!(
-        !repo.has_uncommitted_changes(),
-        "Working directory should be clean after approve"
+        review_output.status.success(),
+        "cresca review should succeed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&review_output.stdout),
+        String::from_utf8_lossy(&review_output.stderr)
     );
+    assert_eq!(repo.worktree_diff(), expected_source_diff);
+    let head_before = repo.rev_parse("HEAD");
+
+    let output = repo.run_cresca(&["approve"]);
+    assert!(
+        output.status.success(),
+        "empty cresca approve should succeed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(repo.rev_parse("HEAD"), head_before);
+    assert!(repo.cached_diff().is_empty());
+    assert!(repo.worktree_diff().is_empty());
+    assert!(String::from_utf8_lossy(&output.stdout)
+        .contains("There are no reviewed changes to approve"));
+    assert!(output.stderr.is_empty());
+
+    let rereview_output = repo.run_cresca(&["review", "main", "develop"]);
+    assert!(
+        rereview_output.status.success(),
+        "cresca re-review should succeed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&rereview_output.stdout),
+        String::from_utf8_lossy(&rereview_output.stderr)
+    );
+    assert_eq!(repo.rev_parse("HEAD"), head_before);
+    assert_eq!(repo.worktree_diff(), expected_source_diff);
 }
 
 /// Test that `cresca approve` fails on a non-review branch.
