@@ -165,7 +165,7 @@ pub fn prepare_review_branch(
         // Check if there are commits before skip_to
         let has_earlier = run_git_command(
             "check earlier commits",
-            &["rev-list", &format!("{}..{}", merge_base, &parent)],
+            &["rev-list", &format!("{}..{}", merge_base, parent)],
             true,
             verbose,
         );
