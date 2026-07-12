@@ -88,14 +88,13 @@ fn prepare_staged_unstaged_and_untracked_changes(repo: &TempGitRepo) {
     repo.write_file("untracked.txt", "untracked content\n");
 }
 
-fn assert_invalid_review_branch_rejection(output: &std::process::Output) {
+fn assert_invalid_review_command_preserves_state(repo: &TempGitRepo, args: &[&str]) {
+    let before = repo.snapshot();
+    let output = repo.run_cresca(args);
     assert!(!output.status.success());
     assert!(output.stdout.is_empty());
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("valid cresca review branch") && stderr.contains("cresca review"),
-        "expected invalid review metadata diagnostic, got: {stderr}"
-    );
+    assert!(String::from_utf8_lossy(&output.stderr).contains("valid cresca review branch"));
+    assert_eq!(repo.snapshot(), before);
 }
 
 #[test]
@@ -338,12 +337,7 @@ fn test_approve_with_no_staged_changes_approves_nothing() {
 fn test_approve_on_non_review_branch() {
     let repo = TempGitRepo::new();
     prepare_staged_unstaged_and_untracked_changes(&repo);
-    let before = repo.snapshot();
-
-    let output = repo.run_cresca(&["approve"]);
-
-    assert_invalid_review_branch_rejection(&output);
-    assert_eq!(repo.snapshot(), before);
+    assert_invalid_review_command_preserves_state(&repo, &["approve"]);
 }
 
 #[test]
@@ -351,12 +345,7 @@ fn test_approve_rejects_review_prefixed_branch_without_metadata_and_preserves_st
     let repo = TempGitRepo::new();
     repo.create_branch("review-not-created-by-cresca");
     prepare_staged_unstaged_and_untracked_changes(&repo);
-    let before = repo.snapshot();
-
-    let output = repo.run_cresca(&["approve"]);
-
-    assert_invalid_review_branch_rejection(&output);
-    assert_eq!(repo.snapshot(), before);
+    assert_invalid_review_command_preserves_state(&repo, &["approve"]);
 }
 
 #[test]
@@ -382,12 +371,7 @@ fn test_approve_rejects_unsupported_review_metadata_and_preserves_state() {
         "999",
     ]);
     prepare_staged_unstaged_and_untracked_changes(&repo);
-    let before = repo.snapshot();
-
-    let output = repo.run_cresca(&["approve"]);
-
-    assert_invalid_review_branch_rejection(&output);
-    assert_eq!(repo.snapshot(), before);
+    assert_invalid_review_command_preserves_state(&repo, &["approve"]);
 }
 
 #[test]
@@ -397,12 +381,7 @@ fn test_approve_rejects_non_review_name_even_with_valid_metadata() {
     repo.git(&["config", "--local", "branch.main.cresca-target", "main"]);
     repo.git(&["config", "--local", "branch.main.cresca-source", "develop"]);
     prepare_staged_unstaged_and_untracked_changes(&repo);
-    let before = repo.snapshot();
-
-    let output = repo.run_cresca(&["approve"]);
-
-    assert_invalid_review_branch_rejection(&output);
-    assert_eq!(repo.snapshot(), before);
+    assert_invalid_review_command_preserves_state(&repo, &["approve"]);
 }
 
 /// Test that `cresca review` fails with uncommitted changes.
@@ -669,12 +648,7 @@ fn test_status_shows_diff_stats() {
 fn test_status_on_non_review_branch() {
     let repo = TempGitRepo::new();
     prepare_staged_unstaged_and_untracked_changes(&repo);
-    let before = repo.snapshot();
-
-    let output = repo.run_cresca(&["status"]);
-
-    assert_invalid_review_branch_rejection(&output);
-    assert_eq!(repo.snapshot(), before);
+    assert_invalid_review_command_preserves_state(&repo, &["status"]);
 }
 
 #[test]
@@ -688,12 +662,7 @@ fn test_status_rejects_parseable_legacy_branch_without_metadata_and_preserves_st
     repo.switch_branch("main");
     repo.create_branch("review-main-develop");
     prepare_staged_unstaged_and_untracked_changes(&repo);
-    let before = repo.snapshot();
-
-    let output = repo.run_cresca(&["status"]);
-
-    assert_invalid_review_branch_rejection(&output);
-    assert_eq!(repo.snapshot(), before);
+    assert_invalid_review_command_preserves_state(&repo, &["status"]);
 }
 
 #[test]
@@ -732,12 +701,7 @@ fn test_status_rejects_duplicate_review_metadata_and_preserves_state() {
         "branch.review-main-develop.cresca-source",
         "other-develop",
     ]);
-    let before = repo.snapshot();
-
-    let output = repo.run_cresca(&["status"]);
-
-    assert_invalid_review_branch_rejection(&output);
-    assert_eq!(repo.snapshot(), before);
+    assert_invalid_review_command_preserves_state(&repo, &["status"]);
 }
 
 /// Test that `cresca status` updates after partial approval.
