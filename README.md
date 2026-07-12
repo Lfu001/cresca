@@ -64,6 +64,12 @@ cresca review main develop --stop-at=C
 
 Use `git log --oneline main..develop` to see available commits.
 
+### Review Branch Identity
+
+Cresca records the target and source in local Git configuration for each review branch. `approve` and `status` accept only branches with valid Cresca metadata; a branch is never identified from its name alone.
+
+The usual readable name (`review-main-develop`) is retained. If that name is already used by another or older metadata-free review, Cresca leaves it untouched and creates a deterministic suffixed name. Review branches made by older Cresca versions are not guessed or migrated because names containing `-`, `/`, or `_` can be ambiguous. Run `cresca review <target> <source>` again to create a metadata-backed branch, inspect the new diff, and then remove the old local branch manually when it is no longer needed.
+
 ## License
 
 [MIT](https://github.com/Lfu001/cresca/blob/main/LICENSE)

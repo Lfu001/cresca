@@ -434,6 +434,10 @@ fn test_review_with_uncommitted_changes() {
     );
     assert_eq!(repo.snapshot(), before);
     assert!(!repo.ref_exists("refs/heads/review-main-develop"));
+    assert_eq!(
+        repo.review_metadata_values("review-main-develop"),
+        (Vec::new(), Vec::new(), Vec::new())
+    );
 }
 
 /// Test that running review twice updates the review branch correctly.
@@ -528,6 +532,38 @@ fn test_review_with_skip_to_first_commit_keeps_full_range_unstaged() {
     assert_eq!(repo.rev_parse("HEAD"), range.base);
     assert!(repo.cached_diff().is_empty());
     assert_eq!(repo.worktree_diff(), repo.diff(&range.base, &range.d));
+}
+
+#[test]
+fn test_failed_review_preparation_does_not_commit_review_metadata() {
+    let (repo, range) = setup_linear_range();
+    repo.git(&["config", "user.useConfigOnly", "true"]);
+    repo.git(&["config", "--unset-all", "user.email"]);
+
+    let output = std::process::Command::new(TempGitRepo::cresca_binary())
+        .args(["review", "main", "develop", "--skip-to", &range.b[..8]])
+        .env("NO_COLOR", "1")
+        // Isolate a possible global identity so the commit failure is reproducible.
+        .env(
+            "GIT_CONFIG_GLOBAL",
+            repo.path().join("missing-global-gitconfig"),
+        )
+        .current_dir(repo.path())
+        .output()
+        .expect("Failed to execute cresca");
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("commit auto-approved changes")
+            && stderr.contains("Author identity unknown"),
+        "expected failed Git commit diagnostic, got: {stderr}"
+    );
+    assert_eq!(
+        repo.review_metadata_values("review-main-develop"),
+        (Vec::new(), Vec::new(), Vec::new()),
+        "a failed materialization must not be marked as valid review state",
+    );
 }
 
 /// Test that `cresca review --skip-to` with already approved commits works correctly.
@@ -925,6 +961,10 @@ fn test_review_with_invalid_stop_at() {
     );
     assert_eq!(repo.snapshot(), before);
     assert!(!repo.ref_exists("refs/heads/review-main-develop"));
+    assert_eq!(
+        repo.review_metadata_values("review-main-develop"),
+        (Vec::new(), Vec::new(), Vec::new())
+    );
 }
 
 #[test]
@@ -945,6 +985,10 @@ fn test_review_with_nonexistent_skip_to_is_atomic() {
     );
     assert_eq!(repo.snapshot(), before);
     assert!(!repo.ref_exists("refs/heads/review-main-develop"));
+    assert_eq!(
+        repo.review_metadata_values("review-main-develop"),
+        (Vec::new(), Vec::new(), Vec::new())
+    );
 }
 
 #[test]
@@ -971,6 +1015,10 @@ fn test_review_with_out_of_range_skip_to_is_atomic() {
     );
     assert_eq!(repo.snapshot(), before);
     assert!(!repo.ref_exists("refs/heads/review-main-develop"));
+    assert_eq!(
+        repo.review_metadata_values("review-main-develop"),
+        (Vec::new(), Vec::new(), Vec::new())
+    );
 }
 
 /// Test that `cresca review` fails when --stop-at is before --skip-to.
@@ -1001,6 +1049,10 @@ fn test_review_with_stop_at_before_skip_to() {
     );
     assert_eq!(repo.snapshot(), before);
     assert!(!repo.ref_exists("refs/heads/review-main-develop"));
+    assert_eq!(
+        repo.review_metadata_values("review-main-develop"),
+        (Vec::new(), Vec::new(), Vec::new())
+    );
 }
 
 /// Test that `cresca review` records the exact CLI target and source values.
