@@ -876,6 +876,57 @@ fn test_review_with_stop_at_before_skip_to() {
     assert!(!repo.ref_exists("refs/heads/review-main-develop"));
 }
 
+/// Test that `cresca review` records the exact CLI target and source values.
+#[test]
+fn test_review_records_versioned_target_and_source_metadata() {
+    let repo = TempGitRepo::new();
+
+    repo.create_branch("release-v1");
+    repo.write_file("release.txt", "release base\n");
+    repo.git(&["add", "."]);
+    repo.commit("Add release base");
+    repo.git(&["push", "-u", "origin", "release-v1"]);
+
+    repo.create_branch("feature/login-page");
+    repo.write_file("login.txt", "login page\n");
+    repo.git(&["add", "."]);
+    repo.commit("Add login page");
+    repo.git(&["push", "-u", "origin", "feature/login-page"]);
+    repo.switch_branch("main");
+
+    let output = repo.run_cresca(&["review", "release-v1", "feature/login-page"]);
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        repo.current_branch(),
+        "review-release-v1-feature_login-page"
+    );
+    assert_eq!(
+        repo.review_metadata_values("review-release-v1-feature_login-page"),
+        (
+            vec!["1".to_string()],
+            vec!["release-v1".to_string()],
+            vec!["feature/login-page".to_string()],
+        )
+    );
+    assert!(repo.cached_diff().is_empty());
+    assert_eq!(
+        repo.worktree_diff(),
+        repo.diff(
+            &repo.git_stdout(&[
+                "merge-base",
+                "origin/release-v1",
+                "origin/feature/login-page",
+            ]),
+            "origin/feature/login-page",
+        )
+    );
+}
+
 /// Test that `cresca review` works with branch names containing slashes.
 #[test]
 fn test_review_with_slash_in_branch_name() {

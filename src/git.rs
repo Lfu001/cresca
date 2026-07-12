@@ -1,6 +1,120 @@
 use colored::Colorize;
 use std::process::{exit, Command, Output};
 
+pub const REVIEW_METADATA_VERSION: &str = "1";
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct ReviewMetadata {
+    pub target: String,
+    pub source: String,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+#[allow(dead_code)]
+pub enum ReviewMetadataError {
+    Missing,
+    UnsupportedVersion(String),
+    Invalid,
+}
+
+fn review_config_key(branch: &str, field: &str) -> String {
+    format!("branch.{branch}.cresca-{field}")
+}
+
+#[allow(dead_code)]
+fn review_config_values(branch: &str, field: &str, verbose: bool) -> Vec<String> {
+    let key = review_config_key(branch, field);
+    let output = run_git_command(
+        "read review metadata",
+        &["config", "--local", "--get-all", &key],
+        true,
+        verbose,
+    );
+    if !output.status.success() {
+        return Vec::new();
+    }
+
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::to_owned)
+        .collect()
+}
+
+#[allow(dead_code)]
+pub fn read_review_metadata(
+    branch: &str,
+    verbose: bool,
+) -> Result<ReviewMetadata, ReviewMetadataError> {
+    let versions = review_config_values(branch, "version", verbose);
+    let targets = review_config_values(branch, "target", verbose);
+    let sources = review_config_values(branch, "source", verbose);
+
+    match (versions.as_slice(), targets.as_slice(), sources.as_slice()) {
+        ([version], [target], [source])
+            if version == REVIEW_METADATA_VERSION && !target.is_empty() && !source.is_empty() =>
+        {
+            Ok(ReviewMetadata {
+                target: target.clone(),
+                source: source.clone(),
+            })
+        }
+        ([], [], []) => Err(ReviewMetadataError::Missing),
+        ([version], _, _) if version != REVIEW_METADATA_VERSION => {
+            Err(ReviewMetadataError::UnsupportedVersion(version.clone()))
+        }
+        _ => Err(ReviewMetadataError::Invalid),
+    }
+}
+
+pub fn write_review_metadata(branch: &str, metadata: &ReviewMetadata, verbose: bool) {
+    let version_key = review_config_key(branch, "version");
+    let target_key = review_config_key(branch, "target");
+    let source_key = review_config_key(branch, "source");
+
+    run_git_command(
+        "clear review metadata version marker",
+        &["config", "--local", "--unset-all", &version_key],
+        true,
+        verbose,
+    );
+    run_git_command(
+        "record review target",
+        &[
+            "config",
+            "--local",
+            "--replace-all",
+            &target_key,
+            &metadata.target,
+        ],
+        false,
+        verbose,
+    );
+    run_git_command(
+        "record review source",
+        &[
+            "config",
+            "--local",
+            "--replace-all",
+            &source_key,
+            &metadata.source,
+        ],
+        false,
+        verbose,
+    );
+    run_git_command(
+        "commit review metadata",
+        &[
+            "config",
+            "--local",
+            "--replace-all",
+            &version_key,
+            REVIEW_METADATA_VERSION,
+        ],
+        false,
+        verbose,
+    );
+}
+
 /// Run a git command and return the output
 ///
 /// # Arguments

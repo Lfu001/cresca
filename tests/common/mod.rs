@@ -15,6 +15,7 @@ pub struct RepoState {
     pub branch: String,
     pub head: String,
     pub local_heads: Vec<u8>,
+    pub local_config: Vec<u8>,
     pub status: Vec<u8>,
     pub cached_diff: Vec<u8>,
     pub worktree_diff: Vec<u8>,
@@ -92,6 +93,26 @@ impl TempGitRepo {
             .expect("git stdout should be UTF-8")
             .trim()
             .to_string()
+    }
+
+    pub fn git_config_values(&self, key: &str) -> Vec<String> {
+        let output = self.git_maybe(&["config", "--local", "--get-all", key]);
+        if !output.status.success() {
+            return Vec::new();
+        }
+        String::from_utf8(output.stdout)
+            .expect("git config value should be UTF-8")
+            .lines()
+            .map(str::to_owned)
+            .collect()
+    }
+
+    pub fn review_metadata_values(&self, branch: &str) -> (Vec<String>, Vec<String>, Vec<String>) {
+        (
+            self.git_config_values(&format!("branch.{branch}.cresca-version")),
+            self.git_config_values(&format!("branch.{branch}.cresca-target")),
+            self.git_config_values(&format!("branch.{branch}.cresca-source")),
+        )
     }
 
     /// Resolves a revision to its object ID.
@@ -194,6 +215,9 @@ impl TempGitRepo {
                     "--format=%(refname) %(objectname)",
                     "refs/heads/",
                 ])
+                .stdout,
+            local_config: self
+                .git(&["config", "--local", "--null", "--list", "--show-origin"])
                 .stdout,
             status: self
                 .git(&["status", "--porcelain=v1", "-z", "--untracked-files=all"])

@@ -1,4 +1,6 @@
-use crate::git::{resolve_remote_tracking_branch, run_git_command};
+use crate::git::{
+    resolve_remote_tracking_branch, run_git_command, write_review_metadata, ReviewMetadata,
+};
 use colored::Colorize;
 use std::ops::Not;
 use std::process::exit;
@@ -19,6 +21,10 @@ pub fn prepare_review_branch(
     stop_at: Option<&str>,
     verbose: bool,
 ) {
+    let metadata = ReviewMetadata {
+        target: to_branch.to_string(),
+        source: from_branch.to_string(),
+    };
     let review_branch = format!("review-{}-{}", to_branch, from_branch).replace("/", "_");
 
     let resolved_to = resolve_remote_tracking_branch(to_branch, verbose);
@@ -220,6 +226,7 @@ pub fn prepare_review_branch(
 
     // Unstage changes for review
     run_git_command("unstage changes for review", &["reset"], false, verbose);
+    write_review_metadata(&review_branch, &metadata, verbose);
 }
 
 /// Commit reviewed changes and discard unreviewed ones
