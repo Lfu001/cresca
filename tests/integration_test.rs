@@ -1091,7 +1091,165 @@ fn test_review_records_versioned_target_and_source_metadata() {
 }
 
 #[test]
-fn test_review_stops_when_existing_metadata_version_cannot_be_cleared() {
+fn test_review_treats_orphan_base_metadata_as_occupied() {
+    let repo = TempGitRepo::new();
+
+    repo.create_branch("develop");
+    repo.write_file("develop.txt", "develop change\n");
+    repo.git(&["add", "."]);
+    repo.commit("Add develop change");
+    repo.git(&["push", "-u", "origin", "develop"]);
+    repo.switch_branch("main");
+
+    let base = "review-main-develop";
+    repo.git(&[
+        "config",
+        "--local",
+        &format!("branch.{base}.cresca-version"),
+        "1",
+    ]);
+    repo.git(&[
+        "config",
+        "--local",
+        &format!("branch.{base}.cresca-target"),
+        "other-target",
+    ]);
+    repo.git(&[
+        "config",
+        "--local",
+        &format!("branch.{base}.cresca-source"),
+        "other-source",
+    ]);
+    let orphan_metadata = repo.review_metadata_values(base);
+
+    let output = repo.run_cresca(&["review", "main", "develop"]);
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let suffix = "review-main-develop-5ee67b20f1cad176";
+    assert_eq!(repo.current_branch(), suffix);
+    assert!(!repo.ref_exists(&format!("refs/heads/{base}")));
+    assert_eq!(repo.review_metadata_values(base), orphan_metadata);
+    assert_eq!(
+        repo.review_metadata_values(suffix),
+        (
+            vec!["1".to_string()],
+            vec!["main".to_string()],
+            vec!["develop".to_string()],
+        )
+    );
+    assert!(repo.cached_diff().is_empty());
+    let merge_base = repo.git_stdout(&["merge-base", "origin/main", "origin/develop"]);
+    assert_eq!(
+        repo.worktree_diff(),
+        repo.diff(&merge_base, "origin/develop")
+    );
+}
+
+#[test]
+fn test_review_fails_closed_when_orphan_metadata_occupies_suffix() {
+    let repo = TempGitRepo::new();
+
+    repo.create_branch("develop");
+    repo.write_file("develop.txt", "develop change\n");
+    repo.git(&["add", "."]);
+    repo.commit("Add develop change");
+    repo.git(&["push", "-u", "origin", "develop"]);
+    repo.switch_branch("main");
+
+    let base = "review-main-develop";
+    repo.create_branch(base);
+    repo.switch_branch("main");
+    let suffix = "review-main-develop-5ee67b20f1cad176";
+    repo.git(&[
+        "config",
+        "--local",
+        &format!("branch.{suffix}.cresca-source"),
+        "orphan-source",
+    ]);
+    let before = repo.snapshot();
+
+    let output = repo.run_cresca(&["review", "main", "develop"]);
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("conflicting review branches")
+            && stderr.contains(base)
+            && stderr.contains(suffix),
+        "expected orphan suffix conflict diagnostic, got: {stderr}"
+    );
+    assert_eq!(repo.snapshot(), before);
+    assert!(!repo.ref_exists(&format!("refs/heads/{suffix}")));
+}
+
+#[cfg(unix)]
+#[test]
+fn test_review_fails_closed_when_metadata_config_read_fails() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let repo = TempGitRepo::new();
+
+    repo.create_branch("develop");
+    repo.write_file("develop.txt", "develop change\n");
+    repo.git(&["add", "."]);
+    repo.commit("Add develop change");
+    repo.git(&["push", "-u", "origin", "develop"]);
+    repo.switch_branch("main");
+    repo.create_branch("review-main-develop");
+    repo.switch_branch("main");
+    let before = repo.snapshot();
+
+    let git_path = String::from_utf8(
+        std::process::Command::new("sh")
+            .args(["-c", "command -v git"])
+            .output()
+            .expect("git path lookup should execute")
+            .stdout,
+    )
+    .expect("git path should be UTF-8")
+    .trim()
+    .to_string();
+    let shim_dir = tempfile::TempDir::new().expect("git shim directory should be created");
+    let shim_path = shim_dir.path().join("git");
+    let shim = format!(
+        "#!/bin/sh\nif [ \"$1\" = config ] && [ \"$2\" = --local ] && [ \"$3\" = --get-all ] && [ \"$4\" = branch.review-main-develop.cresca-version ]; then\n  echo injected metadata read failure >&2\n  exit 2\nfi\nexec '{git_path}' \"$@\"\n"
+    );
+    std::fs::write(&shim_path, shim).expect("git shim should be writable");
+    let mut permissions = std::fs::metadata(&shim_path)
+        .expect("git shim metadata should be readable")
+        .permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&shim_path, permissions).expect("git shim should be executable");
+    let path = std::env::join_paths(std::iter::once(shim_dir.path().to_path_buf()).chain(
+        std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()),
+    ))
+    .expect("git shim PATH should be valid");
+
+    let output = std::process::Command::new(TempGitRepo::cresca_binary())
+        .args(["review", "main", "develop"])
+        .env("NO_COLOR", "1")
+        .env("PATH", path)
+        .current_dir(repo.path())
+        .output()
+        .expect("cresca should execute with git shim");
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Failed to read review metadata")
+            && stderr.contains("injected metadata read failure"),
+        "expected strict metadata read failure, got: {stderr}"
+    );
+    assert_eq!(repo.snapshot(), before);
+}
+
+#[test]
+fn test_review_does_not_materialize_orphan_metadata_when_config_write_fails() {
     let repo = TempGitRepo::new();
 
     repo.create_branch("develop");
@@ -1121,6 +1279,7 @@ fn test_review_stops_when_existing_metadata_version_cannot_be_cleared() {
         "develop",
     ]);
     let metadata_before = repo.review_metadata_values(review_branch);
+    assert!(!repo.ref_exists(&format!("refs/heads/{review_branch}")));
 
     let config_lock_path = repo.path().join(".git/config.lock");
     std::fs::write(&config_lock_path, "lock metadata writes")
@@ -1133,20 +1292,23 @@ fn test_review_stops_when_existing_metadata_version_cannot_be_cleared() {
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("Failed to clear review metadata version marker"),
-        "expected version-clear failure, got: {stderr}"
+        stderr.contains("Failed to record review target"),
+        "expected metadata write failure, got: {stderr}"
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains(&format!(
-        "git config --local --unset-all branch.{review_branch}.cresca-version"
-    )));
     assert!(
-        !stdout.contains(&format!(
-            "git config --local --replace-all branch.{review_branch}.cresca-target"
-        )),
-        "metadata writes must stop after the version marker cannot be cleared: {stdout}"
+        !stdout.contains(&format!("git checkout -b {review_branch} ")),
+        "orphan metadata must prevent the base branch from being created: {stdout}"
     );
+    assert!(!repo.ref_exists(&format!("refs/heads/{review_branch}")));
     assert_eq!(repo.review_metadata_values(review_branch), metadata_before);
+
+    let suffix = "review-main-develop-5ee67b20f1cad176";
+    assert_eq!(
+        repo.review_metadata_values(suffix),
+        (Vec::new(), Vec::new(), Vec::new()),
+        "a failed write must not leave a valid review identity on the new branch"
+    );
 }
 
 #[test]

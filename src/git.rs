@@ -66,19 +66,23 @@ fn local_branch_exists(branch: &str, verbose: bool) -> bool {
 
 pub fn select_review_branch(metadata: &ReviewMetadata, verbose: bool) -> ReviewBranchSelection {
     let base = readable_review_branch(metadata);
-    if !local_branch_exists(&base, verbose) {
-        return ReviewBranchSelection::New(base);
-    }
-    if read_review_metadata(&base, verbose).as_ref() == Ok(metadata) {
-        return ReviewBranchSelection::Existing(base);
+    let base_exists = local_branch_exists(&base, verbose);
+    match (base_exists, read_review_metadata(&base, verbose)) {
+        (false, Err(ReviewMetadataError::Missing)) => return ReviewBranchSelection::New(base),
+        (true, Ok(existing)) if existing == *metadata => {
+            return ReviewBranchSelection::Existing(base)
+        }
+        _ => {}
     }
 
     let suffix = suffixed_review_branch(&base, metadata);
-    if !local_branch_exists(&suffix, verbose) {
-        return ReviewBranchSelection::New(suffix);
-    }
-    if read_review_metadata(&suffix, verbose).as_ref() == Ok(metadata) {
-        return ReviewBranchSelection::Existing(suffix);
+    let suffix_exists = local_branch_exists(&suffix, verbose);
+    match (suffix_exists, read_review_metadata(&suffix, verbose)) {
+        (false, Err(ReviewMetadataError::Missing)) => return ReviewBranchSelection::New(suffix),
+        (true, Ok(existing)) if existing == *metadata => {
+            return ReviewBranchSelection::Existing(suffix)
+        }
+        _ => {}
     }
 
     eprintln!(
@@ -102,14 +106,21 @@ fn review_config_values(branch: &str, field: &str, verbose: bool) -> Vec<String>
         true,
         verbose,
     );
-    if !output.status.success() {
+    if output.status.success() {
+        return String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .map(str::to_owned)
+            .collect();
+    }
+
+    if output.status.code() == Some(1) && output.stderr.is_empty() {
         return Vec::new();
     }
 
-    String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .map(str::to_owned)
-        .collect()
+    eprintln!("{}: Failed to read review metadata.", "error".red().bold());
+    eprintln!("Original error from git:");
+    eprintln!("\t{}", String::from_utf8_lossy(&output.stderr));
+    exit(1);
 }
 
 pub fn read_review_metadata(
