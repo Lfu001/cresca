@@ -2,6 +2,22 @@ mod common;
 
 use common::TempGitRepo;
 
+#[test]
+fn test_helpers_capture_untracked_and_do_not_mutate_real_index() {
+    let repo = TempGitRepo::new();
+
+    repo.write_file("README.md", "# Updated Test Repository");
+    repo.write_file("new.txt", "untracked content");
+    repo.git(&["add", "README.md"]);
+
+    let cached_before = repo.cached_diff();
+    let logical_diff = repo.worktree_diff();
+
+    assert_eq!(repo.cached_diff(), cached_before);
+    assert!(String::from_utf8_lossy(&logical_diff).contains("new.txt"));
+    assert!(String::from_utf8_lossy(&logical_diff).contains("README.md"));
+}
+
 /// Test that `cresca review` creates a review branch with the correct name.
 #[test]
 fn test_review_creates_branch() {
