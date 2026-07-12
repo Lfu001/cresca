@@ -63,6 +63,18 @@ fn assert_review_matches(
     assert_eq!(repo.worktree_diff(), repo.diff(&merge_base, source_ref));
 }
 
+fn prepare_staged_unstaged_and_untracked_changes(repo: &TempGitRepo) {
+    repo.write_file("staged.txt", "staged base\n");
+    repo.write_file("unstaged.txt", "unstaged base\n");
+    repo.git(&["add", "."]);
+    repo.commit("Add dirty state fixtures");
+
+    repo.write_file("staged.txt", "staged modification\n");
+    repo.git(&["add", "staged.txt"]);
+    repo.write_file("unstaged.txt", "unstaged modification\n");
+    repo.write_file("untracked.txt", "untracked content\n");
+}
+
 #[test]
 fn test_helpers_capture_untracked_and_do_not_mutate_real_index() {
     let repo = TempGitRepo::new();
@@ -282,8 +294,9 @@ fn test_approve_with_no_staged_changes_approves_nothing() {
 #[test]
 fn test_approve_on_non_review_branch() {
     let repo = TempGitRepo::new();
+    prepare_staged_unstaged_and_untracked_changes(&repo);
+    let before = repo.snapshot();
 
-    // Try to approve on main (not a review branch)
     let output = repo.run_cresca(&["approve"]);
 
     assert!(
@@ -293,9 +306,10 @@ fn test_approve_on_non_review_branch() {
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("error") || stderr.contains("Not on a review branch"),
-        "Should show error message about not being on review branch"
+        stderr.contains("Not on a review branch"),
+        "expected non-review diagnostic, got: {stderr}"
     );
+    assert_eq!(repo.snapshot(), before);
 }
 
 /// Test that `cresca review` fails with uncommitted changes.
@@ -303,15 +317,16 @@ fn test_approve_on_non_review_branch() {
 fn test_review_with_uncommitted_changes() {
     let repo = TempGitRepo::new();
 
-    // Create develop branch and push it
     repo.create_branch("develop");
+    repo.write_file("develop.txt", "develop content\n");
+    repo.git(&["add", "."]);
+    repo.commit("Add develop change");
     repo.git(&["push", "-u", "origin", "develop"]);
     repo.switch_branch("main");
 
-    // Create uncommitted changes
-    repo.write_file("uncommitted.txt", "uncommitted content");
+    prepare_staged_unstaged_and_untracked_changes(&repo);
+    let before = repo.snapshot();
 
-    // Try to run review
     let output = repo.run_cresca(&["review", "main", "develop"]);
 
     assert!(
@@ -321,9 +336,11 @@ fn test_review_with_uncommitted_changes() {
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("error") || stderr.contains("Uncommitted"),
-        "Should show error about uncommitted changes"
+        stderr.contains("Uncommitted changes found"),
+        "expected uncommitted-changes diagnostic, got: {stderr}"
     );
+    assert_eq!(repo.snapshot(), before);
+    assert!(!repo.ref_exists("refs/heads/review-main-develop"));
 }
 
 /// Test that running review twice updates the review branch correctly.
@@ -512,8 +529,9 @@ fn test_status_shows_diff_stats() {
 #[test]
 fn test_status_on_non_review_branch() {
     let repo = TempGitRepo::new();
+    prepare_staged_unstaged_and_untracked_changes(&repo);
+    let before = repo.snapshot();
 
-    // Try to run status on main (not a review branch)
     let output = repo.run_cresca(&["status"]);
 
     assert!(
@@ -523,9 +541,10 @@ fn test_status_on_non_review_branch() {
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("error") || stderr.contains("Not on a review branch"),
-        "Should show error message about not being on review branch"
+        stderr.contains("Not on a review branch"),
+        "expected non-review diagnostic, got: {stderr}"
     );
+    assert_eq!(repo.snapshot(), before);
 }
 
 /// Test that `cresca status` updates after partial approval.
@@ -742,10 +761,9 @@ fn test_review_with_invalid_stop_at() {
     repo.commit("Add file1");
     repo.git(&["push", "-u", "origin", "develop"]);
 
-    // Switch back to main
     repo.switch_branch("main");
+    let before = repo.snapshot();
 
-    // Run cresca review with invalid --stop-at hash
     let output = repo.run_cresca(&["review", "main", "develop", "--stop-at", "invalidhash"]);
 
     assert!(
@@ -755,52 +773,27 @@ fn test_review_with_invalid_stop_at() {
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("error") && stderr.contains("invalidhash"),
-        "Should show error about invalid commit hash, got: {}",
-        stderr
+        stderr.contains("invalidhash") && stderr.contains("is not in the range"),
+        "expected invalid range diagnostic, got: {stderr}"
     );
+    assert_eq!(repo.snapshot(), before);
+    assert!(!repo.ref_exists("refs/heads/review-main-develop"));
 }
 
 /// Test that `cresca review` fails when --stop-at is before --skip-to.
 #[test]
 fn test_review_with_stop_at_before_skip_to() {
-    let repo = TempGitRepo::new();
+    let (repo, range) = setup_linear_range();
+    let before = repo.snapshot();
 
-    // Create develop branch with multiple commits
-    repo.create_branch("develop");
-    repo.write_file("file1.txt", "content 1");
-    repo.git(&["add", "."]);
-    repo.commit("Add file1");
-
-    repo.write_file("file2.txt", "content 2");
-    repo.git(&["add", "."]);
-    repo.commit("Add file2");
-
-    repo.write_file("file3.txt", "content 3");
-    repo.git(&["add", "."]);
-    repo.commit("Add file3");
-
-    repo.git(&["push", "-u", "origin", "develop"]);
-
-    // Get commit hashes: file3 (newest), file2, file1 (oldest)
-    let log_output = repo.git(&["log", "--oneline", "main..develop"]);
-    let log_str = String::from_utf8_lossy(&log_output.stdout);
-    let commits: Vec<&str> = log_str.lines().collect();
-    let file3_hash = commits[0].split_whitespace().next().unwrap();
-    let file1_hash = commits[2].split_whitespace().next().unwrap();
-
-    // Switch back to main
-    repo.switch_branch("main");
-
-    // Run cresca review with --stop-at BEFORE --skip-to (invalid)
     let output = repo.run_cresca(&[
         "review",
         "main",
         "develop",
         "--skip-to",
-        file3_hash,
+        &range.c,
         "--stop-at",
-        file1_hash,
+        &range.a,
     ]);
 
     assert!(
@@ -810,10 +803,11 @@ fn test_review_with_stop_at_before_skip_to() {
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("error") && stderr.contains("--stop-at"),
-        "Should show error about --stop-at being before --skip-to, got: {}",
-        stderr
+        stderr.contains("must be at or after"),
+        "expected reversed range diagnostic, got: {stderr}"
     );
+    assert_eq!(repo.snapshot(), before);
+    assert!(!repo.ref_exists("refs/heads/review-main-develop"));
 }
 
 /// Test that `cresca review` works with branch names containing slashes.

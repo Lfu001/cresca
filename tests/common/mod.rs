@@ -226,10 +226,4 @@ impl TempGitRepo {
             .output()
             .expect("Failed to execute cresca")
     }
-
-    /// Checks if there are uncommitted changes.
-    pub fn has_uncommitted_changes(&self) -> bool {
-        let output = self.git(&["status", "--porcelain"]);
-        !output.stdout.is_empty()
-    }
 }
