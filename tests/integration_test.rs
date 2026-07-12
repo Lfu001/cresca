@@ -1,6 +1,7 @@
 mod common;
 
 use common::TempGitRepo;
+use std::collections::BTreeSet;
 
 #[test]
 fn test_helpers_capture_untracked_and_do_not_mutate_real_index() {
@@ -18,66 +19,68 @@ fn test_helpers_capture_untracked_and_do_not_mutate_real_index() {
     assert!(String::from_utf8_lossy(&logical_diff).contains("README.md"));
 }
 
-/// Test that `cresca review` creates a review branch with the correct name.
 #[test]
-fn test_review_creates_branch() {
+fn test_review_materializes_exact_three_dot_diff() {
     let repo = TempGitRepo::new();
 
-    // Create a develop branch with some changes
-    repo.create_branch("develop");
-    repo.write_file("feature.txt", "new feature");
+    repo.write_file("shared.txt", "base version\n");
+    repo.write_file("deleted.txt", "delete me\n");
     repo.git(&["add", "."]);
-    repo.commit("Add feature");
+    repo.commit("Add shared base files");
+    repo.git(&["push", "origin", "main"]);
+
+    repo.create_branch("develop");
+    repo.write_file("shared.txt", "develop version\n");
+    repo.git(&["rm", "deleted.txt"]);
+    repo.write_file("added.txt", "added on develop\n");
+    repo.git(&["add", "."]);
+    repo.commit("Develop feature changes");
     repo.git(&["push", "-u", "origin", "develop"]);
 
-    // Switch back to main
     repo.switch_branch("main");
+    repo.write_file("main-only.txt", "added on main\n");
+    repo.git(&["add", "."]);
+    repo.commit("Add main-only change");
+    repo.git(&["push", "origin", "main"]);
 
-    // Run cresca review
+    let merge_base = repo.git_stdout(&["merge-base", "origin/main", "origin/develop"]);
+    let expected_diff = repo.diff(&merge_base, "origin/develop");
+
     let output = repo.run_cresca(&["review", "main", "develop"]);
     assert!(
         output.status.success(),
-        "cresca review should succeed\nstdout: {}\nstderr: {}",
+        "stdout: {}\nstderr: {}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-
-    // Verify we're now on the review branch
-    let current = repo.current_branch();
-    assert_eq!(current, "review-main-develop");
-}
-
-/// Test that `cresca review` shows the diff as unstaged changes.
-#[test]
-fn test_review_shows_diff() {
-    let repo = TempGitRepo::new();
-
-    // Create a develop branch with some changes
-    repo.create_branch("develop");
-    repo.write_file("feature.txt", "new feature content");
-    repo.git(&["add", "."]);
-    repo.commit("Add feature");
-    repo.git(&["push", "-u", "origin", "develop"]);
-
-    // Switch back to main
-    repo.switch_branch("main");
-
-    // Run cresca review
-    repo.run_cresca(&["review", "main", "develop"]);
-
-    // Verify the changes are shown as unstaged
+    assert_eq!(repo.current_branch(), "review-main-develop");
+    assert_eq!(repo.rev_parse("HEAD"), merge_base);
     assert!(
-        repo.has_uncommitted_changes(),
-        "Should have uncommitted changes"
+        repo.cached_diff().is_empty(),
+        "review must leave the real index empty"
+    );
+    assert_eq!(repo.worktree_diff(), expected_diff);
+    assert_eq!(repo.read_file("shared.txt"), "develop version\n");
+    assert_eq!(repo.read_file("added.txt"), "added on develop\n");
+    assert!(!repo.path().join("deleted.txt").exists());
+    assert!(!repo.path().join("main-only.txt").exists());
+
+    let status = String::from_utf8(
+        repo.git(&["status", "--porcelain=v1", "-z", "--untracked-files=all"])
+            .stdout,
+    )
+    .expect("porcelain status should be UTF-8");
+    let status_records: BTreeSet<&str> = status
+        .split('\0')
+        .filter(|record| !record.is_empty())
+        .collect();
+    assert_eq!(
+        status_records,
+        BTreeSet::from([" M shared.txt", " D deleted.txt", "?? added.txt"])
     );
 
-    // Check status for new files
-    let status = repo.git(&["status", "--porcelain"]);
-    let status_str = String::from_utf8_lossy(&status.stdout);
-    assert!(
-        status_str.contains("feature.txt"),
-        "feature.txt should appear in status"
-    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("Review branch prepared successfully"));
+    assert!(output.stderr.is_empty());
 }
 
 /// Test that `cresca approve` commits staged changes and discards unstaged ones.
