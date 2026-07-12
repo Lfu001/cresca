@@ -14,6 +14,7 @@ pub struct TempGitRepo {
 pub struct RepoState {
     pub branch: String,
     pub head: String,
+    pub local_heads: Vec<u8>,
     pub status: Vec<u8>,
     pub cached_diff: Vec<u8>,
     pub worktree_diff: Vec<u8>,
@@ -170,11 +171,30 @@ impl TempGitRepo {
         .stdout
     }
 
+    /// Returns the real index file contents without interpreting them.
+    pub fn real_index_bytes(&self) -> Vec<u8> {
+        let index_path = PathBuf::from(self.git_stdout(&["rev-parse", "--git-path", "index"]));
+        let index_path = if index_path.is_absolute() {
+            index_path
+        } else {
+            self.path().join(index_path)
+        };
+        std::fs::read(index_path).expect("real git index should be readable")
+    }
+
     /// Captures the repository state used by integration-test assertions.
     pub fn snapshot(&self) -> RepoState {
         RepoState {
             branch: self.current_branch(),
             head: self.rev_parse("HEAD"),
+            local_heads: self
+                .git(&[
+                    "for-each-ref",
+                    "--sort=refname",
+                    "--format=%(refname) %(objectname)",
+                    "refs/heads/",
+                ])
+                .stdout,
             status: self
                 .git(&["status", "--porcelain=v1", "-z", "--untracked-files=all"])
                 .stdout,

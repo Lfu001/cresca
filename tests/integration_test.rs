@@ -79,16 +79,36 @@ fn prepare_staged_unstaged_and_untracked_changes(repo: &TempGitRepo) {
 fn test_helpers_capture_untracked_and_do_not_mutate_real_index() {
     let repo = TempGitRepo::new();
 
+    std::fs::write(repo.path().join("binary.bin"), b"base\0binary\n")
+        .expect("binary fixture should be writable");
+    repo.write_file("deleted.txt", "tracked deletion fixture\n");
+    repo.git(&["add", "."]);
+    repo.commit("Add worktree diff fixtures");
+
     repo.write_file("README.md", "# Updated Test Repository");
-    repo.write_file("new.txt", "untracked content");
+    std::fs::write(repo.path().join("binary.bin"), b"updated\0binary\n")
+        .expect("binary fixture should be writable");
+    repo.git(&["rm", "deleted.txt"]);
+    repo.write_file("untracked.txt", "untracked content\n");
     repo.git(&["add", "README.md"]);
 
     let cached_before = repo.cached_diff();
+    let real_index_before = repo.real_index_bytes();
     let logical_diff = repo.worktree_diff();
+    let real_index_after = repo.real_index_bytes();
 
     assert_eq!(repo.cached_diff(), cached_before);
-    assert!(String::from_utf8_lossy(&logical_diff).contains("new.txt"));
-    assert!(String::from_utf8_lossy(&logical_diff).contains("README.md"));
+    assert_eq!(
+        real_index_after, real_index_before,
+        "worktree_diff must leave the real index byte-for-byte unchanged"
+    );
+    let logical_diff_text = String::from_utf8_lossy(&logical_diff);
+    assert!(logical_diff_text.contains("GIT binary patch"));
+    assert!(logical_diff_text.contains("diff --git a/binary.bin b/binary.bin"));
+    assert!(logical_diff_text.contains("deleted file mode"));
+    assert!(logical_diff_text.contains("diff --git a/deleted.txt b/deleted.txt"));
+    assert!(logical_diff_text.contains("diff --git a/untracked.txt b/untracked.txt"));
+    assert!(logical_diff_text.contains("README.md"));
 }
 
 #[test]
@@ -780,6 +800,52 @@ fn test_review_with_invalid_stop_at() {
     assert!(!repo.ref_exists("refs/heads/review-main-develop"));
 }
 
+#[test]
+fn test_review_with_nonexistent_skip_to_is_atomic() {
+    let (repo, _) = setup_linear_range();
+    let before = repo.snapshot();
+
+    let output = repo.run_cresca(&["review", "main", "develop", "--skip-to", "does-not-exist"]);
+
+    assert!(
+        !output.status.success(),
+        "cresca review --skip-to with a nonexistent revision should fail"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("does-not-exist") && stderr.contains("is not in the range"),
+        "expected invalid range diagnostic, got: {stderr}"
+    );
+    assert_eq!(repo.snapshot(), before);
+    assert!(!repo.ref_exists("refs/heads/review-main-develop"));
+}
+
+#[test]
+fn test_review_with_out_of_range_skip_to_is_atomic() {
+    let (repo, _) = setup_linear_range();
+    repo.create_branch("unrelated");
+    repo.write_file("unrelated.txt", "outside the review range\n");
+    repo.git(&["add", "."]);
+    repo.commit("Add unrelated commit");
+    let unrelated_commit = repo.rev_parse("HEAD");
+    repo.switch_branch("main");
+    let before = repo.snapshot();
+
+    let output = repo.run_cresca(&["review", "main", "develop", "--skip-to", &unrelated_commit]);
+
+    assert!(
+        !output.status.success(),
+        "cresca review --skip-to with an out-of-range revision should fail"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(&unrelated_commit) && stderr.contains("is not in the range"),
+        "expected invalid range diagnostic, got: {stderr}"
+    );
+    assert_eq!(repo.snapshot(), before);
+    assert!(!repo.ref_exists("refs/heads/review-main-develop"));
+}
+
 /// Test that `cresca review` fails when --stop-at is before --skip-to.
 #[test]
 fn test_review_with_stop_at_before_skip_to() {
@@ -820,7 +886,17 @@ fn test_review_with_slash_in_branch_name() {
     repo.commit("Add login");
     repo.git(&["push", "-u", "origin", "feature/login-page"]);
 
+    repo.write_file("local-source-decoy.txt", "must not be reviewed\n");
+    repo.git(&["add", "."]);
+    repo.commit("Add unpushed source decoy");
+
     repo.switch_branch("main");
+    repo.write_file(
+        "local-target-decoy.txt",
+        "must not become the review base\n",
+    );
+    repo.git(&["add", "."]);
+    repo.commit("Add unpushed target decoy");
     let output = repo.run_cresca(&["review", "main", "feature/login-page"]);
     assert!(
         output.status.success(),
@@ -835,6 +911,8 @@ fn test_review_with_slash_in_branch_name() {
         "origin/feature/login-page",
     );
     assert_eq!(repo.read_file("login.txt"), "login stuff\n");
+    assert!(!repo.path().join("local-source-decoy.txt").exists());
+    assert!(!repo.path().join("local-target-decoy.txt").exists());
     assert!(String::from_utf8_lossy(&output.stdout).contains("Review branch prepared successfully"));
     assert!(output.stderr.is_empty());
 }
@@ -854,6 +932,12 @@ fn test_review_without_local_branch() {
     repo.switch_branch("main");
     repo.git(&["branch", "-D", "other-users-feature"]);
     assert!(!repo.ref_exists("refs/heads/other-users-feature"));
+    repo.write_file(
+        "local-target-decoy.txt",
+        "must not become the review base\n",
+    );
+    repo.git(&["add", "."]);
+    repo.commit("Add unpushed target decoy");
 
     let output = repo.run_cresca(&["review", "main", "other-users-feature"]);
     assert!(
@@ -869,6 +953,7 @@ fn test_review_without_local_branch() {
         "origin/other-users-feature",
     );
     assert_eq!(repo.read_file("other.txt"), "other stuff\n");
+    assert!(!repo.path().join("local-target-decoy.txt").exists());
     assert!(String::from_utf8_lossy(&output.stdout).contains("Review branch prepared successfully"));
     assert!(output.stderr.is_empty());
 }
@@ -885,11 +970,39 @@ fn test_review_with_custom_remote() {
     repo.write_file("dev.txt", "dev stuff\n");
     repo.git(&["add", "."]);
     repo.commit("Add dev stuff");
-    // Push setting upstream explicitly
     repo.git(&["push", "-u", "upstream", "develop"]);
-    repo.git(&["push", "-u", "upstream", "main"]);
+
+    let wrong_remote = tempfile::TempDir::new().expect("wrong remote should be creatable");
+    repo.git(&["init", "--bare", wrong_remote.path().to_str().unwrap()]);
+    repo.git(&[
+        "remote",
+        "add",
+        "origin",
+        wrong_remote.path().to_str().unwrap(),
+    ]);
+    repo.write_file("origin-source-decoy.txt", "must not be reviewed\n");
+    repo.git(&["add", "."]);
+    repo.commit("Add origin-only source decoy");
+    repo.git(&["push", "origin", "develop"]);
+    repo.write_file("local-source-decoy.txt", "must not be reviewed\n");
+    repo.git(&["add", "."]);
+    repo.commit("Add unpushed source decoy");
 
     repo.switch_branch("main");
+    repo.git(&["push", "-u", "upstream", "main"]);
+    repo.write_file(
+        "origin-target-decoy.txt",
+        "must not become the review base\n",
+    );
+    repo.git(&["add", "."]);
+    repo.commit("Add origin-only target decoy");
+    repo.git(&["push", "origin", "main"]);
+    repo.write_file(
+        "local-target-decoy.txt",
+        "must not become the review base\n",
+    );
+    repo.git(&["add", "."]);
+    repo.commit("Add unpushed target decoy");
     let output = repo.run_cresca(&["review", "main", "develop"]);
     assert!(
         output.status.success(),
@@ -904,6 +1017,10 @@ fn test_review_with_custom_remote() {
         "upstream/develop",
     );
     assert_eq!(repo.read_file("dev.txt"), "dev stuff\n");
+    assert!(!repo.path().join("origin-source-decoy.txt").exists());
+    assert!(!repo.path().join("local-source-decoy.txt").exists());
+    assert!(!repo.path().join("origin-target-decoy.txt").exists());
+    assert!(!repo.path().join("local-target-decoy.txt").exists());
     assert!(String::from_utf8_lossy(&output.stdout).contains("Review branch prepared successfully"));
     assert!(output.stderr.is_empty());
 }
@@ -918,7 +1035,17 @@ fn test_review_with_explicit_remote_tracking_branch() {
     repo.commit("Add dev stuff");
     repo.git(&["push", "-u", "origin", "develop"]);
 
+    repo.write_file("local-source-decoy.txt", "must not be reviewed\n");
+    repo.git(&["add", "."]);
+    repo.commit("Add unpushed source decoy");
+
     repo.switch_branch("main");
+    repo.write_file(
+        "local-target-decoy.txt",
+        "must not become the review base\n",
+    );
+    repo.git(&["add", "."]);
+    repo.commit("Add unpushed target decoy");
     // Pass 'origin/develop' instead of 'develop'
     let output = repo.run_cresca(&["review", "main", "origin/develop"]);
     assert!(
@@ -934,6 +1061,8 @@ fn test_review_with_explicit_remote_tracking_branch() {
         "origin/develop",
     );
     assert_eq!(repo.read_file("dev.txt"), "dev stuff\n");
+    assert!(!repo.path().join("local-source-decoy.txt").exists());
+    assert!(!repo.path().join("local-target-decoy.txt").exists());
     assert!(String::from_utf8_lossy(&output.stdout).contains("Review branch prepared successfully"));
     assert!(output.stderr.is_empty());
 }
