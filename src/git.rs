@@ -142,12 +142,15 @@ pub fn write_review_metadata(branch: &str, metadata: &ReviewMetadata, verbose: b
     let target_key = review_config_key(branch, "target");
     let source_key = review_config_key(branch, "source");
 
-    run_git_command(
-        "clear review metadata version marker",
-        &["config", "--local", "--unset-all", &version_key],
-        true,
-        verbose,
-    );
+    let existing_versions = review_config_values(branch, "version", verbose);
+    if !existing_versions.is_empty() {
+        run_git_command(
+            "clear review metadata version marker",
+            &["config", "--local", "--unset-all", &version_key],
+            false,
+            verbose,
+        );
+    }
     run_git_command(
         "record review target",
         &[
@@ -398,5 +401,23 @@ pub fn resolve_remote_tracking_branch(branch_or_ref: &str, verbose: bool) -> Res
         remote: "origin".to_string(),
         remote_branch: branch_or_ref.to_string(),
         tracking_ref: format!("origin/{}", branch_or_ref),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{suffixed_review_branch, ReviewMetadata};
+
+    #[test]
+    fn review_identity_suffix_matches_fixed_length_framed_fnv1a_vector() {
+        let metadata = ReviewMetadata {
+            target: "main".to_string(),
+            source: "feature/foo".to_string(),
+        };
+
+        assert_eq!(
+            suffixed_review_branch("review-main-feature_foo", &metadata),
+            "review-main-feature_foo-49caf74ca44ff0fe"
+        );
     }
 }

@@ -3,6 +3,14 @@ mod common;
 use common::TempGitRepo;
 use std::collections::BTreeSet;
 
+struct RemoveFileOnDrop(std::path::PathBuf);
+
+impl Drop for RemoveFileOnDrop {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
 struct LinearRange {
     base: String,
     a: String,
@@ -522,6 +530,8 @@ fn test_failed_review_preparation_does_not_commit_review_metadata() {
     let output = std::process::Command::new(TempGitRepo::cresca_binary())
         .args(["review", "main", "develop", "--skip-to", &range.b[..8]])
         .env("NO_COLOR", "1")
+        .env("LC_ALL", "C")
+        .env("LANG", "C")
         // Isolate a possible global identity so the commit failure is reproducible.
         .env(
             "GIT_CONFIG_GLOBAL",
@@ -1078,6 +1088,65 @@ fn test_review_records_versioned_target_and_source_metadata() {
             "origin/feature/login-page",
         )
     );
+}
+
+#[test]
+fn test_review_stops_when_existing_metadata_version_cannot_be_cleared() {
+    let repo = TempGitRepo::new();
+
+    repo.create_branch("develop");
+    repo.write_file("develop.txt", "develop change\n");
+    repo.git(&["add", "."]);
+    repo.commit("Add develop change");
+    repo.git(&["push", "-u", "origin", "develop"]);
+    repo.switch_branch("main");
+
+    let review_branch = "review-main-develop";
+    repo.git(&[
+        "config",
+        "--local",
+        &format!("branch.{review_branch}.cresca-version"),
+        "1",
+    ]);
+    repo.git(&[
+        "config",
+        "--local",
+        &format!("branch.{review_branch}.cresca-target"),
+        "main",
+    ]);
+    repo.git(&[
+        "config",
+        "--local",
+        &format!("branch.{review_branch}.cresca-source"),
+        "develop",
+    ]);
+    let metadata_before = repo.review_metadata_values(review_branch);
+
+    let config_lock_path = repo.path().join(".git/config.lock");
+    std::fs::write(&config_lock_path, "lock metadata writes")
+        .expect("config lock fixture should be writable");
+    let config_lock_cleanup = RemoveFileOnDrop(config_lock_path);
+
+    let output = repo.run_cresca(&["--verbose", "review", "main", "develop"]);
+    drop(config_lock_cleanup);
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Failed to clear review metadata version marker"),
+        "expected version-clear failure, got: {stderr}"
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains(&format!(
+        "git config --local --unset-all branch.{review_branch}.cresca-version"
+    )));
+    assert!(
+        !stdout.contains(&format!(
+            "git config --local --replace-all branch.{review_branch}.cresca-target"
+        )),
+        "metadata writes must stop after the version marker cannot be cleared: {stdout}"
+    );
+    assert_eq!(repo.review_metadata_values(review_branch), metadata_before);
 }
 
 #[test]
