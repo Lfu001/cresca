@@ -75,6 +75,16 @@ fn prepare_staged_unstaged_and_untracked_changes(repo: &TempGitRepo) {
     repo.write_file("untracked.txt", "untracked content\n");
 }
 
+fn assert_invalid_review_branch_rejection(output: &std::process::Output) {
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("valid cresca review branch") && stderr.contains("cresca review"),
+        "expected invalid review metadata diagnostic, got: {stderr}"
+    );
+}
+
 #[test]
 fn test_helpers_capture_untracked_and_do_not_mutate_real_index() {
     let repo = TempGitRepo::new();
@@ -319,16 +329,66 @@ fn test_approve_on_non_review_branch() {
 
     let output = repo.run_cresca(&["approve"]);
 
-    assert!(
-        !output.status.success(),
-        "cresca approve should fail on non-review branch"
-    );
+    assert_invalid_review_branch_rejection(&output);
+    assert_eq!(repo.snapshot(), before);
+}
 
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("Not on a review branch"),
-        "expected non-review diagnostic, got: {stderr}"
-    );
+#[test]
+fn test_approve_rejects_review_prefixed_branch_without_metadata_and_preserves_state() {
+    let repo = TempGitRepo::new();
+    repo.create_branch("review-not-created-by-cresca");
+    prepare_staged_unstaged_and_untracked_changes(&repo);
+    let before = repo.snapshot();
+
+    let output = repo.run_cresca(&["approve"]);
+
+    assert_invalid_review_branch_rejection(&output);
+    assert_eq!(repo.snapshot(), before);
+}
+
+#[test]
+fn test_approve_rejects_unsupported_review_metadata_and_preserves_state() {
+    let repo = TempGitRepo::new();
+    repo.create_branch("review-corrupt");
+    repo.git(&[
+        "config",
+        "--local",
+        "branch.review-corrupt.cresca-target",
+        "main",
+    ]);
+    repo.git(&[
+        "config",
+        "--local",
+        "branch.review-corrupt.cresca-source",
+        "develop",
+    ]);
+    repo.git(&[
+        "config",
+        "--local",
+        "branch.review-corrupt.cresca-version",
+        "999",
+    ]);
+    prepare_staged_unstaged_and_untracked_changes(&repo);
+    let before = repo.snapshot();
+
+    let output = repo.run_cresca(&["approve"]);
+
+    assert_invalid_review_branch_rejection(&output);
+    assert_eq!(repo.snapshot(), before);
+}
+
+#[test]
+fn test_approve_rejects_non_review_name_even_with_valid_metadata() {
+    let repo = TempGitRepo::new();
+    repo.git(&["config", "--local", "branch.main.cresca-version", "1"]);
+    repo.git(&["config", "--local", "branch.main.cresca-target", "main"]);
+    repo.git(&["config", "--local", "branch.main.cresca-source", "develop"]);
+    prepare_staged_unstaged_and_untracked_changes(&repo);
+    let before = repo.snapshot();
+
+    let output = repo.run_cresca(&["approve"]);
+
+    assert_invalid_review_branch_rejection(&output);
     assert_eq!(repo.snapshot(), before);
 }
 
@@ -554,16 +614,70 @@ fn test_status_on_non_review_branch() {
 
     let output = repo.run_cresca(&["status"]);
 
-    assert!(
-        !output.status.success(),
-        "cresca status should fail on non-review branch"
-    );
+    assert_invalid_review_branch_rejection(&output);
+    assert_eq!(repo.snapshot(), before);
+}
 
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("Not on a review branch"),
-        "expected non-review diagnostic, got: {stderr}"
-    );
+#[test]
+fn test_status_rejects_parseable_legacy_branch_without_metadata_and_preserves_state() {
+    let repo = TempGitRepo::new();
+    repo.create_branch("develop");
+    repo.write_file("develop.txt", "develop content\n");
+    repo.git(&["add", "."]);
+    repo.commit("Add develop content");
+    repo.git(&["push", "-u", "origin", "develop"]);
+    repo.switch_branch("main");
+    repo.create_branch("review-main-develop");
+    prepare_staged_unstaged_and_untracked_changes(&repo);
+    let before = repo.snapshot();
+
+    let output = repo.run_cresca(&["status"]);
+
+    assert_invalid_review_branch_rejection(&output);
+    assert_eq!(repo.snapshot(), before);
+}
+
+#[test]
+fn test_status_rejects_duplicate_review_metadata_and_preserves_state() {
+    let repo = TempGitRepo::new();
+    repo.create_branch("develop");
+    repo.write_file("develop.txt", "develop content\n");
+    repo.git(&["add", "."]);
+    repo.commit("Add develop content");
+    repo.git(&["push", "-u", "origin", "develop"]);
+    repo.switch_branch("main");
+    repo.create_branch("review-main-develop");
+    repo.git(&[
+        "config",
+        "--local",
+        "branch.review-main-develop.cresca-version",
+        "1",
+    ]);
+    repo.git(&[
+        "config",
+        "--local",
+        "branch.review-main-develop.cresca-target",
+        "main",
+    ]);
+    repo.git(&[
+        "config",
+        "--local",
+        "--add",
+        "branch.review-main-develop.cresca-source",
+        "develop",
+    ]);
+    repo.git(&[
+        "config",
+        "--local",
+        "--add",
+        "branch.review-main-develop.cresca-source",
+        "other-develop",
+    ]);
+    let before = repo.snapshot();
+
+    let output = repo.run_cresca(&["status"]);
+
+    assert_invalid_review_branch_rejection(&output);
     assert_eq!(repo.snapshot(), before);
 }
 
@@ -925,6 +1039,46 @@ fn test_review_records_versioned_target_and_source_metadata() {
             "origin/feature/login-page",
         )
     );
+}
+
+#[test]
+fn test_status_uses_metadata_for_hyphenated_target_and_slash_source() {
+    let repo = TempGitRepo::new();
+
+    repo.create_branch("release-v1");
+    repo.write_file("release.txt", "release base\n");
+    repo.git(&["add", "."]);
+    repo.commit("Add release base");
+    repo.git(&["push", "-u", "origin", "release-v1"]);
+
+    repo.create_branch("feature/login-page");
+    repo.write_file("login.txt", "login page\n");
+    repo.git(&["add", "."]);
+    repo.commit("Add login page");
+    repo.git(&["push", "-u", "origin", "feature/login-page"]);
+    repo.switch_branch("main");
+
+    let review_output = repo.run_cresca(&["review", "release-v1", "feature/login-page"]);
+    assert!(
+        review_output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&review_output.stdout),
+        String::from_utf8_lossy(&review_output.stderr)
+    );
+
+    let output = repo.run_cresca(&["status"]);
+
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("Remaining diff to feature/login-page:"));
+    assert!(stdout.contains("1 file(s), +1 insertion(s), -0 deletion(s)"));
+    assert!(stdout.contains("    - login.txt\n"));
+    assert!(output.stderr.is_empty());
 }
 
 /// Test that `cresca review` works with branch names containing slashes.

@@ -10,8 +10,8 @@ pub struct ReviewMetadata {
 }
 
 #[derive(Debug, PartialEq, Eq)]
-#[allow(dead_code)]
 pub enum ReviewMetadataError {
+    InvalidBranchName,
     Missing,
     UnsupportedVersion(String),
     Invalid,
@@ -21,7 +21,6 @@ fn review_config_key(branch: &str, field: &str) -> String {
     format!("branch.{branch}.cresca-{field}")
 }
 
-#[allow(dead_code)]
 fn review_config_values(branch: &str, field: &str, verbose: bool) -> Vec<String> {
     let key = review_config_key(branch, field);
     let output = run_git_command(
@@ -40,7 +39,6 @@ fn review_config_values(branch: &str, field: &str, verbose: bool) -> Vec<String>
         .collect()
 }
 
-#[allow(dead_code)]
 pub fn read_review_metadata(
     branch: &str,
     verbose: bool,
@@ -174,52 +172,22 @@ pub fn is_clean(verbose: bool) -> bool {
     .is_empty()
 }
 
-/// Check if the current branch is a review branch
-///
-/// # Arguments
-///
-/// * `verbose` - Whether to print the git command and its output.
-pub fn is_review_branch(verbose: bool) -> bool {
+pub fn current_branch_name(verbose: bool) -> String {
     let output = run_git_command(
         "get current branch",
         &["rev-parse", "--abbrev-ref", "HEAD"],
         false,
         verbose,
     );
-    let branch_name = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    branch_name.starts_with("review")
+    String::from_utf8_lossy(&output.stdout).trim().to_string()
 }
 
-/// Get review branch info (to_branch, from_branch) from current branch name
-///
-/// # Arguments
-///
-/// * `verbose` - Whether to print the git command and its output.
-///
-/// # Returns
-///
-/// * `Option<(String, String)>` - (to_branch, from_branch) if on a review branch, None otherwise
-pub fn get_review_branch_info(verbose: bool) -> Option<(String, String)> {
-    let output = run_git_command(
-        "get current branch",
-        &["rev-parse", "--abbrev-ref", "HEAD"],
-        false,
-        verbose,
-    );
-    let branch_name = String::from_utf8_lossy(&output.stdout).trim().to_string();
-
-    if !branch_name.starts_with("review-") {
-        return None;
+pub fn current_review_metadata(verbose: bool) -> Result<ReviewMetadata, ReviewMetadataError> {
+    let branch = current_branch_name(verbose);
+    if !branch.starts_with("review-") {
+        return Err(ReviewMetadataError::InvalidBranchName);
     }
-
-    // Parse "review-{to}-{from}" format
-    let rest = branch_name.strip_prefix("review-")?;
-    let parts: Vec<&str> = rest.splitn(2, '-').collect();
-    if parts.len() == 2 {
-        Some((parts[0].to_string(), parts[1].to_string()))
-    } else {
-        None
-    }
+    read_review_metadata(&branch, verbose)
 }
 
 /// Resolved remote tracking branch information.
