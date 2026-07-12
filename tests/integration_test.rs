@@ -549,6 +549,10 @@ fn test_failed_review_preparation_does_not_commit_review_metadata() {
             repo.path().join("missing-global-gitconfig"),
         )
         .env("GIT_CONFIG_NOSYSTEM", "1")
+        // GIT_CONFIG_COUNT is the authority for indexed KEY/VALUE pairs; without
+        // it, inherited GIT_CONFIG_KEY_n/GIT_CONFIG_VALUE_n entries are ignored.
+        .env_remove("GIT_CONFIG_COUNT")
+        .env_remove("GIT_CONFIG_PARAMETERS")
         .env_remove("GIT_AUTHOR_NAME")
         .env_remove("GIT_AUTHOR_EMAIL")
         .env_remove("GIT_COMMITTER_NAME")
