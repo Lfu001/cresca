@@ -548,6 +548,12 @@ fn test_failed_review_preparation_does_not_commit_review_metadata() {
             "GIT_CONFIG_GLOBAL",
             repo.path().join("missing-global-gitconfig"),
         )
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env_remove("GIT_AUTHOR_NAME")
+        .env_remove("GIT_AUTHOR_EMAIL")
+        .env_remove("GIT_COMMITTER_NAME")
+        .env_remove("GIT_COMMITTER_EMAIL")
+        .env_remove("EMAIL")
         .current_dir(repo.path())
         .output()
         .expect("Failed to execute cresca");
