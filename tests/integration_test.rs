@@ -47,6 +47,22 @@ fn setup_linear_range() -> (TempGitRepo, LinearRange) {
     (repo, LinearRange { base, a, b, c, d })
 }
 
+fn assert_review_matches(
+    repo: &TempGitRepo,
+    expected_branch: &str,
+    target_ref: &str,
+    source_ref: &str,
+) {
+    let merge_base = repo.git_stdout(&["merge-base", target_ref, source_ref]);
+    assert_eq!(repo.current_branch(), expected_branch);
+    assert_eq!(repo.rev_parse("HEAD"), merge_base);
+    assert!(
+        repo.cached_diff().is_empty(),
+        "review must leave the real index empty"
+    );
+    assert_eq!(repo.worktree_diff(), repo.diff(&merge_base, source_ref));
+}
+
 #[test]
 fn test_helpers_capture_untracked_and_do_not_mutate_real_index() {
     let repo = TempGitRepo::new();
@@ -805,7 +821,7 @@ fn test_review_with_stop_at_before_skip_to() {
 fn test_review_with_slash_in_branch_name() {
     let repo = TempGitRepo::new();
     repo.create_branch("feature/login-page");
-    repo.write_file("login.txt", "login stuff");
+    repo.write_file("login.txt", "login stuff\n");
     repo.git(&["add", "."]);
     repo.commit("Add login");
     repo.git(&["push", "-u", "origin", "feature/login-page"]);
@@ -818,6 +834,15 @@ fn test_review_with_slash_in_branch_name() {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+    assert_review_matches(
+        &repo,
+        "review-main-feature_login-page",
+        "origin/main",
+        "origin/feature/login-page",
+    );
+    assert_eq!(repo.read_file("login.txt"), "login stuff\n");
+    assert!(String::from_utf8_lossy(&output.stdout).contains("Review branch prepared successfully"));
+    assert!(output.stderr.is_empty());
 }
 
 /// Test that `cresca review` works when the local branch does not exist.
@@ -826,7 +851,7 @@ fn test_review_without_local_branch() {
     let repo = TempGitRepo::new();
     // Simulate another user pushing a branch
     repo.create_branch("other-users-feature");
-    repo.write_file("other.txt", "other stuff");
+    repo.write_file("other.txt", "other stuff\n");
     repo.git(&["add", "."]);
     repo.commit("Add other stuff");
     repo.git(&["push", "-u", "origin", "other-users-feature"]);
@@ -834,6 +859,7 @@ fn test_review_without_local_branch() {
     // Switch to main and completely delete the local branch
     repo.switch_branch("main");
     repo.git(&["branch", "-D", "other-users-feature"]);
+    assert!(!repo.ref_exists("refs/heads/other-users-feature"));
 
     let output = repo.run_cresca(&["review", "main", "other-users-feature"]);
     assert!(
@@ -842,6 +868,15 @@ fn test_review_without_local_branch() {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+    assert_review_matches(
+        &repo,
+        "review-main-other-users-feature",
+        "origin/main",
+        "origin/other-users-feature",
+    );
+    assert_eq!(repo.read_file("other.txt"), "other stuff\n");
+    assert!(String::from_utf8_lossy(&output.stdout).contains("Review branch prepared successfully"));
+    assert!(output.stderr.is_empty());
 }
 
 /// Test that `cresca review` works with a custom remote name (e.g. upstream).
@@ -853,7 +888,7 @@ fn test_review_with_custom_remote() {
     repo.git(&["remote", "rename", "origin", "upstream"]);
 
     repo.create_branch("develop");
-    repo.write_file("dev.txt", "dev stuff");
+    repo.write_file("dev.txt", "dev stuff\n");
     repo.git(&["add", "."]);
     repo.commit("Add dev stuff");
     // Push setting upstream explicitly
@@ -868,6 +903,15 @@ fn test_review_with_custom_remote() {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+    assert_review_matches(
+        &repo,
+        "review-main-develop",
+        "upstream/main",
+        "upstream/develop",
+    );
+    assert_eq!(repo.read_file("dev.txt"), "dev stuff\n");
+    assert!(String::from_utf8_lossy(&output.stdout).contains("Review branch prepared successfully"));
+    assert!(output.stderr.is_empty());
 }
 
 /// Test that `cresca review` works when given remote tracking branch explicitly.
@@ -875,7 +919,7 @@ fn test_review_with_custom_remote() {
 fn test_review_with_explicit_remote_tracking_branch() {
     let repo = TempGitRepo::new();
     repo.create_branch("develop");
-    repo.write_file("dev.txt", "dev stuff");
+    repo.write_file("dev.txt", "dev stuff\n");
     repo.git(&["add", "."]);
     repo.commit("Add dev stuff");
     repo.git(&["push", "-u", "origin", "develop"]);
@@ -889,4 +933,13 @@ fn test_review_with_explicit_remote_tracking_branch() {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+    assert_review_matches(
+        &repo,
+        "review-main-origin_develop",
+        "origin/main",
+        "origin/develop",
+    );
+    assert_eq!(repo.read_file("dev.txt"), "dev stuff\n");
+    assert!(String::from_utf8_lossy(&output.stdout).contains("Review branch prepared successfully"));
+    assert!(output.stderr.is_empty());
 }
