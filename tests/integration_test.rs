@@ -1,90 +1,225 @@
 mod common;
 
 use common::TempGitRepo;
+use std::collections::BTreeSet;
 
-/// Test that `cresca review` creates a review branch with the correct name.
-#[test]
-fn test_review_creates_branch() {
+struct LinearRange {
+    base: String,
+    a: String,
+    b: String,
+    c: String,
+    d: String,
+}
+
+fn setup_linear_range() -> (TempGitRepo, LinearRange) {
     let repo = TempGitRepo::new();
 
-    // Create a develop branch with some changes
-    repo.create_branch("develop");
-    repo.write_file("feature.txt", "new feature");
+    repo.write_file("shared.txt", "shared at base\n");
+    repo.write_file("removed-at-c.txt", "present until C\n");
     repo.git(&["add", "."]);
-    repo.commit("Add feature");
-    repo.git(&["push", "-u", "origin", "develop"]);
+    repo.commit("Add range base files");
+    repo.git(&["push", "origin", "main"]);
+    let base = repo.rev_parse("HEAD");
 
-    // Switch back to main
+    repo.create_branch("develop");
+    repo.write_file("a.txt", "added at A\n");
+    repo.git(&["add", "."]);
+    repo.commit("A: add a.txt");
+    let a = repo.rev_parse("HEAD");
+
+    repo.write_file("shared.txt", "shared changed at B\n");
+    repo.git(&["add", "."]);
+    repo.commit("B: change shared.txt");
+    let b = repo.rev_parse("HEAD");
+
+    repo.git(&["rm", "removed-at-c.txt"]);
+    repo.commit("C: remove removed-at-c.txt");
+    let c = repo.rev_parse("HEAD");
+
+    repo.write_file("d.txt", "added at D\n");
+    repo.git(&["add", "."]);
+    repo.commit("D: add d.txt");
+    let d = repo.rev_parse("HEAD");
+
+    repo.git(&["push", "-u", "origin", "develop"]);
     repo.switch_branch("main");
 
-    // Run cresca review
+    (repo, LinearRange { base, a, b, c, d })
+}
+
+fn assert_review_matches(
+    repo: &TempGitRepo,
+    expected_branch: &str,
+    target_ref: &str,
+    source_ref: &str,
+) {
+    let merge_base = repo.git_stdout(&["merge-base", target_ref, source_ref]);
+    assert_eq!(repo.current_branch(), expected_branch);
+    assert_eq!(repo.rev_parse("HEAD"), merge_base);
+    assert!(
+        repo.cached_diff().is_empty(),
+        "review must leave the real index empty"
+    );
+    assert_eq!(repo.worktree_diff(), repo.diff(&merge_base, source_ref));
+}
+
+fn prepare_staged_unstaged_and_untracked_changes(repo: &TempGitRepo) {
+    repo.write_file("staged.txt", "staged base\n");
+    repo.write_file("unstaged.txt", "unstaged base\n");
+    repo.git(&["add", "."]);
+    repo.commit("Add dirty state fixtures");
+
+    repo.write_file("staged.txt", "staged modification\n");
+    repo.git(&["add", "staged.txt"]);
+    repo.write_file("unstaged.txt", "unstaged modification\n");
+    repo.write_file("untracked.txt", "untracked content\n");
+}
+
+#[test]
+fn test_helpers_capture_untracked_and_do_not_mutate_real_index() {
+    let repo = TempGitRepo::new();
+
+    std::fs::write(repo.path().join("binary.bin"), b"base\0binary\n")
+        .expect("binary fixture should be writable");
+    repo.write_file("deleted.txt", "tracked deletion fixture\n");
+    repo.git(&["add", "."]);
+    repo.commit("Add worktree diff fixtures");
+
+    repo.write_file("README.md", "# Updated Test Repository");
+    std::fs::write(repo.path().join("binary.bin"), b"updated\0binary\n")
+        .expect("binary fixture should be writable");
+    repo.git(&["rm", "deleted.txt"]);
+    repo.write_file("untracked.txt", "untracked content\n");
+    repo.git(&["add", "README.md"]);
+
+    let cached_before = repo.cached_diff();
+    let real_index_before = repo.real_index_bytes();
+    let logical_diff = repo.worktree_diff();
+    let real_index_after = repo.real_index_bytes();
+
+    assert_eq!(repo.cached_diff(), cached_before);
+    assert_eq!(
+        real_index_after, real_index_before,
+        "worktree_diff must leave the real index byte-for-byte unchanged"
+    );
+    let logical_diff_text = String::from_utf8_lossy(&logical_diff);
+    assert!(logical_diff_text.contains("GIT binary patch"));
+    assert!(logical_diff_text.contains("diff --git a/binary.bin b/binary.bin"));
+    assert!(logical_diff_text.contains("deleted file mode"));
+    assert!(logical_diff_text.contains("diff --git a/deleted.txt b/deleted.txt"));
+    assert!(logical_diff_text.contains("diff --git a/untracked.txt b/untracked.txt"));
+    assert!(logical_diff_text.contains("README.md"));
+}
+
+#[test]
+fn test_review_materializes_exact_three_dot_diff() {
+    let repo = TempGitRepo::new();
+
+    repo.write_file("shared.txt", "base version\n");
+    repo.write_file("deleted.txt", "delete me\n");
+    repo.git(&["add", "."]);
+    repo.commit("Add shared base files");
+    repo.git(&["push", "origin", "main"]);
+
+    repo.create_branch("develop");
+    repo.write_file("shared.txt", "develop version\n");
+    repo.git(&["rm", "deleted.txt"]);
+    repo.write_file("added.txt", "added on develop\n");
+    repo.git(&["add", "."]);
+    repo.commit("Develop feature changes");
+    repo.git(&["push", "-u", "origin", "develop"]);
+
+    repo.switch_branch("main");
+    repo.write_file("main-only.txt", "added on main\n");
+    repo.git(&["add", "."]);
+    repo.commit("Add main-only change");
+    repo.git(&["push", "origin", "main"]);
+
+    let merge_base = repo.git_stdout(&["merge-base", "origin/main", "origin/develop"]);
+    let expected_diff = repo.diff(&merge_base, "origin/develop");
+
     let output = repo.run_cresca(&["review", "main", "develop"]);
     assert!(
         output.status.success(),
-        "cresca review should succeed\nstdout: {}\nstderr: {}",
+        "stdout: {}\nstderr: {}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-
-    // Verify we're now on the review branch
-    let current = repo.current_branch();
-    assert_eq!(current, "review-main-develop");
-}
-
-/// Test that `cresca review` shows the diff as unstaged changes.
-#[test]
-fn test_review_shows_diff() {
-    let repo = TempGitRepo::new();
-
-    // Create a develop branch with some changes
-    repo.create_branch("develop");
-    repo.write_file("feature.txt", "new feature content");
-    repo.git(&["add", "."]);
-    repo.commit("Add feature");
-    repo.git(&["push", "-u", "origin", "develop"]);
-
-    // Switch back to main
-    repo.switch_branch("main");
-
-    // Run cresca review
-    repo.run_cresca(&["review", "main", "develop"]);
-
-    // Verify the changes are shown as unstaged
+    assert_eq!(repo.current_branch(), "review-main-develop");
+    assert_eq!(repo.rev_parse("HEAD"), merge_base);
     assert!(
-        repo.has_uncommitted_changes(),
-        "Should have uncommitted changes"
+        repo.cached_diff().is_empty(),
+        "review must leave the real index empty"
+    );
+    assert_eq!(repo.worktree_diff(), expected_diff);
+    assert_eq!(repo.read_file("shared.txt"), "develop version\n");
+    assert_eq!(repo.read_file("added.txt"), "added on develop\n");
+    assert!(!repo.path().join("deleted.txt").exists());
+    assert!(!repo.path().join("main-only.txt").exists());
+
+    let status = String::from_utf8(
+        repo.git(&["status", "--porcelain=v1", "-z", "--untracked-files=all"])
+            .stdout,
+    )
+    .expect("porcelain status should be UTF-8");
+    let status_records: BTreeSet<&str> = status
+        .split('\0')
+        .filter(|record| !record.is_empty())
+        .collect();
+    assert_eq!(
+        status_records,
+        BTreeSet::from([" M shared.txt", " D deleted.txt", "?? added.txt"])
     );
 
-    // Check status for new files
-    let status = repo.git(&["status", "--porcelain"]);
-    let status_str = String::from_utf8_lossy(&status.stdout);
-    assert!(
-        status_str.contains("feature.txt"),
-        "feature.txt should appear in status"
-    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("Review branch prepared successfully"));
+    assert!(output.stderr.is_empty());
 }
 
-/// Test that `cresca approve` commits staged changes and discards unstaged ones.
+/// Test that `cresca approve` commits exactly the staged tree and discards everything else.
 #[test]
 fn test_approve_commits_staged() {
     let repo = TempGitRepo::new();
 
-    // Setup: create develop with two files
-    repo.create_branch("develop");
-    repo.write_file("reviewed.txt", "reviewed content");
-    repo.write_file("not_reviewed.txt", "not reviewed content");
+    let base_content = "line 1\nline 2\nline 3\nline 4\nline 5\nline 6\nline 7\nline 8\n";
+    let partial_expected_content =
+        "line 1\nreviewed line 2\nline 3\nline 4\nline 5\nline 6\nline 7\nline 8\n";
+    let full_develop_content =
+        "line 1\nreviewed line 2\nline 3\nline 4\nline 5\nline 6\nreviewed line 7\nline 8\n";
+    let approved_content = "approved addition\n";
+
+    repo.write_file("reviewed.txt", base_content);
+    repo.write_file("kept.txt", "keep this file\n");
     repo.git(&["add", "."]);
-    repo.commit("Add features");
+    repo.commit("Add approval base files");
+    repo.git(&["push", "origin", "main"]);
+
+    repo.create_branch("develop");
+    repo.write_file("reviewed.txt", full_develop_content);
+    repo.write_file("approved.txt", approved_content);
+    repo.write_file("unreviewed.txt", "unreviewed addition\n");
+    repo.git(&["rm", "kept.txt"]);
+    repo.git(&["add", "."]);
+    repo.commit("Add mixed approval changes");
     repo.git(&["push", "-u", "origin", "develop"]);
 
-    // Switch back to main and run review
     repo.switch_branch("main");
-    repo.run_cresca(&["review", "main", "develop"]);
+    let review_output = repo.run_cresca(&["review", "main", "develop"]);
+    assert!(
+        review_output.status.success(),
+        "cresca review should succeed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&review_output.stdout),
+        String::from_utf8_lossy(&review_output.stderr)
+    );
 
-    // Stage only one file (simulating partial review)
+    repo.git(&["add", "approved.txt"]);
+    repo.write_file("reviewed.txt", partial_expected_content);
     repo.git(&["add", "reviewed.txt"]);
+    repo.write_file("reviewed.txt", full_develop_content);
 
-    // Run approve
+    let expected_tree = repo.git_stdout(&["write-tree"]);
+    let expected_commit_diff = repo.cached_diff();
+    let parent = repo.rev_parse("HEAD");
+
     let output = repo.run_cresca(&["approve"]);
     assert!(
         output.status.success(),
@@ -92,35 +227,96 @@ fn test_approve_commits_staged() {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-
-    // Verify: reviewed.txt should be committed
-    let files_in_head = repo.git(&["ls-tree", "--name-only", "HEAD"]);
-    let files_str = String::from_utf8_lossy(&files_in_head.stdout);
-    assert!(
-        files_str.contains("reviewed.txt"),
-        "reviewed.txt should be committed"
+    assert_eq!(
+        repo.git_stdout(&["show", "-s", "--format=%s", "HEAD"]),
+        "Approve reviewed changes"
     );
-
-    // Verify: not_reviewed.txt should NOT exist (discarded)
-    let not_reviewed_path = repo.path().join("not_reviewed.txt");
-    assert!(
-        !not_reviewed_path.exists(),
-        "not_reviewed.txt should be discarded"
+    assert_eq!(repo.rev_parse("HEAD^"), parent);
+    assert_eq!(repo.rev_parse("HEAD^{tree}"), expected_tree);
+    assert_eq!(
+        repo.git(&[
+            "show",
+            "--format=",
+            "--binary",
+            "--no-ext-diff",
+            "--no-renames",
+            "HEAD",
+        ])
+        .stdout,
+        expected_commit_diff
     );
+    assert!(repo.cached_diff().is_empty());
+    assert!(repo.worktree_diff().is_empty());
+    assert_eq!(repo.read_file("reviewed.txt"), partial_expected_content);
+    assert_eq!(repo.read_file("approved.txt"), approved_content);
+    assert!(!repo.path().join("unreviewed.txt").exists());
+    assert!(repo.path().join("kept.txt").exists());
+    assert!(String::from_utf8_lossy(&output.stdout)
+        .contains("Reviewed changes were approved successfully"));
+    assert!(output.stderr.is_empty());
+}
 
-    // Verify: working directory is clean
+/// Test that an empty approval ends the work session without approving any source change.
+#[test]
+fn test_approve_with_no_staged_changes_approves_nothing() {
+    let repo = TempGitRepo::new();
+
+    repo.write_file("tracked.txt", "base content\n");
+    repo.git(&["add", "."]);
+    repo.commit("Add empty approval base");
+    repo.git(&["push", "origin", "main"]);
+
+    repo.create_branch("develop");
+    repo.write_file("tracked.txt", "develop content\n");
+    repo.write_file("added.txt", "new source file\n");
+    repo.git(&["add", "."]);
+    repo.commit("Add empty approval source changes");
+    repo.git(&["push", "-u", "origin", "develop"]);
+
+    let expected_source_diff = repo.diff("main", "develop");
+    repo.switch_branch("main");
+    let review_output = repo.run_cresca(&["review", "main", "develop"]);
     assert!(
-        !repo.has_uncommitted_changes(),
-        "Working directory should be clean after approve"
+        review_output.status.success(),
+        "cresca review should succeed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&review_output.stdout),
+        String::from_utf8_lossy(&review_output.stderr)
     );
+    assert_eq!(repo.worktree_diff(), expected_source_diff);
+    let head_before = repo.rev_parse("HEAD");
+
+    let output = repo.run_cresca(&["approve"]);
+    assert!(
+        output.status.success(),
+        "empty cresca approve should succeed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(repo.rev_parse("HEAD"), head_before);
+    assert!(repo.cached_diff().is_empty());
+    assert!(repo.worktree_diff().is_empty());
+    assert!(String::from_utf8_lossy(&output.stdout)
+        .contains("There are no reviewed changes to approve"));
+    assert!(output.stderr.is_empty());
+
+    let rereview_output = repo.run_cresca(&["review", "main", "develop"]);
+    assert!(
+        rereview_output.status.success(),
+        "cresca re-review should succeed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&rereview_output.stdout),
+        String::from_utf8_lossy(&rereview_output.stderr)
+    );
+    assert_eq!(repo.rev_parse("HEAD"), head_before);
+    assert_eq!(repo.worktree_diff(), expected_source_diff);
 }
 
 /// Test that `cresca approve` fails on a non-review branch.
 #[test]
 fn test_approve_on_non_review_branch() {
     let repo = TempGitRepo::new();
+    prepare_staged_unstaged_and_untracked_changes(&repo);
+    let before = repo.snapshot();
 
-    // Try to approve on main (not a review branch)
     let output = repo.run_cresca(&["approve"]);
 
     assert!(
@@ -130,9 +326,10 @@ fn test_approve_on_non_review_branch() {
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("error") || stderr.contains("Not on a review branch"),
-        "Should show error message about not being on review branch"
+        stderr.contains("Not on a review branch"),
+        "expected non-review diagnostic, got: {stderr}"
     );
+    assert_eq!(repo.snapshot(), before);
 }
 
 /// Test that `cresca review` fails with uncommitted changes.
@@ -140,15 +337,16 @@ fn test_approve_on_non_review_branch() {
 fn test_review_with_uncommitted_changes() {
     let repo = TempGitRepo::new();
 
-    // Create develop branch and push it
     repo.create_branch("develop");
+    repo.write_file("develop.txt", "develop content\n");
+    repo.git(&["add", "."]);
+    repo.commit("Add develop change");
     repo.git(&["push", "-u", "origin", "develop"]);
     repo.switch_branch("main");
 
-    // Create uncommitted changes
-    repo.write_file("uncommitted.txt", "uncommitted content");
+    prepare_staged_unstaged_and_untracked_changes(&repo);
+    let before = repo.snapshot();
 
-    // Try to run review
     let output = repo.run_cresca(&["review", "main", "develop"]);
 
     assert!(
@@ -158,9 +356,11 @@ fn test_review_with_uncommitted_changes() {
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("error") || stderr.contains("Uncommitted"),
-        "Should show error about uncommitted changes"
+        stderr.contains("Uncommitted changes found"),
+        "expected uncommitted-changes diagnostic, got: {stderr}"
     );
+    assert_eq!(repo.snapshot(), before);
+    assert!(!repo.ref_exists("refs/heads/review-main-develop"));
 }
 
 /// Test that running review twice updates the review branch correctly.
@@ -212,36 +412,10 @@ fn test_review_updates_existing_branch() {
 /// Test that `cresca review --skip-to` auto-approves earlier commits.
 #[test]
 fn test_review_with_skip_to_option() {
-    let repo = TempGitRepo::new();
+    let (repo, range) = setup_linear_range();
+    let skip_to = &range.b[..8];
 
-    // Create develop branch with multiple commits
-    repo.create_branch("develop");
-    repo.write_file("file1.txt", "content 1");
-    repo.git(&["add", "."]);
-    repo.commit("Add file1");
-
-    repo.write_file("file2.txt", "content 2");
-    repo.git(&["add", "."]);
-    repo.commit("Add file2");
-
-    repo.write_file("file3.txt", "content 3");
-    repo.git(&["add", "."]);
-    repo.commit("Add file3");
-
-    repo.git(&["push", "-u", "origin", "develop"]);
-
-    // Get the hash of second commit (file2)
-    let log_output = repo.git(&["log", "--oneline", "main..develop"]);
-    let log_str = String::from_utf8_lossy(&log_output.stdout);
-    let commits: Vec<&str> = log_str.lines().collect();
-    // commits[0] = file3, commits[1] = file2, commits[2] = file1
-    let file2_hash = commits[1].split_whitespace().next().unwrap();
-
-    // Switch back to main
-    repo.switch_branch("main");
-
-    // Run cresca review with --skip-to option (skip to file2 commit)
-    let output = repo.run_cresca(&["review", "main", "develop", "--skip-to", file2_hash]);
+    let output = repo.run_cresca(&["review", "main", "develop", "--skip-to", skip_to]);
     assert!(
         output.status.success(),
         "cresca review --skip-to should succeed\nstdout: {}\nstderr: {}",
@@ -249,25 +423,38 @@ fn test_review_with_skip_to_option() {
         String::from_utf8_lossy(&output.stderr)
     );
 
-    // Verify: file1.txt should be auto-approved (committed)
-    let files_in_head = repo.git(&["ls-tree", "--name-only", "HEAD"]);
-    let files_str = String::from_utf8_lossy(&files_in_head.stdout);
+    assert_eq!(
+        repo.git_stdout(&["show", "-s", "--format=%s", "HEAD"]),
+        "Auto-approve earlier commits"
+    );
+    assert_eq!(
+        repo.git_stdout(&["rev-list", "--count", &format!("{}..HEAD", range.base)]),
+        "1"
+    );
+    assert_eq!(
+        repo.rev_parse("HEAD^{tree}"),
+        repo.rev_parse(&format!("{}^{{tree}}", range.a))
+    );
+    assert!(repo.cached_diff().is_empty());
+    assert_eq!(repo.worktree_diff(), repo.diff("HEAD", &range.d));
+}
+
+#[test]
+fn test_review_with_skip_to_first_commit_keeps_full_range_unstaged() {
+    let (repo, range) = setup_linear_range();
+    let skip_to = &range.a[..8];
+
+    let output = repo.run_cresca(&["review", "main", "develop", "--skip-to", skip_to]);
     assert!(
-        files_str.contains("file1.txt"),
-        "file1.txt should be auto-approved and committed"
+        output.status.success(),
+        "cresca review --skip-to A should succeed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
     );
 
-    // Verify: file2.txt and file3.txt should be unstaged changes
-    let status = repo.git(&["status", "--porcelain"]);
-    let status_str = String::from_utf8_lossy(&status.stdout);
-    assert!(
-        status_str.contains("file2.txt"),
-        "file2.txt should be an unstaged change"
-    );
-    assert!(
-        status_str.contains("file3.txt"),
-        "file3.txt should be an unstaged change"
-    );
+    assert_eq!(repo.rev_parse("HEAD"), range.base);
+    assert!(repo.cached_diff().is_empty());
+    assert_eq!(repo.worktree_diff(), repo.diff(&range.base, &range.d));
 }
 
 /// Test that `cresca review --skip-to` with already approved commits works correctly.
@@ -317,19 +504,27 @@ fn test_review_with_skip_to_already_approved() {
 fn test_status_shows_diff_stats() {
     let repo = TempGitRepo::new();
 
-    // Create a develop branch with some changes
-    repo.create_branch("develop");
-    repo.write_file("feature1.txt", "new feature 1");
-    repo.write_file("feature2.txt", "new feature 2");
+    repo.write_file("changed.txt", "line one\nline two\n");
     repo.git(&["add", "."]);
-    repo.commit("Add features");
+    repo.commit("Add status base file");
+    repo.git(&["push", "origin", "main"]);
+
+    repo.create_branch("develop");
+    repo.write_file("changed.txt", "line one\nchanged line two\n");
+    repo.write_file("added.txt", "added line one\nadded line two\n");
+    repo.git(&["add", "."]);
+    repo.commit("Add status changes");
     repo.git(&["push", "-u", "origin", "develop"]);
 
-    // Switch back to main and run review
     repo.switch_branch("main");
-    repo.run_cresca(&["review", "main", "develop"]);
+    let review_output = repo.run_cresca(&["review", "main", "develop"]);
+    assert!(
+        review_output.status.success(),
+        "cresca review should succeed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&review_output.stdout),
+        String::from_utf8_lossy(&review_output.stderr)
+    );
 
-    // Run status
     let output = repo.run_cresca(&["status"]);
     assert!(
         output.status.success(),
@@ -337,27 +532,26 @@ fn test_status_shows_diff_stats() {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        stdout.contains("Review status"),
-        "Should show review status header"
+    assert_eq!(
+        String::from_utf8(output.stdout).expect("status stdout should be UTF-8"),
+        concat!(
+            "📋 Review status:\n",
+            "  Remaining diff to develop: 2 file(s), +3 insertion(s), -1 deletion(s)\n",
+            "  Files remaining:\n",
+            "    - added.txt\n",
+            "    - changed.txt\n",
+        )
     );
-    assert!(
-        stdout.contains("Remaining diff to develop"),
-        "Should mention develop branch"
-    );
-    assert!(stdout.contains("2 file(s)"), "Should show 2 files changed");
-    assert!(stdout.contains("feature1.txt"), "Should list feature1.txt");
-    assert!(stdout.contains("feature2.txt"), "Should list feature2.txt");
+    assert!(output.stderr.is_empty());
 }
 
 /// Test that `cresca status` fails on a non-review branch.
 #[test]
 fn test_status_on_non_review_branch() {
     let repo = TempGitRepo::new();
+    prepare_staged_unstaged_and_untracked_changes(&repo);
+    let before = repo.snapshot();
 
-    // Try to run status on main (not a review branch)
     let output = repo.run_cresca(&["status"]);
 
     assert!(
@@ -367,9 +561,10 @@ fn test_status_on_non_review_branch() {
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("error") || stderr.contains("Not on a review branch"),
-        "Should show error message about not being on review branch"
+        stderr.contains("Not on a review branch"),
+        "expected non-review diagnostic, got: {stderr}"
     );
+    assert_eq!(repo.snapshot(), before);
 }
 
 /// Test that `cresca status` updates after partial approval.
@@ -377,85 +572,94 @@ fn test_status_on_non_review_branch() {
 fn test_status_after_partial_approval() {
     let repo = TempGitRepo::new();
 
-    // Create develop branch with multiple files
-    repo.create_branch("develop");
-    repo.write_file("file1.txt", "content 1");
-    repo.write_file("file2.txt", "content 2");
-    repo.write_file("file3.txt", "content 3");
+    repo.write_file("changed.txt", "line one\nline two\n");
     repo.git(&["add", "."]);
-    repo.commit("Add three files");
+    repo.commit("Add status base file");
+    repo.git(&["push", "origin", "main"]);
+
+    repo.create_branch("develop");
+    repo.write_file("changed.txt", "line one\nchanged line two\n");
+    repo.write_file("added.txt", "added line one\nadded line two\n");
+    repo.git(&["add", "."]);
+    repo.commit("Add status changes");
     repo.git(&["push", "-u", "origin", "develop"]);
 
-    // Switch back to main and run review
     repo.switch_branch("main");
-    repo.run_cresca(&["review", "main", "develop"]);
+    let review_output = repo.run_cresca(&["review", "main", "develop"]);
+    assert!(
+        review_output.status.success(),
+        "cresca review should succeed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&review_output.stdout),
+        String::from_utf8_lossy(&review_output.stderr)
+    );
 
-    // Initial status should show 3 files
+    repo.git(&["add", "added.txt"]);
+    let approve_output = repo.run_cresca(&["approve"]);
+    assert!(
+        approve_output.status.success(),
+        "partial cresca approve should succeed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&approve_output.stdout),
+        String::from_utf8_lossy(&approve_output.stderr)
+    );
+
     let output = repo.run_cresca(&["status"]);
-    let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        stdout.contains("3 file(s)"),
-        "Should initially show 3 files, got: {}",
-        stdout
+        output.status.success(),
+        "cresca status should succeed after partial approval\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8(output.stdout).expect("status stdout should be UTF-8"),
+        concat!(
+            "📋 Review status:\n",
+            "  Remaining diff to develop: 1 file(s), +1 insertion(s), -1 deletion(s)\n",
+            "  Files remaining:\n",
+            "    - changed.txt\n",
+        )
+    );
+    assert!(output.stderr.is_empty());
+
+    let rereview_output = repo.run_cresca(&["review", "main", "develop"]);
+    assert!(
+        rereview_output.status.success(),
+        "cresca re-review should succeed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&rereview_output.stdout),
+        String::from_utf8_lossy(&rereview_output.stderr)
+    );
+    repo.git(&["add", "."]);
+    let final_approve_output = repo.run_cresca(&["approve"]);
+    assert!(
+        final_approve_output.status.success(),
+        "final cresca approve should succeed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&final_approve_output.stdout),
+        String::from_utf8_lossy(&final_approve_output.stderr)
     );
 
-    // Approve only one file
-    repo.git(&["add", "file1.txt"]);
-    repo.run_cresca(&["approve"]);
-
-    // Run review again to see remaining changes
-    repo.run_cresca(&["review", "main", "develop"]);
-
-    // Status should show remaining files (file2.txt and file3.txt)
     let output = repo.run_cresca(&["status"]);
-    let stdout = String::from_utf8_lossy(&output.stdout);
-
-    // After partial approval, approved file should not appear in unstaged diff
     assert!(
-        stdout.contains("file2.txt"),
-        "file2.txt should be in remaining files, got: {}",
-        stdout
+        output.status.success(),
+        "cresca status should succeed after all changes are approved\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
     );
-    assert!(
-        stdout.contains("file3.txt"),
-        "file3.txt should be in remaining files, got: {}",
-        stdout
+    assert_eq!(
+        String::from_utf8(output.stdout).expect("status stdout should be UTF-8"),
+        concat!(
+            "📋 Review status:\n",
+            "  Remaining diff to develop: 0 file(s), +0 insertion(s), -0 deletion(s)\n",
+        )
     );
+    assert!(output.stderr.is_empty());
 }
 
 /// Test that `cresca review --stop-at` excludes later commits from review.
 #[test]
 fn test_review_with_stop_at_option() {
-    let repo = TempGitRepo::new();
+    let (repo, range) = setup_linear_range();
+    let stop_at = &range.c[..8];
 
-    // Create develop branch with multiple commits
-    repo.create_branch("develop");
-    repo.write_file("file1.txt", "content 1");
-    repo.git(&["add", "."]);
-    repo.commit("Add file1");
-
-    repo.write_file("file2.txt", "content 2");
-    repo.git(&["add", "."]);
-    repo.commit("Add file2");
-
-    repo.write_file("file3.txt", "content 3");
-    repo.git(&["add", "."]);
-    repo.commit("Add file3");
-
-    repo.git(&["push", "-u", "origin", "develop"]);
-
-    // Get the hash of second commit (file2)
-    let log_output = repo.git(&["log", "--oneline", "main..develop"]);
-    let log_str = String::from_utf8_lossy(&log_output.stdout);
-    let commits: Vec<&str> = log_str.lines().collect();
-    // commits[0] = file3, commits[1] = file2, commits[2] = file1
-    let file2_hash = commits[1].split_whitespace().next().unwrap();
-
-    // Switch back to main
-    repo.switch_branch("main");
-
-    // Run cresca review with --stop-at option (stop at file2 commit)
-    let output = repo.run_cresca(&["review", "main", "develop", "--stop-at", file2_hash]);
+    let output = repo.run_cresca(&["review", "main", "develop", "--stop-at", stop_at]);
     assert!(
         output.status.success(),
         "cresca review --stop-at should succeed\nstdout: {}\nstderr: {}",
@@ -463,72 +667,45 @@ fn test_review_with_stop_at_option() {
         String::from_utf8_lossy(&output.stderr)
     );
 
-    // Verify: file1.txt and file2.txt should be unstaged changes (in review)
-    let status = repo.git(&["status", "--porcelain"]);
-    let status_str = String::from_utf8_lossy(&status.stdout);
+    assert_eq!(repo.rev_parse("HEAD"), range.base);
+    assert!(repo.cached_diff().is_empty());
+    assert_eq!(repo.worktree_diff(), repo.diff(&range.base, &range.c));
+    assert!(!repo.path().join("d.txt").exists());
+}
+
+#[test]
+fn test_review_with_stop_at_last_commit_keeps_full_range_unstaged() {
+    let (repo, range) = setup_linear_range();
+    let stop_at = &range.d[..8];
+
+    let output = repo.run_cresca(&["review", "main", "develop", "--stop-at", stop_at]);
     assert!(
-        status_str.contains("file1.txt"),
-        "file1.txt should be an unstaged change"
-    );
-    assert!(
-        status_str.contains("file2.txt"),
-        "file2.txt should be an unstaged change"
+        output.status.success(),
+        "cresca review --stop-at D should succeed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
     );
 
-    // Verify: file3.txt should NOT appear (excluded from review)
-    assert!(
-        !status_str.contains("file3.txt"),
-        "file3.txt should NOT appear (excluded by --stop-at)"
-    );
+    assert_eq!(repo.rev_parse("HEAD"), range.base);
+    assert!(repo.cached_diff().is_empty());
+    assert_eq!(repo.worktree_diff(), repo.diff(&range.base, &range.d));
 }
 
 /// Test that `cresca review --skip-to --stop-at` limits review to specific range.
 #[test]
 fn test_review_with_skip_to_and_stop_at() {
-    let repo = TempGitRepo::new();
+    let (repo, range) = setup_linear_range();
+    let skip_to = &range.b[..8];
+    let stop_at = &range.c[..8];
 
-    // Create develop branch with multiple commits: A -> B -> C -> D
-    repo.create_branch("develop");
-    repo.write_file("fileA.txt", "content A");
-    repo.git(&["add", "."]);
-    repo.commit("Add fileA");
-
-    repo.write_file("fileB.txt", "content B");
-    repo.git(&["add", "."]);
-    repo.commit("Add fileB");
-
-    repo.write_file("fileC.txt", "content C");
-    repo.git(&["add", "."]);
-    repo.commit("Add fileC");
-
-    repo.write_file("fileD.txt", "content D");
-    repo.git(&["add", "."]);
-    repo.commit("Add fileD");
-
-    repo.git(&["push", "-u", "origin", "develop"]);
-
-    // Get commit hashes
-    // Log order: D (newest) -> C -> B -> A (oldest)
-    let log_output = repo.git(&["log", "--oneline", "main..develop"]);
-    let log_str = String::from_utf8_lossy(&log_output.stdout);
-    let commits: Vec<&str> = log_str.lines().collect();
-    let _file_d_hash = commits[0].split_whitespace().next().unwrap();
-    let file_c_hash = commits[1].split_whitespace().next().unwrap();
-    let file_b_hash = commits[2].split_whitespace().next().unwrap();
-    let _file_a_hash = commits[3].split_whitespace().next().unwrap();
-
-    // Switch back to main
-    repo.switch_branch("main");
-
-    // Run cresca review: skip A, review B and C, exclude D
     let output = repo.run_cresca(&[
         "review",
         "main",
         "develop",
         "--skip-to",
-        file_b_hash,
+        skip_to,
         "--stop-at",
-        file_c_hash,
+        stop_at,
     ]);
     assert!(
         output.status.success(),
@@ -537,38 +714,59 @@ fn test_review_with_skip_to_and_stop_at() {
         String::from_utf8_lossy(&output.stderr)
     );
 
-    // Verify: fileA.txt should be auto-approved (committed)
-    let files_in_head = repo.git(&["ls-tree", "--name-only", "HEAD"]);
-    let files_str = String::from_utf8_lossy(&files_in_head.stdout);
+    assert_eq!(
+        repo.git_stdout(&["show", "-s", "--format=%s", "HEAD"]),
+        "Auto-approve earlier commits"
+    );
+    assert_eq!(
+        repo.git_stdout(&["rev-list", "--count", &format!("{}..HEAD", range.base)]),
+        "1"
+    );
+    assert_eq!(
+        repo.rev_parse("HEAD^{tree}"),
+        repo.rev_parse(&format!("{}^{{tree}}", range.a))
+    );
+    assert!(repo.cached_diff().is_empty());
+    assert_eq!(repo.worktree_diff(), repo.diff("HEAD", &range.c));
+    assert!(!repo.path().join("d.txt").exists());
+}
+
+#[test]
+fn test_review_with_skip_to_and_stop_at_same_commit_includes_that_commit() {
+    let (repo, range) = setup_linear_range();
+    let boundary = &range.c[..8];
+
+    let output = repo.run_cresca(&[
+        "review",
+        "main",
+        "develop",
+        "--skip-to",
+        boundary,
+        "--stop-at",
+        boundary,
+    ]);
     assert!(
-        files_str.contains("fileA.txt"),
-        "fileA.txt should be auto-approved and committed"
+        output.status.success(),
+        "cresca review --skip-to C --stop-at C should succeed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
     );
 
-    // Verify: fileB.txt and fileC.txt should be unstaged changes (in review)
-    let status = repo.git(&["status", "--porcelain"]);
-    let status_str = String::from_utf8_lossy(&status.stdout);
-    assert!(
-        status_str.contains("fileB.txt"),
-        "fileB.txt should be an unstaged change"
+    assert_eq!(
+        repo.git_stdout(&["show", "-s", "--format=%s", "HEAD"]),
+        "Auto-approve earlier commits"
     );
-    assert!(
-        status_str.contains("fileC.txt"),
-        "fileC.txt should be an unstaged change"
+    assert_eq!(
+        repo.git_stdout(&["rev-list", "--count", &format!("{}..HEAD", range.base)]),
+        "1"
     );
-
-    // Verify: fileD.txt should NOT appear (excluded by --stop-at)
-    assert!(
-        !status_str.contains("fileD.txt"),
-        "fileD.txt should NOT appear (excluded by --stop-at), got: {}",
-        status_str
+    assert_eq!(
+        repo.rev_parse("HEAD^{tree}"),
+        repo.rev_parse(&format!("{}^{{tree}}", range.b))
     );
-
-    // Additional check: fileD.txt should not be committed either
-    assert!(
-        !files_str.contains("fileD.txt"),
-        "fileD.txt should not be in HEAD"
-    );
+    assert!(repo.cached_diff().is_empty());
+    assert_eq!(repo.worktree_diff(), repo.diff("HEAD", &range.c));
+    assert!(!repo.path().join("d.txt").exists());
 }
 
 /// Test that `cresca review --stop-at` fails with invalid commit hash.
@@ -583,10 +781,9 @@ fn test_review_with_invalid_stop_at() {
     repo.commit("Add file1");
     repo.git(&["push", "-u", "origin", "develop"]);
 
-    // Switch back to main
     repo.switch_branch("main");
+    let before = repo.snapshot();
 
-    // Run cresca review with invalid --stop-at hash
     let output = repo.run_cresca(&["review", "main", "develop", "--stop-at", "invalidhash"]);
 
     assert!(
@@ -596,52 +793,73 @@ fn test_review_with_invalid_stop_at() {
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("error") && stderr.contains("invalidhash"),
-        "Should show error about invalid commit hash, got: {}",
-        stderr
+        stderr.contains("invalidhash") && stderr.contains("is not in the range"),
+        "expected invalid range diagnostic, got: {stderr}"
     );
+    assert_eq!(repo.snapshot(), before);
+    assert!(!repo.ref_exists("refs/heads/review-main-develop"));
+}
+
+#[test]
+fn test_review_with_nonexistent_skip_to_is_atomic() {
+    let (repo, _) = setup_linear_range();
+    let before = repo.snapshot();
+
+    let output = repo.run_cresca(&["review", "main", "develop", "--skip-to", "does-not-exist"]);
+
+    assert!(
+        !output.status.success(),
+        "cresca review --skip-to with a nonexistent revision should fail"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("does-not-exist") && stderr.contains("is not in the range"),
+        "expected invalid range diagnostic, got: {stderr}"
+    );
+    assert_eq!(repo.snapshot(), before);
+    assert!(!repo.ref_exists("refs/heads/review-main-develop"));
+}
+
+#[test]
+fn test_review_with_out_of_range_skip_to_is_atomic() {
+    let (repo, _) = setup_linear_range();
+    repo.create_branch("unrelated");
+    repo.write_file("unrelated.txt", "outside the review range\n");
+    repo.git(&["add", "."]);
+    repo.commit("Add unrelated commit");
+    let unrelated_commit = repo.rev_parse("HEAD");
+    repo.switch_branch("main");
+    let before = repo.snapshot();
+
+    let output = repo.run_cresca(&["review", "main", "develop", "--skip-to", &unrelated_commit]);
+
+    assert!(
+        !output.status.success(),
+        "cresca review --skip-to with an out-of-range revision should fail"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(&unrelated_commit) && stderr.contains("is not in the range"),
+        "expected invalid range diagnostic, got: {stderr}"
+    );
+    assert_eq!(repo.snapshot(), before);
+    assert!(!repo.ref_exists("refs/heads/review-main-develop"));
 }
 
 /// Test that `cresca review` fails when --stop-at is before --skip-to.
 #[test]
 fn test_review_with_stop_at_before_skip_to() {
-    let repo = TempGitRepo::new();
+    let (repo, range) = setup_linear_range();
+    let before = repo.snapshot();
 
-    // Create develop branch with multiple commits
-    repo.create_branch("develop");
-    repo.write_file("file1.txt", "content 1");
-    repo.git(&["add", "."]);
-    repo.commit("Add file1");
-
-    repo.write_file("file2.txt", "content 2");
-    repo.git(&["add", "."]);
-    repo.commit("Add file2");
-
-    repo.write_file("file3.txt", "content 3");
-    repo.git(&["add", "."]);
-    repo.commit("Add file3");
-
-    repo.git(&["push", "-u", "origin", "develop"]);
-
-    // Get commit hashes: file3 (newest), file2, file1 (oldest)
-    let log_output = repo.git(&["log", "--oneline", "main..develop"]);
-    let log_str = String::from_utf8_lossy(&log_output.stdout);
-    let commits: Vec<&str> = log_str.lines().collect();
-    let file3_hash = commits[0].split_whitespace().next().unwrap();
-    let file1_hash = commits[2].split_whitespace().next().unwrap();
-
-    // Switch back to main
-    repo.switch_branch("main");
-
-    // Run cresca review with --stop-at BEFORE --skip-to (invalid)
     let output = repo.run_cresca(&[
         "review",
         "main",
         "develop",
         "--skip-to",
-        file3_hash,
+        &range.c,
         "--stop-at",
-        file1_hash,
+        &range.a,
     ]);
 
     assert!(
@@ -651,10 +869,11 @@ fn test_review_with_stop_at_before_skip_to() {
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("error") && stderr.contains("--stop-at"),
-        "Should show error about --stop-at being before --skip-to, got: {}",
-        stderr
+        stderr.contains("must be at or after"),
+        "expected reversed range diagnostic, got: {stderr}"
     );
+    assert_eq!(repo.snapshot(), before);
+    assert!(!repo.ref_exists("refs/heads/review-main-develop"));
 }
 
 /// Test that `cresca review` works with branch names containing slashes.
@@ -662,12 +881,22 @@ fn test_review_with_stop_at_before_skip_to() {
 fn test_review_with_slash_in_branch_name() {
     let repo = TempGitRepo::new();
     repo.create_branch("feature/login-page");
-    repo.write_file("login.txt", "login stuff");
+    repo.write_file("login.txt", "login stuff\n");
     repo.git(&["add", "."]);
     repo.commit("Add login");
     repo.git(&["push", "-u", "origin", "feature/login-page"]);
 
+    repo.write_file("local-source-decoy.txt", "must not be reviewed\n");
+    repo.git(&["add", "."]);
+    repo.commit("Add unpushed source decoy");
+
     repo.switch_branch("main");
+    repo.write_file(
+        "local-target-decoy.txt",
+        "must not become the review base\n",
+    );
+    repo.git(&["add", "."]);
+    repo.commit("Add unpushed target decoy");
     let output = repo.run_cresca(&["review", "main", "feature/login-page"]);
     assert!(
         output.status.success(),
@@ -675,6 +904,17 @@ fn test_review_with_slash_in_branch_name() {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+    assert_review_matches(
+        &repo,
+        "review-main-feature_login-page",
+        "origin/main",
+        "origin/feature/login-page",
+    );
+    assert_eq!(repo.read_file("login.txt"), "login stuff\n");
+    assert!(!repo.path().join("local-source-decoy.txt").exists());
+    assert!(!repo.path().join("local-target-decoy.txt").exists());
+    assert!(String::from_utf8_lossy(&output.stdout).contains("Review branch prepared successfully"));
+    assert!(output.stderr.is_empty());
 }
 
 /// Test that `cresca review` works when the local branch does not exist.
@@ -683,7 +923,7 @@ fn test_review_without_local_branch() {
     let repo = TempGitRepo::new();
     // Simulate another user pushing a branch
     repo.create_branch("other-users-feature");
-    repo.write_file("other.txt", "other stuff");
+    repo.write_file("other.txt", "other stuff\n");
     repo.git(&["add", "."]);
     repo.commit("Add other stuff");
     repo.git(&["push", "-u", "origin", "other-users-feature"]);
@@ -691,6 +931,13 @@ fn test_review_without_local_branch() {
     // Switch to main and completely delete the local branch
     repo.switch_branch("main");
     repo.git(&["branch", "-D", "other-users-feature"]);
+    assert!(!repo.ref_exists("refs/heads/other-users-feature"));
+    repo.write_file(
+        "local-target-decoy.txt",
+        "must not become the review base\n",
+    );
+    repo.git(&["add", "."]);
+    repo.commit("Add unpushed target decoy");
 
     let output = repo.run_cresca(&["review", "main", "other-users-feature"]);
     assert!(
@@ -699,6 +946,16 @@ fn test_review_without_local_branch() {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+    assert_review_matches(
+        &repo,
+        "review-main-other-users-feature",
+        "origin/main",
+        "origin/other-users-feature",
+    );
+    assert_eq!(repo.read_file("other.txt"), "other stuff\n");
+    assert!(!repo.path().join("local-target-decoy.txt").exists());
+    assert!(String::from_utf8_lossy(&output.stdout).contains("Review branch prepared successfully"));
+    assert!(output.stderr.is_empty());
 }
 
 /// Test that `cresca review` works with a custom remote name (e.g. upstream).
@@ -710,14 +967,42 @@ fn test_review_with_custom_remote() {
     repo.git(&["remote", "rename", "origin", "upstream"]);
 
     repo.create_branch("develop");
-    repo.write_file("dev.txt", "dev stuff");
+    repo.write_file("dev.txt", "dev stuff\n");
     repo.git(&["add", "."]);
     repo.commit("Add dev stuff");
-    // Push setting upstream explicitly
     repo.git(&["push", "-u", "upstream", "develop"]);
-    repo.git(&["push", "-u", "upstream", "main"]);
+
+    let wrong_remote = tempfile::TempDir::new().expect("wrong remote should be creatable");
+    repo.git(&["init", "--bare", wrong_remote.path().to_str().unwrap()]);
+    repo.git(&[
+        "remote",
+        "add",
+        "origin",
+        wrong_remote.path().to_str().unwrap(),
+    ]);
+    repo.write_file("origin-source-decoy.txt", "must not be reviewed\n");
+    repo.git(&["add", "."]);
+    repo.commit("Add origin-only source decoy");
+    repo.git(&["push", "origin", "develop"]);
+    repo.write_file("local-source-decoy.txt", "must not be reviewed\n");
+    repo.git(&["add", "."]);
+    repo.commit("Add unpushed source decoy");
 
     repo.switch_branch("main");
+    repo.git(&["push", "-u", "upstream", "main"]);
+    repo.write_file(
+        "origin-target-decoy.txt",
+        "must not become the review base\n",
+    );
+    repo.git(&["add", "."]);
+    repo.commit("Add origin-only target decoy");
+    repo.git(&["push", "origin", "main"]);
+    repo.write_file(
+        "local-target-decoy.txt",
+        "must not become the review base\n",
+    );
+    repo.git(&["add", "."]);
+    repo.commit("Add unpushed target decoy");
     let output = repo.run_cresca(&["review", "main", "develop"]);
     assert!(
         output.status.success(),
@@ -725,6 +1010,19 @@ fn test_review_with_custom_remote() {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+    assert_review_matches(
+        &repo,
+        "review-main-develop",
+        "upstream/main",
+        "upstream/develop",
+    );
+    assert_eq!(repo.read_file("dev.txt"), "dev stuff\n");
+    assert!(!repo.path().join("origin-source-decoy.txt").exists());
+    assert!(!repo.path().join("local-source-decoy.txt").exists());
+    assert!(!repo.path().join("origin-target-decoy.txt").exists());
+    assert!(!repo.path().join("local-target-decoy.txt").exists());
+    assert!(String::from_utf8_lossy(&output.stdout).contains("Review branch prepared successfully"));
+    assert!(output.stderr.is_empty());
 }
 
 /// Test that `cresca review` works when given remote tracking branch explicitly.
@@ -732,12 +1030,22 @@ fn test_review_with_custom_remote() {
 fn test_review_with_explicit_remote_tracking_branch() {
     let repo = TempGitRepo::new();
     repo.create_branch("develop");
-    repo.write_file("dev.txt", "dev stuff");
+    repo.write_file("dev.txt", "dev stuff\n");
     repo.git(&["add", "."]);
     repo.commit("Add dev stuff");
     repo.git(&["push", "-u", "origin", "develop"]);
 
+    repo.write_file("local-source-decoy.txt", "must not be reviewed\n");
+    repo.git(&["add", "."]);
+    repo.commit("Add unpushed source decoy");
+
     repo.switch_branch("main");
+    repo.write_file(
+        "local-target-decoy.txt",
+        "must not become the review base\n",
+    );
+    repo.git(&["add", "."]);
+    repo.commit("Add unpushed target decoy");
     // Pass 'origin/develop' instead of 'develop'
     let output = repo.run_cresca(&["review", "main", "origin/develop"]);
     assert!(
@@ -746,4 +1054,15 @@ fn test_review_with_explicit_remote_tracking_branch() {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+    assert_review_matches(
+        &repo,
+        "review-main-origin_develop",
+        "origin/main",
+        "origin/develop",
+    );
+    assert_eq!(repo.read_file("dev.txt"), "dev stuff\n");
+    assert!(!repo.path().join("local-source-decoy.txt").exists());
+    assert!(!repo.path().join("local-target-decoy.txt").exists());
+    assert!(String::from_utf8_lossy(&output.stdout).contains("Review branch prepared successfully"));
+    assert!(output.stderr.is_empty());
 }
