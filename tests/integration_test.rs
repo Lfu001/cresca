@@ -63,6 +63,19 @@ fn assert_review_matches(
     assert_eq!(repo.worktree_diff(), repo.diff(&merge_base, source_ref));
 }
 
+fn assert_identity_suffixed_branch(branch: &str, base: &str) {
+    let suffix = branch
+        .strip_prefix(&format!("{base}-"))
+        .expect("review branch should retain the readable base name");
+    assert_eq!(suffix.len(), 16);
+    assert!(
+        suffix
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+        "identity suffix should be 16 lowercase hexadecimal characters: {branch}"
+    );
+}
+
 fn prepare_staged_unstaged_and_untracked_changes(repo: &TempGitRepo) {
     repo.write_file("staged.txt", "staged base\n");
     repo.write_file("unstaged.txt", "unstaged base\n");
@@ -1039,6 +1052,264 @@ fn test_review_records_versioned_target_and_source_metadata() {
             "origin/feature/login-page",
         )
     );
+}
+
+#[test]
+fn test_review_does_not_reuse_branch_for_slash_underscore_collision() {
+    let repo = TempGitRepo::new();
+
+    repo.create_branch("feature/foo");
+    repo.write_file("slash.txt", "slash branch\n");
+    repo.git(&["add", "."]);
+    repo.commit("Add slash branch change");
+    repo.git(&["push", "-u", "origin", "feature/foo"]);
+
+    repo.switch_branch("main");
+    repo.create_branch("feature_foo");
+    repo.write_file("underscore.txt", "underscore branch\n");
+    repo.git(&["add", "."]);
+    repo.commit("Add underscore branch change");
+    repo.git(&["push", "-u", "origin", "feature_foo"]);
+
+    repo.switch_branch("main");
+    let first = repo.run_cresca(&["review", "main", "feature/foo"]);
+    assert!(first.status.success());
+    assert_eq!(repo.current_branch(), "review-main-feature_foo");
+    assert!(repo.run_cresca(&["approve"]).status.success());
+    repo.switch_branch("main");
+    let first_oid = repo.rev_parse("refs/heads/review-main-feature_foo");
+
+    let second = repo.run_cresca(&["review", "main", "feature_foo"]);
+    assert!(
+        second.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&second.stdout),
+        String::from_utf8_lossy(&second.stderr)
+    );
+    let second_branch = repo.current_branch();
+    assert_ne!(second_branch, "review-main-feature_foo");
+    assert_identity_suffixed_branch(&second_branch, "review-main-feature_foo");
+    assert_eq!(
+        repo.rev_parse("refs/heads/review-main-feature_foo"),
+        first_oid
+    );
+    assert_eq!(
+        repo.review_metadata_values(&second_branch),
+        (
+            vec!["1".to_string()],
+            vec!["main".to_string()],
+            vec!["feature_foo".to_string()],
+        )
+    );
+    assert!(repo.cached_diff().is_empty());
+    let merge_base = repo.git_stdout(&["merge-base", "origin/main", "origin/feature_foo"]);
+    assert_eq!(
+        repo.worktree_diff(),
+        repo.diff(&merge_base, "origin/feature_foo")
+    );
+    assert!(!repo.path().join("slash.txt").exists());
+    assert_eq!(repo.read_file("underscore.txt"), "underscore branch\n");
+}
+
+#[test]
+fn test_review_does_not_reuse_branch_for_ambiguous_pair_boundary() {
+    let repo = TempGitRepo::new();
+
+    repo.create_branch("release");
+    repo.git(&["push", "-u", "origin", "release"]);
+    repo.create_branch("v1-feature");
+    repo.write_file("pair-one.txt", "first pair\n");
+    repo.git(&["add", "."]);
+    repo.commit("Add first pair change");
+    repo.git(&["push", "-u", "origin", "v1-feature"]);
+
+    repo.switch_branch("main");
+    repo.create_branch("release-v1");
+    repo.write_file("release-v1-base.txt", "second target base\n");
+    repo.git(&["add", "."]);
+    repo.commit("Add second target base");
+    repo.git(&["push", "-u", "origin", "release-v1"]);
+    repo.create_branch("feature");
+    repo.write_file("pair-two.txt", "second pair\n");
+    repo.git(&["add", "."]);
+    repo.commit("Add second pair change");
+    repo.git(&["push", "-u", "origin", "feature"]);
+
+    repo.switch_branch("main");
+    let first = repo.run_cresca(&["review", "release", "v1-feature"]);
+    assert!(first.status.success());
+    assert_eq!(repo.current_branch(), "review-release-v1-feature");
+    assert!(repo.run_cresca(&["approve"]).status.success());
+    repo.switch_branch("main");
+    let first_oid = repo.rev_parse("refs/heads/review-release-v1-feature");
+
+    let second = repo.run_cresca(&["review", "release-v1", "feature"]);
+    assert!(
+        second.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&second.stdout),
+        String::from_utf8_lossy(&second.stderr)
+    );
+    let second_branch = repo.current_branch();
+    assert_ne!(second_branch, "review-release-v1-feature");
+    assert_identity_suffixed_branch(&second_branch, "review-release-v1-feature");
+    assert_eq!(
+        repo.rev_parse("refs/heads/review-release-v1-feature"),
+        first_oid
+    );
+    assert_eq!(
+        repo.review_metadata_values(&second_branch),
+        (
+            vec!["1".to_string()],
+            vec!["release-v1".to_string()],
+            vec!["feature".to_string()],
+        )
+    );
+    assert!(repo.cached_diff().is_empty());
+    let merge_base = repo.git_stdout(&["merge-base", "origin/release-v1", "origin/feature"]);
+    assert_eq!(
+        repo.worktree_diff(),
+        repo.diff(&merge_base, "origin/feature")
+    );
+    assert!(!repo.path().join("pair-one.txt").exists());
+    assert_eq!(repo.read_file("pair-two.txt"), "second pair\n");
+}
+
+#[test]
+fn test_review_leaves_legacy_branch_untouched_and_creates_metadata_backed_branch() {
+    let repo = TempGitRepo::new();
+
+    repo.create_branch("develop");
+    repo.write_file("develop.txt", "develop change\n");
+    repo.git(&["add", "."]);
+    repo.commit("Add develop change");
+    repo.git(&["push", "-u", "origin", "develop"]);
+
+    repo.switch_branch("main");
+    repo.create_branch("review-main-develop");
+    let legacy_oid = repo.rev_parse("HEAD");
+    assert_eq!(
+        repo.review_metadata_values("review-main-develop"),
+        (Vec::new(), Vec::new(), Vec::new())
+    );
+    repo.switch_branch("main");
+
+    let first = repo.run_cresca(&["review", "main", "develop"]);
+    assert!(
+        first.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&first.stdout),
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let metadata_branch = repo.current_branch();
+    assert_identity_suffixed_branch(&metadata_branch, "review-main-develop");
+    assert_eq!(repo.rev_parse("refs/heads/review-main-develop"), legacy_oid);
+    assert_eq!(
+        repo.review_metadata_values("review-main-develop"),
+        (Vec::new(), Vec::new(), Vec::new())
+    );
+    assert_eq!(
+        repo.review_metadata_values(&metadata_branch),
+        (
+            vec!["1".to_string()],
+            vec!["main".to_string()],
+            vec!["develop".to_string()],
+        )
+    );
+    assert!(repo.cached_diff().is_empty());
+    let merge_base = repo.git_stdout(&["merge-base", "origin/main", "origin/develop"]);
+    assert_eq!(
+        repo.worktree_diff(),
+        repo.diff(&merge_base, "origin/develop")
+    );
+
+    assert!(repo.run_cresca(&["approve"]).status.success());
+    repo.switch_branch("main");
+    let heads_before = repo
+        .git(&[
+            "for-each-ref",
+            "--sort=refname",
+            "--format=%(refname) %(objectname)",
+            "refs/heads/",
+        ])
+        .stdout;
+
+    let second = repo.run_cresca(&["review", "main", "develop"]);
+    assert!(
+        second.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&second.stdout),
+        String::from_utf8_lossy(&second.stderr)
+    );
+    assert_eq!(repo.current_branch(), metadata_branch);
+    assert_eq!(
+        repo.git(&[
+            "for-each-ref",
+            "--sort=refname",
+            "--format=%(refname) %(objectname)",
+            "refs/heads/",
+        ])
+        .stdout,
+        heads_before
+    );
+}
+
+#[test]
+fn test_review_fails_atomically_when_base_and_identity_suffix_belong_to_other_reviews() {
+    let repo = TempGitRepo::new();
+
+    repo.create_branch("develop");
+    repo.write_file("develop.txt", "develop change\n");
+    repo.git(&["add", "."]);
+    repo.commit("Add develop change");
+    repo.git(&["push", "-u", "origin", "develop"]);
+
+    repo.switch_branch("main");
+    repo.create_branch("review-main-develop");
+    repo.switch_branch("main");
+
+    let first = repo.run_cresca(&["review", "main", "develop"]);
+    assert!(
+        first.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&first.stdout),
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let suffixed_branch = repo.current_branch();
+    assert_identity_suffixed_branch(&suffixed_branch, "review-main-develop");
+    assert!(repo.run_cresca(&["approve"]).status.success());
+
+    repo.git(&[
+        "config",
+        "--local",
+        &format!("branch.{suffixed_branch}.cresca-target"),
+        "other-target",
+    ]);
+    repo.git(&[
+        "config",
+        "--local",
+        &format!("branch.{suffixed_branch}.cresca-source"),
+        "other-source",
+    ]);
+    assert_eq!(
+        repo.git_config_values(&format!("branch.{suffixed_branch}.cresca-version")),
+        vec!["1".to_string()]
+    );
+
+    repo.switch_branch("main");
+    let before = repo.snapshot();
+    let output = repo.run_cresca(&["review", "main", "develop"]);
+
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("conflicting review branches")
+            && stderr.contains("review-main-develop")
+            && stderr.contains(&suffixed_branch),
+        "expected conflicting review branch diagnostic, got: {stderr}"
+    );
+    assert_eq!(repo.snapshot(), before);
 }
 
 #[test]

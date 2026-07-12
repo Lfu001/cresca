@@ -1,5 +1,6 @@
 use crate::git::{
-    resolve_remote_tracking_branch, run_git_command, write_review_metadata, ReviewMetadata,
+    resolve_remote_tracking_branch, run_git_command, select_review_branch, write_review_metadata,
+    ReviewBranchSelection, ReviewMetadata,
 };
 use colored::Colorize;
 use std::ops::Not;
@@ -25,8 +26,6 @@ pub fn prepare_review_branch(
         target: to_branch.to_string(),
         source: from_branch.to_string(),
     };
-    let review_branch = format!("review-{}-{}", to_branch, from_branch).replace("/", "_");
-
     let resolved_to = resolve_remote_tracking_branch(to_branch, verbose);
     let resolved_from = resolve_remote_tracking_branch(from_branch, verbose);
 
@@ -131,37 +130,26 @@ pub fn prepare_review_branch(
         }
     }
 
-    // Check if review branch exists
-    let review_branch_exists = run_git_command(
-        "check existence of review branch",
-        &[
-            "show-ref",
-            "--verify",
-            &format!("refs/heads/{}", review_branch),
-        ],
-        true,
-        verbose,
-    )
-    .status
-    .success();
-
-    if review_branch_exists {
-        // Switch to existing review branch
-        run_git_command(
-            "switch to review branch",
-            &["switch", &review_branch],
-            false,
-            verbose,
-        );
-    } else {
-        // Create review branch from merge-base
-        run_git_command(
-            "create review branch from merge-base",
-            &["checkout", "-b", &review_branch, &merge_base],
-            false,
-            verbose,
-        );
-    }
+    let (review_branch, is_new) = match select_review_branch(&metadata, verbose) {
+        ReviewBranchSelection::Existing(name) => {
+            run_git_command(
+                "switch to review branch",
+                &["switch", &name],
+                false,
+                verbose,
+            );
+            (name, false)
+        }
+        ReviewBranchSelection::New(name) => {
+            run_git_command(
+                "create review branch from merge-base",
+                &["checkout", "-b", &name, &merge_base],
+                false,
+                verbose,
+            );
+            (name, true)
+        }
+    };
 
     // Determine target commit for squash merge
     let target_commit = if let Some(hash) = skip_to {
@@ -226,7 +214,9 @@ pub fn prepare_review_branch(
 
     // Unstage changes for review
     run_git_command("unstage changes for review", &["reset"], false, verbose);
-    write_review_metadata(&review_branch, &metadata, verbose);
+    if is_new {
+        write_review_metadata(&review_branch, &metadata, verbose);
+    }
 }
 
 /// Commit reviewed changes and discard unreviewed ones

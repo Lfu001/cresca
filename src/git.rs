@@ -17,6 +17,79 @@ pub enum ReviewMetadataError {
     Invalid,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub enum ReviewBranchSelection {
+    New(String),
+    Existing(String),
+}
+
+fn readable_review_branch(metadata: &ReviewMetadata) -> String {
+    format!("review-{}-{}", metadata.target, metadata.source).replace('/', "_")
+}
+
+fn review_identity_hash(metadata: &ReviewMetadata) -> u64 {
+    const OFFSET: u64 = 0xcbf29ce484222325;
+    const PRIME: u64 = 0x100000001b3;
+    let mut hash = OFFSET;
+    let mut feed = |bytes: &[u8]| {
+        for byte in bytes {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(PRIME);
+        }
+    };
+    feed(&(metadata.target.len() as u64).to_be_bytes());
+    feed(metadata.target.as_bytes());
+    feed(&(metadata.source.len() as u64).to_be_bytes());
+    feed(metadata.source.as_bytes());
+    hash
+}
+
+fn suffixed_review_branch(base: &str, metadata: &ReviewMetadata) -> String {
+    format!("{base}-{:016x}", review_identity_hash(metadata))
+}
+
+fn local_branch_exists(branch: &str, verbose: bool) -> bool {
+    run_git_command(
+        "check existence of review branch",
+        &[
+            "show-ref",
+            "--verify",
+            "--quiet",
+            &format!("refs/heads/{branch}"),
+        ],
+        true,
+        verbose,
+    )
+    .status
+    .success()
+}
+
+pub fn select_review_branch(metadata: &ReviewMetadata, verbose: bool) -> ReviewBranchSelection {
+    let base = readable_review_branch(metadata);
+    if !local_branch_exists(&base, verbose) {
+        return ReviewBranchSelection::New(base);
+    }
+    if read_review_metadata(&base, verbose).as_ref() == Ok(metadata) {
+        return ReviewBranchSelection::Existing(base);
+    }
+
+    let suffix = suffixed_review_branch(&base, metadata);
+    if !local_branch_exists(&suffix, verbose) {
+        return ReviewBranchSelection::New(suffix);
+    }
+    if read_review_metadata(&suffix, verbose).as_ref() == Ok(metadata) {
+        return ReviewBranchSelection::Existing(suffix);
+    }
+
+    eprintln!(
+        "{}: Found conflicting review branches `{}` and `{}` with missing, invalid, or different metadata. Inspect and delete or rename the conflicting local review branch before retrying.",
+        "error".red().bold(),
+        base,
+        suffix
+    );
+    exit(1);
+}
+
 fn review_config_key(branch: &str, field: &str) -> String {
     format!("branch.{branch}.cresca-{field}")
 }
