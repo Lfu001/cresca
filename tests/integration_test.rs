@@ -3,6 +3,14 @@ mod common;
 use common::TempGitRepo;
 use std::collections::BTreeSet;
 
+struct RemoveFileOnDrop(std::path::PathBuf);
+
+impl Drop for RemoveFileOnDrop {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
 struct LinearRange {
     base: String,
     a: String,
@@ -63,6 +71,19 @@ fn assert_review_matches(
     assert_eq!(repo.worktree_diff(), repo.diff(&merge_base, source_ref));
 }
 
+fn assert_identity_suffixed_branch(branch: &str, base: &str) {
+    let suffix = branch
+        .strip_prefix(&format!("{base}-"))
+        .expect("review branch should retain the readable base name");
+    assert_eq!(suffix.len(), 16);
+    assert!(
+        suffix
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+        "identity suffix should be 16 lowercase hexadecimal characters: {branch}"
+    );
+}
+
 fn prepare_staged_unstaged_and_untracked_changes(repo: &TempGitRepo) {
     repo.write_file("staged.txt", "staged base\n");
     repo.write_file("unstaged.txt", "unstaged base\n");
@@ -73,6 +94,15 @@ fn prepare_staged_unstaged_and_untracked_changes(repo: &TempGitRepo) {
     repo.git(&["add", "staged.txt"]);
     repo.write_file("unstaged.txt", "unstaged modification\n");
     repo.write_file("untracked.txt", "untracked content\n");
+}
+
+fn assert_invalid_review_command_preserves_state(repo: &TempGitRepo, args: &[&str]) {
+    let before = repo.snapshot();
+    let output = repo.run_cresca(args);
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("valid cresca review branch"));
+    assert_eq!(repo.snapshot(), before);
 }
 
 #[test]
@@ -315,21 +345,51 @@ fn test_approve_with_no_staged_changes_approves_nothing() {
 fn test_approve_on_non_review_branch() {
     let repo = TempGitRepo::new();
     prepare_staged_unstaged_and_untracked_changes(&repo);
-    let before = repo.snapshot();
+    assert_invalid_review_command_preserves_state(&repo, &["approve"]);
+}
 
-    let output = repo.run_cresca(&["approve"]);
+#[test]
+fn test_approve_rejects_review_prefixed_branch_without_metadata_and_preserves_state() {
+    let repo = TempGitRepo::new();
+    repo.create_branch("review-not-created-by-cresca");
+    prepare_staged_unstaged_and_untracked_changes(&repo);
+    assert_invalid_review_command_preserves_state(&repo, &["approve"]);
+}
 
-    assert!(
-        !output.status.success(),
-        "cresca approve should fail on non-review branch"
-    );
+#[test]
+fn test_approve_rejects_unsupported_review_metadata_and_preserves_state() {
+    let repo = TempGitRepo::new();
+    repo.create_branch("review-corrupt");
+    repo.git(&[
+        "config",
+        "--local",
+        "branch.review-corrupt.cresca-target",
+        "main",
+    ]);
+    repo.git(&[
+        "config",
+        "--local",
+        "branch.review-corrupt.cresca-source",
+        "develop",
+    ]);
+    repo.git(&[
+        "config",
+        "--local",
+        "branch.review-corrupt.cresca-version",
+        "999",
+    ]);
+    prepare_staged_unstaged_and_untracked_changes(&repo);
+    assert_invalid_review_command_preserves_state(&repo, &["approve"]);
+}
 
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("Not on a review branch"),
-        "expected non-review diagnostic, got: {stderr}"
-    );
-    assert_eq!(repo.snapshot(), before);
+#[test]
+fn test_approve_rejects_non_review_name_even_with_valid_metadata() {
+    let repo = TempGitRepo::new();
+    repo.git(&["config", "--local", "branch.main.cresca-version", "1"]);
+    repo.git(&["config", "--local", "branch.main.cresca-target", "main"]);
+    repo.git(&["config", "--local", "branch.main.cresca-source", "develop"]);
+    prepare_staged_unstaged_and_untracked_changes(&repo);
+    assert_invalid_review_command_preserves_state(&repo, &["approve"]);
 }
 
 /// Test that `cresca review` fails with uncommitted changes.
@@ -361,6 +421,10 @@ fn test_review_with_uncommitted_changes() {
     );
     assert_eq!(repo.snapshot(), before);
     assert!(!repo.ref_exists("refs/heads/review-main-develop"));
+    assert_eq!(
+        repo.review_metadata_values("review-main-develop"),
+        (Vec::new(), Vec::new(), Vec::new())
+    );
 }
 
 /// Test that running review twice updates the review branch correctly.
@@ -457,6 +521,50 @@ fn test_review_with_skip_to_first_commit_keeps_full_range_unstaged() {
     assert_eq!(repo.worktree_diff(), repo.diff(&range.base, &range.d));
 }
 
+#[test]
+fn test_failed_review_preparation_does_not_commit_review_metadata() {
+    let (repo, range) = setup_linear_range();
+    repo.git(&["config", "user.useConfigOnly", "true"]);
+    repo.git(&["config", "--unset-all", "user.email"]);
+
+    let output = std::process::Command::new(TempGitRepo::cresca_binary())
+        .args(["review", "main", "develop", "--skip-to", &range.b[..8]])
+        .env("NO_COLOR", "1")
+        .env("LC_ALL", "C")
+        .env("LANG", "C")
+        // Isolate a possible global identity so the commit failure is reproducible.
+        .env(
+            "GIT_CONFIG_GLOBAL",
+            repo.path().join("missing-global-gitconfig"),
+        )
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        // GIT_CONFIG_COUNT is the authority for indexed KEY/VALUE pairs; without
+        // it, inherited GIT_CONFIG_KEY_n/GIT_CONFIG_VALUE_n entries are ignored.
+        .env_remove("GIT_CONFIG_COUNT")
+        .env_remove("GIT_CONFIG_PARAMETERS")
+        .env_remove("GIT_AUTHOR_NAME")
+        .env_remove("GIT_AUTHOR_EMAIL")
+        .env_remove("GIT_COMMITTER_NAME")
+        .env_remove("GIT_COMMITTER_EMAIL")
+        .env_remove("EMAIL")
+        .current_dir(repo.path())
+        .output()
+        .expect("Failed to execute cresca");
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("commit auto-approved changes")
+            && stderr.contains("Author identity unknown"),
+        "expected failed Git commit diagnostic, got: {stderr}"
+    );
+    assert_eq!(
+        repo.review_metadata_values("review-main-develop"),
+        (Vec::new(), Vec::new(), Vec::new()),
+        "a failed materialization must not be marked as valid review state",
+    );
+}
+
 /// Test that `cresca review --skip-to` with already approved commits works correctly.
 #[test]
 fn test_review_with_skip_to_already_approved() {
@@ -550,21 +658,60 @@ fn test_status_shows_diff_stats() {
 fn test_status_on_non_review_branch() {
     let repo = TempGitRepo::new();
     prepare_staged_unstaged_and_untracked_changes(&repo);
-    let before = repo.snapshot();
+    assert_invalid_review_command_preserves_state(&repo, &["status"]);
+}
 
-    let output = repo.run_cresca(&["status"]);
+#[test]
+fn test_status_rejects_parseable_legacy_branch_without_metadata_and_preserves_state() {
+    let repo = TempGitRepo::new();
+    repo.create_branch("develop");
+    repo.write_file("develop.txt", "develop content\n");
+    repo.git(&["add", "."]);
+    repo.commit("Add develop content");
+    repo.git(&["push", "-u", "origin", "develop"]);
+    repo.switch_branch("main");
+    repo.create_branch("review-main-develop");
+    prepare_staged_unstaged_and_untracked_changes(&repo);
+    assert_invalid_review_command_preserves_state(&repo, &["status"]);
+}
 
-    assert!(
-        !output.status.success(),
-        "cresca status should fail on non-review branch"
-    );
-
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("Not on a review branch"),
-        "expected non-review diagnostic, got: {stderr}"
-    );
-    assert_eq!(repo.snapshot(), before);
+#[test]
+fn test_status_rejects_duplicate_review_metadata_and_preserves_state() {
+    let repo = TempGitRepo::new();
+    repo.create_branch("develop");
+    repo.write_file("develop.txt", "develop content\n");
+    repo.git(&["add", "."]);
+    repo.commit("Add develop content");
+    repo.git(&["push", "-u", "origin", "develop"]);
+    repo.switch_branch("main");
+    repo.create_branch("review-main-develop");
+    repo.git(&[
+        "config",
+        "--local",
+        "branch.review-main-develop.cresca-version",
+        "1",
+    ]);
+    repo.git(&[
+        "config",
+        "--local",
+        "branch.review-main-develop.cresca-target",
+        "main",
+    ]);
+    repo.git(&[
+        "config",
+        "--local",
+        "--add",
+        "branch.review-main-develop.cresca-source",
+        "develop",
+    ]);
+    repo.git(&[
+        "config",
+        "--local",
+        "--add",
+        "branch.review-main-develop.cresca-source",
+        "other-develop",
+    ]);
+    assert_invalid_review_command_preserves_state(&repo, &["status"]);
 }
 
 /// Test that `cresca status` updates after partial approval.
@@ -798,6 +945,10 @@ fn test_review_with_invalid_stop_at() {
     );
     assert_eq!(repo.snapshot(), before);
     assert!(!repo.ref_exists("refs/heads/review-main-develop"));
+    assert_eq!(
+        repo.review_metadata_values("review-main-develop"),
+        (Vec::new(), Vec::new(), Vec::new())
+    );
 }
 
 #[test]
@@ -818,6 +969,10 @@ fn test_review_with_nonexistent_skip_to_is_atomic() {
     );
     assert_eq!(repo.snapshot(), before);
     assert!(!repo.ref_exists("refs/heads/review-main-develop"));
+    assert_eq!(
+        repo.review_metadata_values("review-main-develop"),
+        (Vec::new(), Vec::new(), Vec::new())
+    );
 }
 
 #[test]
@@ -844,6 +999,10 @@ fn test_review_with_out_of_range_skip_to_is_atomic() {
     );
     assert_eq!(repo.snapshot(), before);
     assert!(!repo.ref_exists("refs/heads/review-main-develop"));
+    assert_eq!(
+        repo.review_metadata_values("review-main-develop"),
+        (Vec::new(), Vec::new(), Vec::new())
+    );
 }
 
 /// Test that `cresca review` fails when --stop-at is before --skip-to.
@@ -874,6 +1033,580 @@ fn test_review_with_stop_at_before_skip_to() {
     );
     assert_eq!(repo.snapshot(), before);
     assert!(!repo.ref_exists("refs/heads/review-main-develop"));
+    assert_eq!(
+        repo.review_metadata_values("review-main-develop"),
+        (Vec::new(), Vec::new(), Vec::new())
+    );
+}
+
+/// Test that `cresca review` records the exact CLI target and source values.
+#[test]
+fn test_review_records_versioned_target_and_source_metadata() {
+    let repo = TempGitRepo::new();
+
+    repo.create_branch("release-v1");
+    repo.write_file("release.txt", "release base\n");
+    repo.git(&["add", "."]);
+    repo.commit("Add release base");
+    repo.git(&["push", "-u", "origin", "release-v1"]);
+
+    repo.create_branch("feature/login-page");
+    repo.write_file("login.txt", "login page\n");
+    repo.git(&["add", "."]);
+    repo.commit("Add login page");
+    repo.git(&["push", "-u", "origin", "feature/login-page"]);
+    repo.switch_branch("main");
+
+    let output = repo.run_cresca(&["review", "release-v1", "feature/login-page"]);
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        repo.current_branch(),
+        "review-release-v1-feature_login-page"
+    );
+    assert_eq!(
+        repo.review_metadata_values("review-release-v1-feature_login-page"),
+        (
+            vec!["1".to_string()],
+            vec!["release-v1".to_string()],
+            vec!["feature/login-page".to_string()],
+        )
+    );
+    assert!(repo.cached_diff().is_empty());
+    assert_eq!(
+        repo.worktree_diff(),
+        repo.diff(
+            &repo.git_stdout(&[
+                "merge-base",
+                "origin/release-v1",
+                "origin/feature/login-page",
+            ]),
+            "origin/feature/login-page",
+        )
+    );
+}
+
+#[test]
+fn test_review_treats_orphan_base_metadata_as_occupied() {
+    let repo = TempGitRepo::new();
+
+    repo.create_branch("develop");
+    repo.write_file("develop.txt", "develop change\n");
+    repo.git(&["add", "."]);
+    repo.commit("Add develop change");
+    repo.git(&["push", "-u", "origin", "develop"]);
+    repo.switch_branch("main");
+
+    let base = "review-main-develop";
+    repo.git(&[
+        "config",
+        "--local",
+        &format!("branch.{base}.cresca-version"),
+        "1",
+    ]);
+    repo.git(&[
+        "config",
+        "--local",
+        &format!("branch.{base}.cresca-target"),
+        "other-target",
+    ]);
+    repo.git(&[
+        "config",
+        "--local",
+        &format!("branch.{base}.cresca-source"),
+        "other-source",
+    ]);
+    let orphan_metadata = repo.review_metadata_values(base);
+
+    let output = repo.run_cresca(&["review", "main", "develop"]);
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let suffix = "review-main-develop-5ee67b20f1cad176";
+    assert_eq!(repo.current_branch(), suffix);
+    assert!(!repo.ref_exists(&format!("refs/heads/{base}")));
+    assert_eq!(repo.review_metadata_values(base), orphan_metadata);
+    assert_eq!(
+        repo.review_metadata_values(suffix),
+        (
+            vec!["1".to_string()],
+            vec!["main".to_string()],
+            vec!["develop".to_string()],
+        )
+    );
+    assert!(repo.cached_diff().is_empty());
+    let merge_base = repo.git_stdout(&["merge-base", "origin/main", "origin/develop"]);
+    assert_eq!(
+        repo.worktree_diff(),
+        repo.diff(&merge_base, "origin/develop")
+    );
+}
+
+#[test]
+fn test_review_fails_closed_when_orphan_metadata_occupies_suffix() {
+    let repo = TempGitRepo::new();
+
+    repo.create_branch("develop");
+    repo.write_file("develop.txt", "develop change\n");
+    repo.git(&["add", "."]);
+    repo.commit("Add develop change");
+    repo.git(&["push", "-u", "origin", "develop"]);
+    repo.switch_branch("main");
+
+    let base = "review-main-develop";
+    repo.create_branch(base);
+    repo.switch_branch("main");
+    let suffix = "review-main-develop-5ee67b20f1cad176";
+    repo.git(&[
+        "config",
+        "--local",
+        &format!("branch.{suffix}.cresca-source"),
+        "orphan-source",
+    ]);
+    let before = repo.snapshot();
+
+    let output = repo.run_cresca(&["review", "main", "develop"]);
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("conflicting review branches")
+            && stderr.contains(base)
+            && stderr.contains(suffix),
+        "expected orphan suffix conflict diagnostic, got: {stderr}"
+    );
+    assert_eq!(repo.snapshot(), before);
+    assert!(!repo.ref_exists(&format!("refs/heads/{suffix}")));
+}
+
+#[cfg(unix)]
+#[test]
+fn test_review_fails_closed_when_metadata_config_read_fails() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let repo = TempGitRepo::new();
+
+    repo.create_branch("develop");
+    repo.write_file("develop.txt", "develop change\n");
+    repo.git(&["add", "."]);
+    repo.commit("Add develop change");
+    repo.git(&["push", "-u", "origin", "develop"]);
+    repo.switch_branch("main");
+    repo.create_branch("review-main-develop");
+    repo.switch_branch("main");
+    let before = repo.snapshot();
+
+    let git_path = String::from_utf8(
+        std::process::Command::new("sh")
+            .args(["-c", "command -v git"])
+            .output()
+            .expect("git path lookup should execute")
+            .stdout,
+    )
+    .expect("git path should be UTF-8")
+    .trim()
+    .to_string();
+    let shim_dir = tempfile::TempDir::new().expect("git shim directory should be created");
+    let shim_path = shim_dir.path().join("git");
+    let shim = format!(
+        "#!/bin/sh\nif [ \"$1\" = config ] && [ \"$2\" = --local ] && [ \"$3\" = --get-all ] && [ \"$4\" = branch.review-main-develop.cresca-version ]; then\n  echo injected metadata read failure >&2\n  exit 2\nfi\nexec '{git_path}' \"$@\"\n"
+    );
+    std::fs::write(&shim_path, shim).expect("git shim should be writable");
+    let mut permissions = std::fs::metadata(&shim_path)
+        .expect("git shim metadata should be readable")
+        .permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&shim_path, permissions).expect("git shim should be executable");
+    let path = std::env::join_paths(std::iter::once(shim_dir.path().to_path_buf()).chain(
+        std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()),
+    ))
+    .expect("git shim PATH should be valid");
+
+    let output = std::process::Command::new(TempGitRepo::cresca_binary())
+        .args(["review", "main", "develop"])
+        .env("NO_COLOR", "1")
+        .env("PATH", path)
+        .current_dir(repo.path())
+        .output()
+        .expect("cresca should execute with git shim");
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Failed to read review metadata")
+            && stderr.contains("injected metadata read failure"),
+        "expected strict metadata read failure, got: {stderr}"
+    );
+    assert_eq!(repo.snapshot(), before);
+}
+
+#[test]
+fn test_review_does_not_materialize_orphan_metadata_when_config_write_fails() {
+    let repo = TempGitRepo::new();
+
+    repo.create_branch("develop");
+    repo.write_file("develop.txt", "develop change\n");
+    repo.git(&["add", "."]);
+    repo.commit("Add develop change");
+    repo.git(&["push", "-u", "origin", "develop"]);
+    repo.switch_branch("main");
+
+    let review_branch = "review-main-develop";
+    repo.git(&[
+        "config",
+        "--local",
+        &format!("branch.{review_branch}.cresca-version"),
+        "1",
+    ]);
+    repo.git(&[
+        "config",
+        "--local",
+        &format!("branch.{review_branch}.cresca-target"),
+        "main",
+    ]);
+    repo.git(&[
+        "config",
+        "--local",
+        &format!("branch.{review_branch}.cresca-source"),
+        "develop",
+    ]);
+    let metadata_before = repo.review_metadata_values(review_branch);
+    assert!(!repo.ref_exists(&format!("refs/heads/{review_branch}")));
+
+    let config_lock_path = repo.path().join(".git/config.lock");
+    std::fs::write(&config_lock_path, "lock metadata writes")
+        .expect("config lock fixture should be writable");
+    let config_lock_cleanup = RemoveFileOnDrop(config_lock_path);
+
+    let output = repo.run_cresca(&["--verbose", "review", "main", "develop"]);
+    drop(config_lock_cleanup);
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Failed to record review target"),
+        "expected metadata write failure, got: {stderr}"
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !stdout.contains(&format!("git checkout -b {review_branch} ")),
+        "orphan metadata must prevent the base branch from being created: {stdout}"
+    );
+    assert!(!repo.ref_exists(&format!("refs/heads/{review_branch}")));
+    assert_eq!(repo.review_metadata_values(review_branch), metadata_before);
+
+    let suffix = "review-main-develop-5ee67b20f1cad176";
+    assert_eq!(
+        repo.review_metadata_values(suffix),
+        (Vec::new(), Vec::new(), Vec::new()),
+        "a failed write must not leave a valid review identity on the new branch"
+    );
+}
+
+#[test]
+fn test_review_does_not_reuse_branch_for_slash_underscore_collision() {
+    let repo = TempGitRepo::new();
+
+    repo.create_branch("feature/foo");
+    repo.write_file("slash.txt", "slash branch\n");
+    repo.git(&["add", "."]);
+    repo.commit("Add slash branch change");
+    repo.git(&["push", "-u", "origin", "feature/foo"]);
+
+    repo.switch_branch("main");
+    repo.create_branch("feature_foo");
+    repo.write_file("underscore.txt", "underscore branch\n");
+    repo.git(&["add", "."]);
+    repo.commit("Add underscore branch change");
+    repo.git(&["push", "-u", "origin", "feature_foo"]);
+
+    repo.switch_branch("main");
+    let first = repo.run_cresca(&["review", "main", "feature/foo"]);
+    assert!(first.status.success());
+    assert_eq!(repo.current_branch(), "review-main-feature_foo");
+    assert!(repo.run_cresca(&["approve"]).status.success());
+    repo.switch_branch("main");
+    let first_oid = repo.rev_parse("refs/heads/review-main-feature_foo");
+
+    let second = repo.run_cresca(&["review", "main", "feature_foo"]);
+    assert!(
+        second.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&second.stdout),
+        String::from_utf8_lossy(&second.stderr)
+    );
+    let second_branch = repo.current_branch();
+    assert_ne!(second_branch, "review-main-feature_foo");
+    assert_identity_suffixed_branch(&second_branch, "review-main-feature_foo");
+    assert_eq!(
+        repo.rev_parse("refs/heads/review-main-feature_foo"),
+        first_oid
+    );
+    assert_eq!(
+        repo.review_metadata_values(&second_branch),
+        (
+            vec!["1".to_string()],
+            vec!["main".to_string()],
+            vec!["feature_foo".to_string()],
+        )
+    );
+    assert!(repo.cached_diff().is_empty());
+    let merge_base = repo.git_stdout(&["merge-base", "origin/main", "origin/feature_foo"]);
+    assert_eq!(
+        repo.worktree_diff(),
+        repo.diff(&merge_base, "origin/feature_foo")
+    );
+    assert!(!repo.path().join("slash.txt").exists());
+    assert_eq!(repo.read_file("underscore.txt"), "underscore branch\n");
+}
+
+#[test]
+fn test_review_does_not_reuse_branch_for_ambiguous_pair_boundary() {
+    let repo = TempGitRepo::new();
+
+    repo.create_branch("release");
+    repo.git(&["push", "-u", "origin", "release"]);
+    repo.create_branch("v1-feature");
+    repo.write_file("pair-one.txt", "first pair\n");
+    repo.git(&["add", "."]);
+    repo.commit("Add first pair change");
+    repo.git(&["push", "-u", "origin", "v1-feature"]);
+
+    repo.switch_branch("main");
+    repo.create_branch("release-v1");
+    repo.write_file("release-v1-base.txt", "second target base\n");
+    repo.git(&["add", "."]);
+    repo.commit("Add second target base");
+    repo.git(&["push", "-u", "origin", "release-v1"]);
+    repo.create_branch("feature");
+    repo.write_file("pair-two.txt", "second pair\n");
+    repo.git(&["add", "."]);
+    repo.commit("Add second pair change");
+    repo.git(&["push", "-u", "origin", "feature"]);
+
+    repo.switch_branch("main");
+    let first = repo.run_cresca(&["review", "release", "v1-feature"]);
+    assert!(first.status.success());
+    assert_eq!(repo.current_branch(), "review-release-v1-feature");
+    assert!(repo.run_cresca(&["approve"]).status.success());
+    repo.switch_branch("main");
+    let first_oid = repo.rev_parse("refs/heads/review-release-v1-feature");
+
+    let second = repo.run_cresca(&["review", "release-v1", "feature"]);
+    assert!(
+        second.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&second.stdout),
+        String::from_utf8_lossy(&second.stderr)
+    );
+    let second_branch = repo.current_branch();
+    assert_ne!(second_branch, "review-release-v1-feature");
+    assert_identity_suffixed_branch(&second_branch, "review-release-v1-feature");
+    assert_eq!(
+        repo.rev_parse("refs/heads/review-release-v1-feature"),
+        first_oid
+    );
+    assert_eq!(
+        repo.review_metadata_values(&second_branch),
+        (
+            vec!["1".to_string()],
+            vec!["release-v1".to_string()],
+            vec!["feature".to_string()],
+        )
+    );
+    assert!(repo.cached_diff().is_empty());
+    let merge_base = repo.git_stdout(&["merge-base", "origin/release-v1", "origin/feature"]);
+    assert_eq!(
+        repo.worktree_diff(),
+        repo.diff(&merge_base, "origin/feature")
+    );
+    assert!(!repo.path().join("pair-one.txt").exists());
+    assert_eq!(repo.read_file("pair-two.txt"), "second pair\n");
+}
+
+#[test]
+fn test_review_leaves_legacy_branch_untouched_and_creates_metadata_backed_branch() {
+    let repo = TempGitRepo::new();
+
+    repo.create_branch("develop");
+    repo.write_file("develop.txt", "develop change\n");
+    repo.git(&["add", "."]);
+    repo.commit("Add develop change");
+    repo.git(&["push", "-u", "origin", "develop"]);
+
+    repo.switch_branch("main");
+    repo.create_branch("review-main-develop");
+    let legacy_oid = repo.rev_parse("HEAD");
+    assert_eq!(
+        repo.review_metadata_values("review-main-develop"),
+        (Vec::new(), Vec::new(), Vec::new())
+    );
+    repo.switch_branch("main");
+
+    let first = repo.run_cresca(&["review", "main", "develop"]);
+    assert!(
+        first.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&first.stdout),
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let metadata_branch = repo.current_branch();
+    assert_identity_suffixed_branch(&metadata_branch, "review-main-develop");
+    assert_eq!(repo.rev_parse("refs/heads/review-main-develop"), legacy_oid);
+    assert_eq!(
+        repo.review_metadata_values("review-main-develop"),
+        (Vec::new(), Vec::new(), Vec::new())
+    );
+    assert_eq!(
+        repo.review_metadata_values(&metadata_branch),
+        (
+            vec!["1".to_string()],
+            vec!["main".to_string()],
+            vec!["develop".to_string()],
+        )
+    );
+    assert!(repo.cached_diff().is_empty());
+    let merge_base = repo.git_stdout(&["merge-base", "origin/main", "origin/develop"]);
+    assert_eq!(
+        repo.worktree_diff(),
+        repo.diff(&merge_base, "origin/develop")
+    );
+
+    assert!(repo.run_cresca(&["approve"]).status.success());
+    repo.switch_branch("main");
+    let heads_before = repo
+        .git(&[
+            "for-each-ref",
+            "--sort=refname",
+            "--format=%(refname) %(objectname)",
+            "refs/heads/",
+        ])
+        .stdout;
+
+    let second = repo.run_cresca(&["review", "main", "develop"]);
+    assert!(
+        second.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&second.stdout),
+        String::from_utf8_lossy(&second.stderr)
+    );
+    assert_eq!(repo.current_branch(), metadata_branch);
+    assert_eq!(
+        repo.git(&[
+            "for-each-ref",
+            "--sort=refname",
+            "--format=%(refname) %(objectname)",
+            "refs/heads/",
+        ])
+        .stdout,
+        heads_before
+    );
+}
+
+#[test]
+fn test_review_fails_atomically_when_base_and_identity_suffix_belong_to_other_reviews() {
+    let repo = TempGitRepo::new();
+
+    repo.create_branch("develop");
+    repo.write_file("develop.txt", "develop change\n");
+    repo.git(&["add", "."]);
+    repo.commit("Add develop change");
+    repo.git(&["push", "-u", "origin", "develop"]);
+
+    repo.switch_branch("main");
+    repo.create_branch("review-main-develop");
+    repo.switch_branch("main");
+
+    let first = repo.run_cresca(&["review", "main", "develop"]);
+    assert!(
+        first.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&first.stdout),
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let suffixed_branch = repo.current_branch();
+    assert_identity_suffixed_branch(&suffixed_branch, "review-main-develop");
+    assert!(repo.run_cresca(&["approve"]).status.success());
+
+    repo.git(&[
+        "config",
+        "--local",
+        &format!("branch.{suffixed_branch}.cresca-target"),
+        "other-target",
+    ]);
+    repo.git(&[
+        "config",
+        "--local",
+        &format!("branch.{suffixed_branch}.cresca-source"),
+        "other-source",
+    ]);
+    assert_eq!(
+        repo.git_config_values(&format!("branch.{suffixed_branch}.cresca-version")),
+        vec!["1".to_string()]
+    );
+
+    repo.switch_branch("main");
+    let before = repo.snapshot();
+    let output = repo.run_cresca(&["review", "main", "develop"]);
+
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("conflicting review branches")
+            && stderr.contains("review-main-develop")
+            && stderr.contains(&suffixed_branch),
+        "expected conflicting review branch diagnostic, got: {stderr}"
+    );
+    assert_eq!(repo.snapshot(), before);
+}
+
+#[test]
+fn test_status_uses_metadata_for_hyphenated_target_and_slash_source() {
+    let repo = TempGitRepo::new();
+
+    repo.create_branch("release-v1");
+    repo.write_file("release.txt", "release base\n");
+    repo.git(&["add", "."]);
+    repo.commit("Add release base");
+    repo.git(&["push", "-u", "origin", "release-v1"]);
+
+    repo.create_branch("feature/login-page");
+    repo.write_file("login.txt", "login page\n");
+    repo.git(&["add", "."]);
+    repo.commit("Add login page");
+    repo.git(&["push", "-u", "origin", "feature/login-page"]);
+    repo.switch_branch("main");
+
+    let review_output = repo.run_cresca(&["review", "release-v1", "feature/login-page"]);
+    assert!(
+        review_output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&review_output.stdout),
+        String::from_utf8_lossy(&review_output.stderr)
+    );
+
+    let output = repo.run_cresca(&["status"]);
+
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("Remaining diff to feature/login-page:"));
+    assert!(stdout.contains("1 file(s), +1 insertion(s), -0 deletion(s)"));
+    assert!(stdout.contains("    - login.txt\n"));
+    assert!(output.stderr.is_empty());
 }
 
 /// Test that `cresca review` works with branch names containing slashes.

@@ -14,7 +14,7 @@ Also You need to have `git` installed.
 
 ## Usage
 
-1. Start a review by specifying the branches. Following example will prepare a review branch (named `review-main-develop`) for the PR that `develop` is to be merged into `main`.
+1. Start a review by specifying the branches. Following example will prepare a review branch (typically named `review-main-develop`) for the PR that `develop` is to be merged into `main`.
 
     ```sh
     cresca review main develop

@@ -1,6 +1,205 @@
 use colored::Colorize;
 use std::process::{exit, Command, Output};
 
+pub const REVIEW_METADATA_VERSION: &str = "1";
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct ReviewMetadata {
+    pub target: String,
+    pub source: String,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum ReviewMetadataError {
+    InvalidBranchName,
+    Missing,
+    UnsupportedVersion(String),
+    Invalid,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum ReviewBranchSelection {
+    New(String),
+    Existing(String),
+}
+
+fn readable_review_branch(metadata: &ReviewMetadata) -> String {
+    format!("review-{}-{}", metadata.target, metadata.source).replace('/', "_")
+}
+
+fn review_identity_hash(metadata: &ReviewMetadata) -> u64 {
+    const OFFSET: u64 = 0xcbf29ce484222325;
+    const PRIME: u64 = 0x100000001b3;
+    let mut hash = OFFSET;
+    let mut feed = |bytes: &[u8]| {
+        for byte in bytes {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(PRIME);
+        }
+    };
+    feed(&(metadata.target.len() as u64).to_be_bytes());
+    feed(metadata.target.as_bytes());
+    feed(&(metadata.source.len() as u64).to_be_bytes());
+    feed(metadata.source.as_bytes());
+    hash
+}
+
+fn suffixed_review_branch(base: &str, metadata: &ReviewMetadata) -> String {
+    format!("{base}-{:016x}", review_identity_hash(metadata))
+}
+
+fn local_branch_exists(branch: &str, verbose: bool) -> bool {
+    run_git_command(
+        "check existence of review branch",
+        &[
+            "show-ref",
+            "--verify",
+            "--quiet",
+            &format!("refs/heads/{branch}"),
+        ],
+        true,
+        verbose,
+    )
+    .status
+    .success()
+}
+
+pub fn select_review_branch(metadata: &ReviewMetadata, verbose: bool) -> ReviewBranchSelection {
+    let base = readable_review_branch(metadata);
+    let base_exists = local_branch_exists(&base, verbose);
+    match (base_exists, read_review_metadata(&base, verbose)) {
+        (false, Err(ReviewMetadataError::Missing)) => return ReviewBranchSelection::New(base),
+        (true, Ok(existing)) if existing == *metadata => {
+            return ReviewBranchSelection::Existing(base)
+        }
+        _ => {}
+    }
+
+    let suffix = suffixed_review_branch(&base, metadata);
+    let suffix_exists = local_branch_exists(&suffix, verbose);
+    match (suffix_exists, read_review_metadata(&suffix, verbose)) {
+        (false, Err(ReviewMetadataError::Missing)) => return ReviewBranchSelection::New(suffix),
+        (true, Ok(existing)) if existing == *metadata => {
+            return ReviewBranchSelection::Existing(suffix)
+        }
+        _ => {}
+    }
+
+    eprintln!(
+        "{}: Found conflicting review branches `{}` and `{}` with missing, invalid, or different metadata. Inspect and delete or rename the conflicting local review branch before retrying.",
+        "error".red().bold(),
+        base,
+        suffix
+    );
+    exit(1);
+}
+
+fn review_config_key(branch: &str, field: &str) -> String {
+    format!("branch.{branch}.cresca-{field}")
+}
+
+fn review_config_values(branch: &str, field: &str, verbose: bool) -> Vec<String> {
+    let key = review_config_key(branch, field);
+    let output = run_git_command(
+        "read review metadata",
+        &["config", "--local", "--get-all", &key],
+        true,
+        verbose,
+    );
+    if output.status.success() {
+        return String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .map(str::to_owned)
+            .collect();
+    }
+
+    if output.status.code() == Some(1) && output.stderr.is_empty() {
+        return Vec::new();
+    }
+
+    eprintln!("{}: Failed to read review metadata.", "error".red().bold());
+    eprintln!("Original error from git:");
+    eprintln!("\t{}", String::from_utf8_lossy(&output.stderr));
+    exit(1);
+}
+
+pub fn read_review_metadata(
+    branch: &str,
+    verbose: bool,
+) -> Result<ReviewMetadata, ReviewMetadataError> {
+    let versions = review_config_values(branch, "version", verbose);
+    let targets = review_config_values(branch, "target", verbose);
+    let sources = review_config_values(branch, "source", verbose);
+
+    match (versions.as_slice(), targets.as_slice(), sources.as_slice()) {
+        ([version], [target], [source])
+            if version == REVIEW_METADATA_VERSION && !target.is_empty() && !source.is_empty() =>
+        {
+            Ok(ReviewMetadata {
+                target: target.clone(),
+                source: source.clone(),
+            })
+        }
+        ([], [], []) => Err(ReviewMetadataError::Missing),
+        ([version], _, _) if version != REVIEW_METADATA_VERSION => {
+            Err(ReviewMetadataError::UnsupportedVersion(version.clone()))
+        }
+        _ => Err(ReviewMetadataError::Invalid),
+    }
+}
+
+pub fn write_review_metadata(branch: &str, metadata: &ReviewMetadata, verbose: bool) {
+    let version_key = review_config_key(branch, "version");
+    let target_key = review_config_key(branch, "target");
+    let source_key = review_config_key(branch, "source");
+
+    let existing_versions = review_config_values(branch, "version", verbose);
+    if !existing_versions.is_empty() {
+        run_git_command(
+            "clear review metadata version marker",
+            &["config", "--local", "--unset-all", &version_key],
+            false,
+            verbose,
+        );
+    }
+    run_git_command(
+        "record review target",
+        &[
+            "config",
+            "--local",
+            "--replace-all",
+            &target_key,
+            &metadata.target,
+        ],
+        false,
+        verbose,
+    );
+    run_git_command(
+        "record review source",
+        &[
+            "config",
+            "--local",
+            "--replace-all",
+            &source_key,
+            &metadata.source,
+        ],
+        false,
+        verbose,
+    );
+    run_git_command(
+        "commit review metadata",
+        &[
+            "config",
+            "--local",
+            "--replace-all",
+            &version_key,
+            REVIEW_METADATA_VERSION,
+        ],
+        false,
+        verbose,
+    );
+}
+
 /// Run a git command and return the output
 ///
 /// # Arguments
@@ -60,52 +259,22 @@ pub fn is_clean(verbose: bool) -> bool {
     .is_empty()
 }
 
-/// Check if the current branch is a review branch
-///
-/// # Arguments
-///
-/// * `verbose` - Whether to print the git command and its output.
-pub fn is_review_branch(verbose: bool) -> bool {
+pub fn current_branch_name(verbose: bool) -> String {
     let output = run_git_command(
         "get current branch",
         &["rev-parse", "--abbrev-ref", "HEAD"],
         false,
         verbose,
     );
-    let branch_name = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    branch_name.starts_with("review")
+    String::from_utf8_lossy(&output.stdout).trim().to_string()
 }
 
-/// Get review branch info (to_branch, from_branch) from current branch name
-///
-/// # Arguments
-///
-/// * `verbose` - Whether to print the git command and its output.
-///
-/// # Returns
-///
-/// * `Option<(String, String)>` - (to_branch, from_branch) if on a review branch, None otherwise
-pub fn get_review_branch_info(verbose: bool) -> Option<(String, String)> {
-    let output = run_git_command(
-        "get current branch",
-        &["rev-parse", "--abbrev-ref", "HEAD"],
-        false,
-        verbose,
-    );
-    let branch_name = String::from_utf8_lossy(&output.stdout).trim().to_string();
-
-    if !branch_name.starts_with("review-") {
-        return None;
+pub fn current_review_metadata(verbose: bool) -> Result<ReviewMetadata, ReviewMetadataError> {
+    let branch = current_branch_name(verbose);
+    if !branch.starts_with("review-") {
+        return Err(ReviewMetadataError::InvalidBranchName);
     }
-
-    // Parse "review-{to}-{from}" format
-    let rest = branch_name.strip_prefix("review-")?;
-    let parts: Vec<&str> = rest.splitn(2, '-').collect();
-    if parts.len() == 2 {
-        Some((parts[0].to_string(), parts[1].to_string()))
-    } else {
-        None
-    }
+    read_review_metadata(&branch, verbose)
 }
 
 /// Resolved remote tracking branch information.
@@ -243,5 +412,23 @@ pub fn resolve_remote_tracking_branch(branch_or_ref: &str, verbose: bool) -> Res
         remote: "origin".to_string(),
         remote_branch: branch_or_ref.to_string(),
         tracking_ref: format!("origin/{}", branch_or_ref),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{suffixed_review_branch, ReviewMetadata};
+
+    #[test]
+    fn review_identity_suffix_matches_fixed_length_framed_fnv1a_vector() {
+        let metadata = ReviewMetadata {
+            target: "main".to_string(),
+            source: "feature/foo".to_string(),
+        };
+
+        assert_eq!(
+            suffixed_review_branch("review-main-feature_foo", &metadata),
+            "review-main-feature_foo-49caf74ca44ff0fe"
+        );
     }
 }

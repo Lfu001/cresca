@@ -5,7 +5,7 @@ use clap::builder::styling::{AnsiColor, Effects};
 use clap::{builder::Styles, ArgAction, Args, Parser, Subcommand};
 use colored::Colorize;
 use commands::{approve_changes, get_review_status, prepare_review_branch};
-use git::{get_review_branch_info, is_clean, is_review_branch};
+use git::{current_review_metadata, is_clean, ReviewMetadataError};
 use std::process::exit;
 
 const STYLES: Styles = Styles::styled()
@@ -67,22 +67,14 @@ fn main() {
 
     match &cli.command {
         Commands::Approve => {
-            if is_review_branch(cli.verbose) {
-                let res = approve_changes(cli.verbose);
-                match res {
-                    Err(_) => {
-                        println!("There are no reviewed changes to approve. Ending the review.",)
-                    }
-                    Ok(_) => println!("Reviewed changes were approved successfully.",),
-                };
-            } else {
-                eprintln!(
-                    "{}: Not on a review branch; run `{}` to prepare a review branch.",
-                    "error".red().bold(),
-                    "cresca review".green()
-                );
-                exit(1);
+            if let Err(error) = current_review_metadata(cli.verbose) {
+                exit_invalid_review_branch(error);
             }
+            let res = approve_changes(cli.verbose);
+            match res {
+                Err(_) => println!("There are no reviewed changes to approve. Ending the review."),
+                Ok(_) => println!("Reviewed changes were approved successfully."),
+            };
         }
         Commands::Review(args) => {
             if !is_clean(cli.verbose) {
@@ -104,37 +96,39 @@ fn main() {
             }
         }
         Commands::Status => {
-            if let Some((_, from_branch)) = get_review_branch_info(cli.verbose) {
-                let status = get_review_status(&from_branch, cli.verbose);
-                println!("📋 Review status:");
-                println!(
-                    "  Remaining diff to {}: {} file(s), {} insertion(s), {} deletion(s)",
-                    status.from_branch.green(),
-                    status.file_count.to_string().yellow(),
-                    format!("+{}", status.insertions).green(),
-                    format!("-{}", status.deletions).red()
-                );
-                if !status.files.is_empty() {
-                    const MAX_FILES: usize = 10;
-                    println!("  Files remaining:");
-                    for file in status.files.iter().take(MAX_FILES) {
-                        println!("    - {}", file);
-                    }
-                    if status.files.len() > MAX_FILES {
-                        println!(
-                            "    ... and {} more file(s)",
-                            status.files.len() - MAX_FILES
-                        );
-                    }
+            let metadata = current_review_metadata(cli.verbose)
+                .unwrap_or_else(|error| exit_invalid_review_branch(error));
+            let status = get_review_status(&metadata.source, cli.verbose);
+            println!("📋 Review status:");
+            println!(
+                "  Remaining diff to {}: {} file(s), {} insertion(s), {} deletion(s)",
+                status.from_branch.green(),
+                status.file_count.to_string().yellow(),
+                format!("+{}", status.insertions).green(),
+                format!("-{}", status.deletions).red()
+            );
+            if !status.files.is_empty() {
+                const MAX_FILES: usize = 10;
+                println!("  Files remaining:");
+                for file in status.files.iter().take(MAX_FILES) {
+                    println!("    - {}", file);
                 }
-            } else {
-                eprintln!(
-                    "{}: Not on a review branch; run `{}` to prepare a review branch.",
-                    "error".red().bold(),
-                    "cresca review".green()
-                );
-                exit(1);
+                if status.files.len() > MAX_FILES {
+                    println!(
+                        "    ... and {} more file(s)",
+                        status.files.len() - MAX_FILES
+                    );
+                }
             }
         }
     }
+}
+
+fn exit_invalid_review_branch(_: ReviewMetadataError) -> ! {
+    eprintln!(
+        "{}: Current branch is not a valid cresca review branch because its metadata is missing or invalid; run `{}` to prepare one.",
+        "error".red().bold(),
+        "cresca review <target> <source>".green()
+    );
+    exit(1);
 }
