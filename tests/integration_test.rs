@@ -55,6 +55,141 @@ fn setup_linear_range() -> (TempGitRepo, LinearRange) {
     (repo, LinearRange { base, a, b, c, d })
 }
 
+fn run_status_stdout(repo: &TempGitRepo, args: &[&str]) -> String {
+    let output = repo.run_cresca(args);
+    assert!(
+        output.status.success(),
+        "cresca {} failed\nstdout: {}\nstderr: {}",
+        args.join(" "),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stderr.is_empty());
+    String::from_utf8(output.stdout).expect("status stdout should be UTF-8")
+}
+
+fn setup_identity_only_review_branch() -> TempGitRepo {
+    let repo = TempGitRepo::new();
+    repo.create_branch("develop");
+    repo.write_file("develop.txt", "develop content\n");
+    repo.git(&["add", "."]);
+    repo.commit("Add develop content");
+    repo.git(&["push", "-u", "origin", "develop"]);
+    repo.switch_branch("main");
+    repo.create_branch("review-main-develop");
+    repo.git(&[
+        "config",
+        "--local",
+        "branch.review-main-develop.cresca-version",
+        "1",
+    ]);
+    repo.git(&[
+        "config",
+        "--local",
+        "branch.review-main-develop.cresca-target",
+        "main",
+    ]);
+    repo.git(&[
+        "config",
+        "--local",
+        "branch.review-main-develop.cresca-source",
+        "develop",
+    ]);
+    repo
+}
+
+#[test]
+fn test_review_records_source_tip_as_full_scope_end_without_stop_at() {
+    let (repo, range) = setup_linear_range();
+    let output = repo.run_cresca(&["review", "main", "develop"]);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        repo.review_scope_values("review-main-develop"),
+        vec![format!("1:{}", range.d)]
+    );
+}
+
+#[test]
+fn test_review_records_stop_at_as_full_scope_end() {
+    let (repo, range) = setup_linear_range();
+    let output = repo.run_cresca(&["review", "main", "develop", "--stop-at", &range.c[..8]]);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        repo.review_scope_values("review-main-develop"),
+        vec![format!("1:{}", range.c)]
+    );
+}
+
+#[test]
+fn test_review_scope_end_is_independent_of_skip_to() {
+    let (repo, range) = setup_linear_range();
+    let output = repo.run_cresca(&[
+        "review",
+        "main",
+        "develop",
+        "--skip-to",
+        &range.b[..8],
+        "--stop-at",
+        &range.c[..8],
+    ]);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        repo.review_scope_values("review-main-develop"),
+        vec![format!("1:{}", range.c)]
+    );
+}
+
+#[test]
+fn test_successful_rereview_replaces_scope_end() {
+    let (repo, range) = setup_linear_range();
+    assert!(repo
+        .run_cresca(&["review", "main", "develop", "--stop-at", &range.c[..8],])
+        .status
+        .success());
+    repo.git(&["add", "-A"]);
+    assert!(repo.run_cresca(&["approve"]).status.success());
+    let output = repo.run_cresca(&["review", "main", "develop", "--stop-at", &range.d[..8]]);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        repo.review_scope_values("review-main-develop"),
+        vec![format!("1:{}", range.d)]
+    );
+}
+
+#[test]
+fn test_failed_rereview_preserves_previous_scope_end() {
+    let (repo, range) = setup_linear_range();
+    assert!(repo
+        .run_cresca(&["review", "main", "develop", "--stop-at", &range.c[..8],])
+        .status
+        .success());
+    repo.git(&["add", "-A"]);
+    assert!(repo.run_cresca(&["approve"]).status.success());
+    let before = repo.review_scope_values("review-main-develop");
+    assert_eq!(before, vec![format!("1:{}", range.c)]);
+    let output = repo.run_cresca(&["review", "main", "develop", "--stop-at", "does-not-exist"]);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("does-not-exist") && stderr.contains("is not in the range"));
+    assert_eq!(repo.review_scope_values("review-main-develop"), before);
+}
+
 fn assert_review_matches(
     repo: &TempGitRepo,
     expected_branch: &str,
@@ -643,8 +778,8 @@ fn test_status_shows_diff_stats() {
     assert_eq!(
         String::from_utf8(output.stdout).expect("status stdout should be UTF-8"),
         concat!(
-            "📋 Review status:\n",
-            "  Remaining diff to develop: 2 file(s), +3 insertion(s), -1 deletion(s)\n",
+            "📋 Review status (current range):\n",
+            "  Remaining diff in current review range: 2 file(s), +3 insertion(s), -1 deletion(s)\n",
             "  Files remaining:\n",
             "    - added.txt\n",
             "    - changed.txt\n",
@@ -759,8 +894,8 @@ fn test_status_after_partial_approval() {
     assert_eq!(
         String::from_utf8(output.stdout).expect("status stdout should be UTF-8"),
         concat!(
-            "📋 Review status:\n",
-            "  Remaining diff to develop: 1 file(s), +1 insertion(s), -1 deletion(s)\n",
+            "📋 Review status (current range):\n",
+            "  Remaining diff in current review range: 1 file(s), +1 insertion(s), -1 deletion(s)\n",
             "  Files remaining:\n",
             "    - changed.txt\n",
         )
@@ -793,8 +928,8 @@ fn test_status_after_partial_approval() {
     assert_eq!(
         String::from_utf8(output.stdout).expect("status stdout should be UTF-8"),
         concat!(
-            "📋 Review status:\n",
-            "  Remaining diff to develop: 0 file(s), +0 insertion(s), -0 deletion(s)\n",
+            "📋 Review status (current range):\n",
+            "  Remaining diff in current review range: 0 file(s), +0 insertion(s), -0 deletion(s)\n",
         )
     );
     assert!(output.stderr.is_empty());
@@ -1603,10 +1738,252 @@ fn test_status_uses_metadata_for_hyphenated_target_and_slash_source() {
         String::from_utf8_lossy(&output.stderr)
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("Remaining diff to feature/login-page:"));
+    assert!(stdout.contains("Remaining diff in current review range:"));
     assert!(stdout.contains("1 file(s), +1 insertion(s), -0 deletion(s)"));
     assert!(stdout.contains("    - login.txt\n"));
     assert!(output.stderr.is_empty());
+}
+
+fn assert_scope_error_and_all_available(repo: &TempGitRepo, expected_error: &str) {
+    let before = repo.snapshot();
+    let output = repo.run_cresca(&["status"]);
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(expected_error),
+        "unexpected diagnostic: {stderr}"
+    );
+    assert!(stderr.contains("cresca review main develop"));
+    assert!(stderr.contains("cresca status --all"));
+    assert_eq!(repo.snapshot(), before);
+
+    let all = repo.run_cresca(&["status", "--all"]);
+    assert!(
+        all.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&all.stdout),
+        String::from_utf8_lossy(&all.stderr)
+    );
+    assert!(String::from_utf8_lossy(&all.stdout).contains("    - develop.txt\n"));
+    assert!(all.stderr.is_empty());
+}
+
+#[test]
+fn test_status_requires_scope_metadata_but_all_works_for_pr12_identity() {
+    let repo = setup_identity_only_review_branch();
+    assert_scope_error_and_all_available(&repo, "range metadata is missing");
+}
+
+#[test]
+fn test_status_rejects_duplicate_scope_values_but_all_still_works() {
+    let repo = setup_identity_only_review_branch();
+    let value = format!("1:{}", repo.rev_parse("HEAD"));
+    repo.git(&[
+        "config",
+        "--local",
+        "--add",
+        "branch.review-main-develop.cresca-scope",
+        &value,
+    ]);
+    repo.git(&[
+        "config",
+        "--local",
+        "--add",
+        "branch.review-main-develop.cresca-scope",
+        &value,
+    ]);
+    assert_scope_error_and_all_available(&repo, "range metadata has duplicate values");
+}
+
+#[test]
+fn test_status_rejects_unsupported_scope_version_but_all_still_works() {
+    let repo = setup_identity_only_review_branch();
+    let value = format!("2:{}", repo.rev_parse("HEAD"));
+    repo.git(&[
+        "config",
+        "--local",
+        "branch.review-main-develop.cresca-scope",
+        &value,
+    ]);
+    assert_scope_error_and_all_available(&repo, "range metadata version '2' is unsupported");
+}
+
+#[test]
+fn test_status_rejects_malformed_scope_oid_but_all_still_works() {
+    let repo = setup_identity_only_review_branch();
+    repo.git(&[
+        "config",
+        "--local",
+        "branch.review-main-develop.cresca-scope",
+        "1:not-an-oid",
+    ]);
+    assert_scope_error_and_all_available(&repo, "range metadata is invalid");
+}
+
+#[test]
+fn test_status_rejects_abbreviated_scope_oid() {
+    let repo = setup_identity_only_review_branch();
+    let head = repo.rev_parse("HEAD");
+    let value = format!("1:{}", &head[..8]);
+    repo.git(&[
+        "config",
+        "--local",
+        "branch.review-main-develop.cresca-scope",
+        &value,
+    ]);
+    assert_scope_error_and_all_available(&repo, "range metadata is invalid");
+}
+
+#[test]
+fn test_status_rejects_unavailable_scope_commit_but_all_still_works() {
+    let repo = setup_identity_only_review_branch();
+    let oid = "0000000000000000000000000000000000000000";
+    let value = format!("1:{oid}");
+    repo.git(&[
+        "config",
+        "--local",
+        "branch.review-main-develop.cresca-scope",
+        &value,
+    ]);
+    assert_scope_error_and_all_available(
+        &repo,
+        &format!("saved range endpoint '{oid}' is unavailable"),
+    );
+}
+
+#[test]
+fn test_status_keeps_unbounded_review_tip_fixed_until_next_review() {
+    let (repo, _) = setup_linear_range();
+    assert!(repo
+        .run_cresca(&["review", "main", "develop"])
+        .status
+        .success());
+    repo.git(&["add", "-A"]);
+    assert!(repo.run_cresca(&["approve"]).status.success());
+    repo.switch_branch("develop");
+    repo.write_file("e.txt", "added at E\n");
+    repo.git(&["add", "e.txt"]);
+    repo.commit("E: add e.txt");
+    repo.git(&["push", "origin", "develop"]);
+    repo.switch_branch("review-main-develop");
+    assert_eq!(
+        run_status_stdout(&repo, &["status"]),
+        concat!(
+            "📋 Review status (current range):\n",
+            "  Remaining diff in current review range: 0 file(s), +0 insertion(s), -0 deletion(s)\n",
+        )
+    );
+    assert_eq!(
+        run_status_stdout(&repo, &["status", "--all"]),
+        concat!(
+            "📋 Review status (full pull request):\n",
+            "  Remaining diff to develop: 1 file(s), +1 insertion(s), -0 deletion(s)\n",
+            "  Files remaining:\n",
+            "    - e.txt\n",
+        )
+    );
+}
+
+#[test]
+fn test_status_default_excludes_commits_after_stop_at_while_all_includes_them() {
+    let (repo, range) = setup_linear_range();
+    assert!(repo
+        .run_cresca(&["review", "main", "develop", "--stop-at", &range.c[..8],])
+        .status
+        .success());
+    let current = run_status_stdout(&repo, &["status"]);
+    assert!(current.contains("📋 Review status (current range):"));
+    assert!(current.contains("3 file(s), +2 insertion(s), -2 deletion(s)"));
+    assert!(current.contains("    - a.txt\n"));
+    assert!(current.contains("    - removed-at-c.txt\n"));
+    assert!(current.contains("    - shared.txt\n"));
+    assert!(!current.contains("    - d.txt\n"));
+    let all = run_status_stdout(&repo, &["status", "--all"]);
+    assert!(all.contains("📋 Review status (full pull request):"));
+    assert!(all.contains("4 file(s), +3 insertion(s), -2 deletion(s)"));
+    for file in ["a.txt", "d.txt", "removed-at-c.txt", "shared.txt"] {
+        assert!(all.contains(&format!("    - {file}\n")));
+    }
+}
+
+#[test]
+fn test_status_after_skip_stop_and_partial_approve_excludes_auto_approved_changes() {
+    let (repo, range) = setup_linear_range();
+    assert!(repo
+        .run_cresca(&[
+            "review",
+            "main",
+            "develop",
+            "--skip-to",
+            &range.b[..8],
+            "--stop-at",
+            &range.c[..8],
+        ])
+        .status
+        .success());
+    repo.git(&["add", "shared.txt"]);
+    assert!(repo.run_cresca(&["approve"]).status.success());
+    let current = run_status_stdout(&repo, &["status"]);
+    assert!(current.contains("1 file(s), +0 insertion(s), -1 deletion(s)"));
+    assert!(current.contains("    - removed-at-c.txt\n"));
+    assert!(!current.contains("a.txt"));
+    assert!(!current.contains("d.txt"));
+    let all = run_status_stdout(&repo, &["status", "--all"]);
+    assert!(all.contains("2 file(s), +1 insertion(s), -1 deletion(s)"));
+    assert!(all.contains("    - d.txt\n"));
+    assert!(all.contains("    - removed-at-c.txt\n"));
+    assert!(!all.contains("a.txt"));
+}
+
+#[test]
+fn test_status_current_range_can_be_complete_while_full_pull_request_remains() {
+    let (repo, range) = setup_linear_range();
+    assert!(repo
+        .run_cresca(&["review", "main", "develop", "--stop-at", &range.c[..8],])
+        .status
+        .success());
+    repo.git(&["add", "-A"]);
+    assert!(repo.run_cresca(&["approve"]).status.success());
+    assert_eq!(
+        run_status_stdout(&repo, &["status"]),
+        concat!(
+            "📋 Review status (current range):\n",
+            "  Remaining diff in current review range: 0 file(s), +0 insertion(s), -0 deletion(s)\n",
+        )
+    );
+    assert_eq!(
+        run_status_stdout(&repo, &["status", "--all"]),
+        concat!(
+            "📋 Review status (full pull request):\n",
+            "  Remaining diff to develop: 1 file(s), +1 insertion(s), -0 deletion(s)\n",
+            "  Files remaining:\n",
+            "    - d.txt\n",
+        )
+    );
+}
+
+#[test]
+fn test_status_help_describes_all_scope() {
+    let repo = TempGitRepo::new();
+    let output = repo.run_cresca(&["status", "--help"]);
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("Usage: cresca status [OPTIONS]"));
+    assert!(stdout.contains("--all"));
+    assert!(stdout.contains("full pull request"));
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
+fn test_status_rejects_unknown_option() {
+    let repo = TempGitRepo::new();
+    let before = repo.snapshot();
+    let output = repo.run_cresca(&["status", "--unknown"]);
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("unexpected argument '--unknown'"));
+    assert_eq!(repo.snapshot(), before);
 }
 
 /// Test that `cresca review` works with branch names containing slashes.

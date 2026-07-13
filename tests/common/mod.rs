@@ -115,6 +115,10 @@ impl TempGitRepo {
         )
     }
 
+    pub fn review_scope_values(&self, branch: &str) -> Vec<String> {
+        self.git_config_values(&format!("branch.{branch}.cresca-scope"))
+    }
+
     /// Resolves a revision to its object ID.
     pub fn rev_parse(&self, revision: &str) -> String {
         self.git_stdout(&["rev-parse", revision])

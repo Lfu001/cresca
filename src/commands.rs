@@ -1,6 +1,6 @@
 use crate::git::{
     resolve_remote_tracking_branch, run_git_command, select_review_branch, write_review_metadata,
-    ReviewBranchSelection, ReviewMetadata,
+    write_review_scope, ReviewBranchSelection, ReviewMetadata, ReviewScope,
 };
 use colored::Colorize;
 use std::ops::Not;
@@ -130,6 +130,20 @@ pub fn prepare_review_branch(
         }
     }
 
+    let scope_end_revision = stop_at.unwrap_or(&tracking_from);
+    let scope_end_commit = format!("{scope_end_revision}^{{commit}}");
+    let scope_end_output = run_git_command(
+        "resolve review range endpoint",
+        &["rev-parse", "--verify", &scope_end_commit],
+        false,
+        verbose,
+    );
+    let scope = ReviewScope {
+        end_oid: String::from_utf8_lossy(&scope_end_output.stdout)
+            .trim()
+            .to_string(),
+    };
+
     let (review_branch, is_new) = match select_review_branch(&metadata, verbose) {
         ReviewBranchSelection::Existing(name) => {
             run_git_command(
@@ -151,8 +165,7 @@ pub fn prepare_review_branch(
         }
     };
 
-    // Determine target commit for squash merge
-    let target_commit = if let Some(hash) = skip_to {
+    if let Some(hash) = skip_to {
         // Auto-approve commits before skip_to by squash merging them
         let parent = format!("{}^", hash);
 
@@ -187,13 +200,9 @@ pub fn prepare_review_branch(
                 verbose,
             );
         }
+    }
 
-        // Use stop_at if specified, otherwise tracking_from
-        stop_at.unwrap_or(&tracking_from).to_string()
-    } else {
-        // Use stop_at if specified, otherwise tracking_from
-        stop_at.unwrap_or(&tracking_from).to_string()
-    };
+    let target_commit = scope.end_oid.clone();
 
     // Squash merge remaining changes
     run_git_command(
@@ -217,6 +226,7 @@ pub fn prepare_review_branch(
     if is_new {
         write_review_metadata(&review_branch, &metadata, verbose);
     }
+    write_review_scope(&review_branch, &scope, verbose);
 }
 
 /// Commit reviewed changes and discard unreviewed ones
@@ -266,7 +276,7 @@ pub fn approve_changes(verbose: bool) -> Result<(), ()> {
 
 /// Review status information
 pub struct ReviewStatus {
-    pub from_branch: String,
+    pub display_label: String,
     pub file_count: usize,
     pub insertions: usize,
     pub deletions: usize,
@@ -277,20 +287,18 @@ pub struct ReviewStatus {
 ///
 /// # Arguments
 ///
-/// * `from_branch` - The development branch to compare against.
+/// * `compare_ref` - The Git ref to compare against.
+/// * `display_label` - The human-readable label for the comparison.
 /// * `verbose` - Whether to print the git command and its output.
 ///
 /// # Returns
 ///
 /// * `ReviewStatus` - The remaining diff statistics
-pub fn get_review_status(from_branch: &str, verbose: bool) -> ReviewStatus {
-    let resolved_from = resolve_remote_tracking_branch(from_branch, verbose);
-    let tracking_from = resolved_from.tracking_ref;
-
+pub fn get_review_status(compare_ref: &str, display_label: &str, verbose: bool) -> ReviewStatus {
     // Get diff stats summary (use HEAD..branch for direct comparison, not HEAD...branch)
     let stat_output = run_git_command(
         "get diff stats",
-        &["diff", "--stat", "HEAD", &tracking_from],
+        &["diff", "--stat", "HEAD", compare_ref],
         false,
         verbose,
     );
@@ -323,7 +331,7 @@ pub fn get_review_status(from_branch: &str, verbose: bool) -> ReviewStatus {
     // Get list of changed files
     let files_output = run_git_command(
         "get changed files",
-        &["diff", "--name-only", "HEAD", &tracking_from],
+        &["diff", "--name-only", "HEAD", compare_ref],
         false,
         verbose,
     );
@@ -334,7 +342,7 @@ pub fn get_review_status(from_branch: &str, verbose: bool) -> ReviewStatus {
         .collect();
 
     ReviewStatus {
-        from_branch: from_branch.to_string(),
+        display_label: display_label.to_string(),
         file_count,
         insertions,
         deletions,

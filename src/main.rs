@@ -5,7 +5,10 @@ use clap::builder::styling::{AnsiColor, Effects};
 use clap::{builder::Styles, ArgAction, Args, Parser, Subcommand};
 use colored::Colorize;
 use commands::{approve_changes, get_review_status, prepare_review_branch};
-use git::{current_review_metadata, is_clean, ReviewMetadataError};
+use git::{
+    current_branch_name, current_review_metadata, is_clean, read_review_scope,
+    resolve_remote_tracking_branch, ReviewMetadata, ReviewMetadataError, ReviewScopeError,
+};
 use std::process::exit;
 
 const STYLES: Styles = Styles::styled()
@@ -43,7 +46,14 @@ enum Commands {
     /// Prepare a review branch.
     Review(ReviewArgs),
     /// Show remaining diff statistics.
-    Status,
+    Status(StatusArgs),
+}
+
+#[derive(Args)]
+struct StatusArgs {
+    /// Show unapproved changes across the full pull request.
+    #[arg(long)]
+    all: bool,
 }
 
 #[derive(Args)]
@@ -95,14 +105,31 @@ fn main() {
                 println!("Review branch prepared successfully. Stage the changes you have reviewed and run `{}` to approve them.", "cresca approve".green());
             }
         }
-        Commands::Status => {
+        Commands::Status(args) => {
             let metadata = current_review_metadata(cli.verbose)
                 .unwrap_or_else(|error| exit_invalid_review_branch(error));
-            let status = get_review_status(&metadata.source, cli.verbose);
-            println!("📋 Review status:");
+            let (heading, compare_ref, display_label) = if args.all {
+                let resolved = resolve_remote_tracking_branch(&metadata.source, cli.verbose);
+                (
+                    "full pull request",
+                    resolved.tracking_ref,
+                    format!("to {}", metadata.source),
+                )
+            } else {
+                let branch = current_branch_name(cli.verbose);
+                let scope = read_review_scope(&branch, cli.verbose)
+                    .unwrap_or_else(|error| exit_invalid_review_scope(error, &metadata));
+                (
+                    "current range",
+                    scope.end_oid,
+                    "in current review range".to_string(),
+                )
+            };
+            let status = get_review_status(&compare_ref, &display_label, cli.verbose);
+            println!("📋 Review status ({}):", heading);
             println!(
-                "  Remaining diff to {}: {} file(s), {} insertion(s), {} deletion(s)",
-                status.from_branch.green(),
+                "  Remaining diff {}: {} file(s), {} insertion(s), {} deletion(s)",
+                status.display_label,
                 status.file_count.to_string().yellow(),
                 format!("+{}", status.insertions).green(),
                 format!("-{}", status.deletions).red()
@@ -122,6 +149,28 @@ fn main() {
             }
         }
     }
+}
+
+fn exit_invalid_review_scope(error: ReviewScopeError, metadata: &ReviewMetadata) -> ! {
+    let reason = match error {
+        ReviewScopeError::Missing => "range metadata is missing".to_string(),
+        ReviewScopeError::Duplicate => "range metadata has duplicate values".to_string(),
+        ReviewScopeError::UnsupportedVersion(version) => {
+            format!("range metadata version '{version}' is unsupported")
+        }
+        ReviewScopeError::Invalid => "range metadata is invalid".to_string(),
+        ReviewScopeError::UnavailableCommit(oid) => {
+            format!("saved range endpoint '{oid}' is unavailable")
+        }
+    };
+    eprintln!(
+        "{}: Cannot show current review range because {}. Rerun `cresca review {} {}` to record the range. `cresca status --all` is still available.",
+        "error".red().bold(),
+        reason,
+        metadata.target,
+        metadata.source
+    );
+    exit(1);
 }
 
 fn exit_invalid_review_branch(_: ReviewMetadataError) -> ! {
