@@ -1744,19 +1744,112 @@ fn test_status_uses_metadata_for_hyphenated_target_and_slash_source() {
     assert!(output.stderr.is_empty());
 }
 
-#[test]
-fn test_status_requires_recorded_range_while_all_uses_identity_only() {
-    let repo = setup_identity_only_review_branch();
+fn assert_scope_error_and_all_available(repo: &TempGitRepo, expected_error: &str) {
+    let before = repo.snapshot();
     let output = repo.run_cresca(&["status"]);
     assert!(!output.status.success());
     assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        String::from_utf8_lossy(&output.stderr).contains("range metadata is missing or invalid")
+        stderr.contains(expected_error),
+        "unexpected diagnostic: {stderr}"
     );
+    assert!(stderr.contains("cresca review main develop"));
+    assert!(stderr.contains("cresca status --all"));
+    assert_eq!(repo.snapshot(), before);
+
     let all = repo.run_cresca(&["status", "--all"]);
-    assert!(all.status.success());
+    assert!(
+        all.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&all.stdout),
+        String::from_utf8_lossy(&all.stderr)
+    );
     assert!(String::from_utf8_lossy(&all.stdout).contains("    - develop.txt\n"));
     assert!(all.stderr.is_empty());
+}
+
+#[test]
+fn test_status_requires_scope_metadata_but_all_works_for_pr12_identity() {
+    let repo = setup_identity_only_review_branch();
+    assert_scope_error_and_all_available(&repo, "range metadata is missing");
+}
+
+#[test]
+fn test_status_rejects_duplicate_scope_values_but_all_still_works() {
+    let repo = setup_identity_only_review_branch();
+    let value = format!("1:{}", repo.rev_parse("HEAD"));
+    repo.git(&[
+        "config",
+        "--local",
+        "--add",
+        "branch.review-main-develop.cresca-scope",
+        &value,
+    ]);
+    repo.git(&[
+        "config",
+        "--local",
+        "--add",
+        "branch.review-main-develop.cresca-scope",
+        &value,
+    ]);
+    assert_scope_error_and_all_available(&repo, "range metadata has duplicate values");
+}
+
+#[test]
+fn test_status_rejects_unsupported_scope_version_but_all_still_works() {
+    let repo = setup_identity_only_review_branch();
+    let value = format!("2:{}", repo.rev_parse("HEAD"));
+    repo.git(&[
+        "config",
+        "--local",
+        "branch.review-main-develop.cresca-scope",
+        &value,
+    ]);
+    assert_scope_error_and_all_available(&repo, "range metadata version '2' is unsupported");
+}
+
+#[test]
+fn test_status_rejects_malformed_scope_oid_but_all_still_works() {
+    let repo = setup_identity_only_review_branch();
+    repo.git(&[
+        "config",
+        "--local",
+        "branch.review-main-develop.cresca-scope",
+        "1:not-an-oid",
+    ]);
+    assert_scope_error_and_all_available(&repo, "range metadata is invalid");
+}
+
+#[test]
+fn test_status_rejects_abbreviated_scope_oid() {
+    let repo = setup_identity_only_review_branch();
+    let head = repo.rev_parse("HEAD");
+    let value = format!("1:{}", &head[..8]);
+    repo.git(&[
+        "config",
+        "--local",
+        "branch.review-main-develop.cresca-scope",
+        &value,
+    ]);
+    assert_scope_error_and_all_available(&repo, "range metadata is invalid");
+}
+
+#[test]
+fn test_status_rejects_unavailable_scope_commit_but_all_still_works() {
+    let repo = setup_identity_only_review_branch();
+    let oid = "0000000000000000000000000000000000000000";
+    let value = format!("1:{oid}");
+    repo.git(&[
+        "config",
+        "--local",
+        "branch.review-main-develop.cresca-scope",
+        &value,
+    ]);
+    assert_scope_error_and_all_available(
+        &repo,
+        &format!("saved range endpoint '{oid}' is unavailable"),
+    );
 }
 
 #[test]

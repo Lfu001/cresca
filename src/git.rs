@@ -25,7 +25,11 @@ pub enum ReviewMetadataError {
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum ReviewScopeError {
-    MissingOrInvalid,
+    Missing,
+    Duplicate,
+    UnsupportedVersion(String),
+    Invalid,
+    UnavailableCommit(String),
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -224,14 +228,36 @@ pub fn write_review_scope(branch: &str, scope: &ReviewScope, verbose: bool) {
 
 pub fn read_review_scope(branch: &str, verbose: bool) -> Result<ReviewScope, ReviewScopeError> {
     let values = review_config_values(branch, "scope", verbose);
-    let [value] = values.as_slice() else {
-        return Err(ReviewScopeError::MissingOrInvalid);
+    let value = match values.as_slice() {
+        [] => return Err(ReviewScopeError::Missing),
+        [value] => value,
+        _ => return Err(ReviewScopeError::Duplicate),
     };
     let Some((version, end_oid)) = value.split_once(':') else {
-        return Err(ReviewScopeError::MissingOrInvalid);
+        return Err(ReviewScopeError::Invalid);
     };
-    if version != REVIEW_SCOPE_VERSION || end_oid.is_empty() {
-        return Err(ReviewScopeError::MissingOrInvalid);
+    if version != REVIEW_SCOPE_VERSION {
+        return Err(ReviewScopeError::UnsupportedVersion(version.to_string()));
+    }
+    if end_oid.is_empty()
+        || end_oid.contains(':')
+        || !end_oid.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err(ReviewScopeError::Invalid);
+    }
+    let revision = format!("{end_oid}^{{commit}}");
+    let output = run_git_command(
+        "validate review range endpoint",
+        &["rev-parse", "--verify", &revision],
+        true,
+        verbose,
+    );
+    if !output.status.success() {
+        return Err(ReviewScopeError::UnavailableCommit(end_oid.to_string()));
+    }
+    let canonical = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if canonical != end_oid {
+        return Err(ReviewScopeError::Invalid);
     }
     Ok(ReviewScope {
         end_oid: end_oid.to_string(),

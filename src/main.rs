@@ -151,10 +151,22 @@ fn main() {
     }
 }
 
-fn exit_invalid_review_scope(_: ReviewScopeError, metadata: &ReviewMetadata) -> ! {
+fn exit_invalid_review_scope(error: ReviewScopeError, metadata: &ReviewMetadata) -> ! {
+    let reason = match error {
+        ReviewScopeError::Missing => "range metadata is missing".to_string(),
+        ReviewScopeError::Duplicate => "range metadata has duplicate values".to_string(),
+        ReviewScopeError::UnsupportedVersion(version) => {
+            format!("range metadata version '{version}' is unsupported")
+        }
+        ReviewScopeError::Invalid => "range metadata is invalid".to_string(),
+        ReviewScopeError::UnavailableCommit(oid) => {
+            format!("saved range endpoint '{oid}' is unavailable")
+        }
+    };
     eprintln!(
-        "{}: Cannot show current review range because range metadata is missing or invalid. Rerun `cresca review {} {}` to record the range. `cresca status --all` is still available.",
+        "{}: Cannot show current review range because {}. Rerun `cresca review {} {}` to record the range. `cresca status --all` is still available.",
         "error".red().bold(),
+        reason,
         metadata.target,
         metadata.source
     );
