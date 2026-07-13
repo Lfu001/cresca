@@ -2,11 +2,17 @@ use colored::Colorize;
 use std::process::{exit, Command, Output};
 
 pub const REVIEW_METADATA_VERSION: &str = "1";
+pub const REVIEW_SCOPE_VERSION: &str = "1";
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct ReviewMetadata {
     pub target: String,
     pub source: String,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct ReviewScope {
+    pub end_oid: String,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -195,6 +201,17 @@ pub fn write_review_metadata(branch: &str, metadata: &ReviewMetadata, verbose: b
             &version_key,
             REVIEW_METADATA_VERSION,
         ],
+        false,
+        verbose,
+    );
+}
+
+pub fn write_review_scope(branch: &str, scope: &ReviewScope, verbose: bool) {
+    let key = review_config_key(branch, "scope");
+    let value = format!("{}:{}", REVIEW_SCOPE_VERSION, scope.end_oid);
+    run_git_command(
+        "record review range",
+        &["config", "--local", "--replace-all", &key, &value],
         false,
         verbose,
     );

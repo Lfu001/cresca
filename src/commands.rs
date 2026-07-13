@@ -1,6 +1,6 @@
 use crate::git::{
     resolve_remote_tracking_branch, run_git_command, select_review_branch, write_review_metadata,
-    ReviewBranchSelection, ReviewMetadata,
+    write_review_scope, ReviewBranchSelection, ReviewMetadata, ReviewScope,
 };
 use colored::Colorize;
 use std::ops::Not;
@@ -130,6 +130,20 @@ pub fn prepare_review_branch(
         }
     }
 
+    let scope_end_revision = stop_at.unwrap_or(&tracking_from);
+    let scope_end_commit = format!("{scope_end_revision}^{{commit}}");
+    let scope_end_output = run_git_command(
+        "resolve review range endpoint",
+        &["rev-parse", "--verify", &scope_end_commit],
+        false,
+        verbose,
+    );
+    let scope = ReviewScope {
+        end_oid: String::from_utf8_lossy(&scope_end_output.stdout)
+            .trim()
+            .to_string(),
+    };
+
     let (review_branch, is_new) = match select_review_branch(&metadata, verbose) {
         ReviewBranchSelection::Existing(name) => {
             run_git_command(
@@ -151,8 +165,7 @@ pub fn prepare_review_branch(
         }
     };
 
-    // Determine target commit for squash merge
-    let target_commit = if let Some(hash) = skip_to {
+    if let Some(hash) = skip_to {
         // Auto-approve commits before skip_to by squash merging them
         let parent = format!("{}^", hash);
 
@@ -187,13 +200,9 @@ pub fn prepare_review_branch(
                 verbose,
             );
         }
+    }
 
-        // Use stop_at if specified, otherwise tracking_from
-        stop_at.unwrap_or(&tracking_from).to_string()
-    } else {
-        // Use stop_at if specified, otherwise tracking_from
-        stop_at.unwrap_or(&tracking_from).to_string()
-    };
+    let target_commit = scope.end_oid.clone();
 
     // Squash merge remaining changes
     run_git_command(
@@ -217,6 +226,7 @@ pub fn prepare_review_branch(
     if is_new {
         write_review_metadata(&review_branch, &metadata, verbose);
     }
+    write_review_scope(&review_branch, &scope, verbose);
 }
 
 /// Commit reviewed changes and discard unreviewed ones

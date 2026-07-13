@@ -55,6 +55,98 @@ fn setup_linear_range() -> (TempGitRepo, LinearRange) {
     (repo, LinearRange { base, a, b, c, d })
 }
 
+#[test]
+fn test_review_records_source_tip_as_full_scope_end_without_stop_at() {
+    let (repo, range) = setup_linear_range();
+    let output = repo.run_cresca(&["review", "main", "develop"]);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        repo.review_scope_values("review-main-develop"),
+        vec![format!("1:{}", range.d)]
+    );
+}
+
+#[test]
+fn test_review_records_stop_at_as_full_scope_end() {
+    let (repo, range) = setup_linear_range();
+    let output = repo.run_cresca(&["review", "main", "develop", "--stop-at", &range.c[..8]]);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        repo.review_scope_values("review-main-develop"),
+        vec![format!("1:{}", range.c)]
+    );
+}
+
+#[test]
+fn test_review_scope_end_is_independent_of_skip_to() {
+    let (repo, range) = setup_linear_range();
+    let output = repo.run_cresca(&[
+        "review",
+        "main",
+        "develop",
+        "--skip-to",
+        &range.b[..8],
+        "--stop-at",
+        &range.c[..8],
+    ]);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        repo.review_scope_values("review-main-develop"),
+        vec![format!("1:{}", range.c)]
+    );
+}
+
+#[test]
+fn test_successful_rereview_replaces_scope_end() {
+    let (repo, range) = setup_linear_range();
+    assert!(repo
+        .run_cresca(&["review", "main", "develop", "--stop-at", &range.c[..8],])
+        .status
+        .success());
+    repo.git(&["add", "-A"]);
+    assert!(repo.run_cresca(&["approve"]).status.success());
+    let output = repo.run_cresca(&["review", "main", "develop", "--stop-at", &range.d[..8]]);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        repo.review_scope_values("review-main-develop"),
+        vec![format!("1:{}", range.d)]
+    );
+}
+
+#[test]
+fn test_failed_rereview_preserves_previous_scope_end() {
+    let (repo, range) = setup_linear_range();
+    assert!(repo
+        .run_cresca(&["review", "main", "develop", "--stop-at", &range.c[..8],])
+        .status
+        .success());
+    repo.git(&["add", "-A"]);
+    assert!(repo.run_cresca(&["approve"]).status.success());
+    let before = repo.review_scope_values("review-main-develop");
+    assert_eq!(before, vec![format!("1:{}", range.c)]);
+    let output = repo.run_cresca(&["review", "main", "develop", "--stop-at", "does-not-exist"]);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("does-not-exist") && stderr.contains("is not in the range"));
+    assert_eq!(repo.review_scope_values("review-main-develop"), before);
+}
+
 fn assert_review_matches(
     repo: &TempGitRepo,
     expected_branch: &str,
