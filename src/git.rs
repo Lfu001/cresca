@@ -24,6 +24,11 @@ pub enum ReviewMetadataError {
 }
 
 #[derive(Debug, PartialEq, Eq)]
+pub enum ReviewScopeError {
+    MissingOrInvalid,
+}
+
+#[derive(Debug, PartialEq, Eq)]
 pub enum ReviewBranchSelection {
     New(String),
     Existing(String),
@@ -215,6 +220,22 @@ pub fn write_review_scope(branch: &str, scope: &ReviewScope, verbose: bool) {
         false,
         verbose,
     );
+}
+
+pub fn read_review_scope(branch: &str, verbose: bool) -> Result<ReviewScope, ReviewScopeError> {
+    let values = review_config_values(branch, "scope", verbose);
+    let [value] = values.as_slice() else {
+        return Err(ReviewScopeError::MissingOrInvalid);
+    };
+    let Some((version, end_oid)) = value.split_once(':') else {
+        return Err(ReviewScopeError::MissingOrInvalid);
+    };
+    if version != REVIEW_SCOPE_VERSION || end_oid.is_empty() {
+        return Err(ReviewScopeError::MissingOrInvalid);
+    }
+    Ok(ReviewScope {
+        end_oid: end_oid.to_string(),
+    })
 }
 
 /// Run a git command and return the output
