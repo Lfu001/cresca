@@ -64,6 +64,20 @@ cresca review main develop --stop-at=C
 
 Use `git log --oneline main..develop` to see available commits.
 
+### Checking Review Progress
+
+`status` shows the changes that remain unapproved in the range prepared by the most recent successful `review` command:
+
+```sh
+cresca status
+```
+
+Use `--all` to include unapproved changes after that range and show the remaining diff across the full pull request:
+
+```sh
+cresca status --all
+```
+
 ## License
 
 [MIT](https://github.com/Lfu001/cresca/blob/main/LICENSE)
