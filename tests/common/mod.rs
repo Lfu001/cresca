@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use tempfile::TempDir;
@@ -15,10 +16,12 @@ pub struct RepoState {
     pub branch: String,
     pub head: String,
     pub local_heads: Vec<u8>,
-    pub local_config: Vec<u8>,
     pub status: Vec<u8>,
     pub cached_diff: Vec<u8>,
     pub worktree_diff: Vec<u8>,
+    pub raw_local_config: Vec<u8>,
+    pub raw_index: Vec<u8>,
+    pub directories: BTreeSet<PathBuf>,
 }
 
 impl TempGitRepo {
@@ -85,6 +88,22 @@ impl TempGitRepo {
             .current_dir(self.path())
             .output()
             .expect("Failed to execute git command")
+    }
+
+    fn git_without_optional_locks(&self, args: &[&str]) -> Output {
+        let output = Command::new("git")
+            .args(args)
+            .env("GIT_OPTIONAL_LOCKS", "0")
+            .current_dir(self.path())
+            .output()
+            .expect("Failed to execute git command without optional locks");
+        assert!(
+            output.status.success(),
+            "Git command failed: git {}\nstderr: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output
     }
 
     /// Runs a git command and returns normalized UTF-8 stdout.
@@ -198,36 +217,88 @@ impl TempGitRepo {
 
     /// Returns the real index file contents without interpreting them.
     pub fn real_index_bytes(&self) -> Vec<u8> {
-        let index_path = PathBuf::from(self.git_stdout(&["rev-parse", "--git-path", "index"]));
-        let index_path = if index_path.is_absolute() {
-            index_path
+        std::fs::read(self.git_path("index")).expect("real git index should be readable")
+    }
+
+    /// Returns the local config file contents without Git normalization.
+    pub fn raw_local_config_bytes(&self) -> Vec<u8> {
+        std::fs::read(self.git_path("config")).expect("local Git config should be readable")
+    }
+
+    /// Returns every worktree directory, including empty directories.
+    pub fn directory_set(&self) -> BTreeSet<PathBuf> {
+        fn visit(root: &Path, directory: &Path, result: &mut BTreeSet<PathBuf>) {
+            for child in
+                std::fs::read_dir(directory).expect("worktree directory should be readable")
+            {
+                let child = child.expect("worktree entry should be readable");
+                if directory == root && child.file_name() == ".git" {
+                    continue;
+                }
+                let path = child.path();
+                let metadata = std::fs::symlink_metadata(&path)
+                    .expect("worktree entry metadata should be readable");
+                if metadata.is_dir() && !metadata.file_type().is_symlink() {
+                    let relative = path
+                        .strip_prefix(root)
+                        .expect("worktree directory must be under root")
+                        .to_path_buf();
+                    result.insert(relative);
+                    visit(root, &path, result);
+                }
+            }
+        }
+
+        let mut result = BTreeSet::new();
+        visit(self.path(), self.path(), &mut result);
+        result
+    }
+
+    fn git_path(&self, name: &str) -> PathBuf {
+        let path = PathBuf::from(self.git_stdout(&["rev-parse", "--git-path", name]));
+        if path.is_absolute() {
+            path
         } else {
-            self.path().join(index_path)
-        };
-        std::fs::read(index_path).expect("real git index should be readable")
+            self.path().join(path)
+        }
     }
 
     /// Captures the repository state used by integration-test assertions.
     pub fn snapshot(&self) -> RepoState {
+        let branch = self.current_branch();
+        let head = self.rev_parse("HEAD");
+        let local_heads = self
+            .git(&[
+                "for-each-ref",
+                "--sort=refname",
+                "--format=%(refname) %(objectname)",
+                "refs/heads/",
+            ])
+            .stdout;
+        let status = self
+            .git_without_optional_locks(&[
+                "status",
+                "--porcelain=v1",
+                "-z",
+                "--untracked-files=all",
+            ])
+            .stdout;
+        let cached_diff = self.cached_diff();
+        let worktree_diff = self.worktree_diff();
+        let raw_local_config = self.raw_local_config_bytes();
+        let raw_index = self.real_index_bytes();
+        let directories = self.directory_set();
+
         RepoState {
-            branch: self.current_branch(),
-            head: self.rev_parse("HEAD"),
-            local_heads: self
-                .git(&[
-                    "for-each-ref",
-                    "--sort=refname",
-                    "--format=%(refname) %(objectname)",
-                    "refs/heads/",
-                ])
-                .stdout,
-            local_config: self
-                .git(&["config", "--local", "--null", "--list", "--show-origin"])
-                .stdout,
-            status: self
-                .git(&["status", "--porcelain=v1", "-z", "--untracked-files=all"])
-                .stdout,
-            cached_diff: self.cached_diff(),
-            worktree_diff: self.worktree_diff(),
+            branch,
+            head,
+            local_heads,
+            status,
+            cached_diff,
+            worktree_diff,
+            raw_local_config,
+            raw_index,
+            directories,
         }
     }
 

@@ -112,15 +112,15 @@ impl ReviewTransaction {
         })
     }
 
-    pub fn execute<F>(&mut self, operation: F) -> Result<(), ReviewError>
+    pub fn execute<F, T>(&mut self, operation: F) -> Result<T, ReviewError>
     where
-        F: FnOnce() -> Result<(), ReviewError>,
+        F: FnOnce() -> Result<T, ReviewError>,
     {
         self.mutation_started = true;
         match operation() {
-            Ok(()) => {
+            Ok(value) => {
                 self.finished = true;
-                Ok(())
+                Ok(value)
             }
             Err(original) => {
                 let rollback = self.rollback();
@@ -365,6 +365,11 @@ fn scan_worktree(root: &Path) -> io::Result<BTreeMap<PathBuf, Entry>> {
                         data: fs::read(path)?,
                     },
                 );
+            } else {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("unsupported filesystem entry `{}`", relative.display()),
+                ));
             }
         }
         Ok(())

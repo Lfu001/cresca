@@ -1,7 +1,7 @@
 use crate::git::{
-    resolve_remote_tracking_branch, run_git_command, select_review_branch, write_review_metadata,
-    write_review_scope, ReviewBranchSelection, ReviewBranchSelectionError, ReviewMetadata,
-    ReviewScope,
+    is_clean, resolve_remote_tracking_branch, run_git_command, select_review_branch,
+    write_review_metadata, write_review_scope, ReviewBranchSelection, ReviewBranchSelectionError,
+    ReviewMetadata, ReviewScope,
 };
 use crate::review::{ReviewError, ReviewTransaction};
 use std::ops::Not;
@@ -21,8 +21,26 @@ pub fn prepare_review_branch(
     skip_to: Option<&str>,
     stop_at: Option<&str>,
     verbose: bool,
-) -> Result<(), ReviewError> {
+) -> Result<bool, ReviewError> {
     let mut transaction = ReviewTransaction::begin(verbose)?;
+    transaction
+        .execute(|| prepare_review_branch_inner(to_branch, from_branch, skip_to, stop_at, verbose))
+}
+
+fn prepare_review_branch_inner(
+    to_branch: &str,
+    from_branch: &str,
+    skip_to: Option<&str>,
+    stop_at: Option<&str>,
+    verbose: bool,
+) -> Result<bool, ReviewError> {
+    if !is_clean(verbose)? {
+        return Err(ReviewError::Message(
+            "Uncommitted changes found. Please commit or stash them before starting review."
+                .to_string(),
+        ));
+    }
+
     let metadata = ReviewMetadata {
         target: to_branch.to_string(),
         source: from_branch.to_string(),
@@ -152,58 +170,31 @@ pub fn prepare_review_branch(
         ReviewBranchSelectionError::Conflict(message) => ReviewError::Message(message),
     })?;
 
-    transaction.execute(|| {
-        let (review_branch, is_new) = match selection {
-            ReviewBranchSelection::Existing(name) => {
-                run_git_command(
-                    "switch to review branch",
-                    &["switch", &name],
-                    false,
-                    verbose,
-                )?;
-                (name, false)
-            }
-            ReviewBranchSelection::New(name) => {
-                run_git_command(
-                    "create review branch from merge-base",
-                    &["checkout", "-b", &name, &merge_base],
-                    false,
-                    verbose,
-                )?;
-                (name, true)
-            }
-        };
-
-        if let Some(parent) = auto_approve_parent {
-            // Auto-approve commits before skip_to by squash merging them
+    let (review_branch, is_new) = match selection {
+        ReviewBranchSelection::Existing(name) => {
             run_git_command(
-                "auto-approve earlier commits",
-                &[
-                    "merge",
-                    "--squash",
-                    "--ff",
-                    "--quiet",
-                    "--no-stat",
-                    "-X",
-                    "theirs",
-                    &parent,
-                ],
+                "switch to review branch",
+                &["switch", &name],
                 false,
                 verbose,
             )?;
-            run_git_command(
-                "commit auto-approved changes",
-                &["commit", "--quiet", "-m", "Auto-approve earlier commits"],
-                false,
-                verbose,
-            )?;
+            (name, false)
         }
+        ReviewBranchSelection::New(name) => {
+            run_git_command(
+                "create review branch from merge-base",
+                &["checkout", "-b", &name, &merge_base],
+                false,
+                verbose,
+            )?;
+            (name, true)
+        }
+    };
 
-        let target_commit = scope.end_oid.clone();
-
-        // Squash merge remaining changes
+    if let Some(parent) = auto_approve_parent {
+        // Auto-approve commits before skip_to by squash merging them
         run_git_command(
-            "squash merge remaining changes",
+            "auto-approve earlier commits",
             &[
                 "merge",
                 "--squash",
@@ -212,20 +203,45 @@ pub fn prepare_review_branch(
                 "--no-stat",
                 "-X",
                 "theirs",
-                &target_commit,
+                &parent,
             ],
             false,
             verbose,
         )?;
+        run_git_command(
+            "commit auto-approved changes",
+            &["commit", "--quiet", "-m", "Auto-approve earlier commits"],
+            false,
+            verbose,
+        )?;
+    }
 
-        // Unstage changes for review
-        run_git_command("unstage changes for review", &["reset"], false, verbose)?;
-        if is_new {
-            write_review_metadata(&review_branch, &metadata, verbose)?;
-        }
-        write_review_scope(&review_branch, &scope, verbose)?;
-        Ok(())
-    })
+    let target_commit = scope.end_oid.clone();
+
+    // Squash merge remaining changes
+    run_git_command(
+        "squash merge remaining changes",
+        &[
+            "merge",
+            "--squash",
+            "--ff",
+            "--quiet",
+            "--no-stat",
+            "-X",
+            "theirs",
+            &target_commit,
+        ],
+        false,
+        verbose,
+    )?;
+
+    // Unstage changes for review
+    run_git_command("unstage changes for review", &["reset"], false, verbose)?;
+    if is_new {
+        write_review_metadata(&review_branch, &metadata, verbose)?;
+    }
+    write_review_scope(&review_branch, &scope, verbose)?;
+    Ok(!is_clean(verbose)?)
 }
 
 /// Commit reviewed changes and discard unreviewed ones

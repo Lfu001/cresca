@@ -2,7 +2,7 @@ mod common;
 
 use common::TempGitRepo;
 use std::collections::BTreeSet;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 
 fn install_git_wrapper(repo: &TempGitRepo, script: &str) -> tempfile::TempDir {
     let wrapper_dir = tempfile::TempDir::new().expect("wrapper directory should be created");
@@ -63,11 +63,8 @@ fn test_git_failure_renders_description_args_status_stdout_and_stderr() {
     assert_eq!(output.status.code(), Some(1));
     assert!(output.stdout.is_empty());
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("check working directory status"),
-        "{stderr}"
-    );
-    assert!(stderr.contains("status --porcelain"), "{stderr}");
+    assert!(stderr.contains("locate repository worktree"), "{stderr}");
+    assert!(stderr.contains("rev-parse --show-toplevel"), "{stderr}");
     assert!(stderr.contains("exit status: 42"), "{stderr}");
     assert!(stderr.contains("captured stdout"), "{stderr}");
     assert!(stderr.contains("captured stderr"), "{stderr}");
@@ -91,6 +88,74 @@ fn test_review_ref_update_failure_rolls_back_exact_repository_state() {
     assert_eq!(repo.snapshot(), before);
     assert!(!repo.ref_exists("refs/heads/review-main-develop"));
     assert!(!repo.path().join("generated-by-failed-review").exists());
+}
+
+#[test]
+fn test_post_transaction_status_failure_rolls_back_new_review_exactly() {
+    let (repo, _) = setup_linear_range();
+    let before = repo.snapshot();
+    let wrapper = install_git_wrapper(
+        &repo,
+        "#!/bin/sh\nif [ \"$1\" = status ] && [ \"$2\" = --porcelain ]; then\n  count_file=\"$0.count\"\n  count=0\n  if [ -f \"$count_file\" ]; then IFS= read -r count < \"$count_file\"; fi\n  count=$((count + 1))\n  printf '%s\\n' \"$count\" > \"$count_file\"\n  if [ \"$count\" -eq 2 ]; then\n    printf 'injected post-transaction status failure\\n' >&2\n    exit 52\n  fi\nfi\nexec \"$CRESCA_REAL_GIT\" \"$@\"\n",
+    );
+
+    let output = run_cresca_with_git_wrapper(&repo, &wrapper, &["review", "main", "develop"]);
+
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("check working directory status"));
+    assert_eq!(repo.snapshot(), before);
+    assert!(!repo.ref_exists("refs/heads/review-main-develop"));
+    assert_eq!(
+        repo.review_metadata_values("review-main-develop"),
+        (Vec::new(), Vec::new(), Vec::new())
+    );
+    assert!(repo.review_scope_values("review-main-develop").is_empty());
+}
+
+#[test]
+fn test_review_rejects_unsupported_fifo_before_mutation_and_preserves_it() {
+    let (repo, _) = setup_linear_range();
+    repo.write_file(".gitignore", "review.pipe\n");
+    repo.git(&["add", ".gitignore"]);
+    repo.commit("Ignore review FIFO fixture");
+    repo.git(&["push", "origin", "main"]);
+    let fifo_path = repo.path().join("review.pipe");
+    let mkfifo = std::process::Command::new("mkfifo")
+        .arg(&fifo_path)
+        .output()
+        .expect("mkfifo should be executable");
+    assert!(
+        mkfifo.status.success(),
+        "mkfifo failed: {}",
+        String::from_utf8_lossy(&mkfifo.stderr)
+    );
+    let before = repo.snapshot();
+    let wrapper = install_git_wrapper(
+        &repo,
+        "#!/bin/sh\nif [ \"$1\" = checkout ] && [ \"$2\" = -b ]; then\n  \"$CRESCA_REAL_GIT\" \"$@\" || exit $?\n  printf 'mutation should not be reached\\n' >&2\n  exit 53\nfi\nexec \"$CRESCA_REAL_GIT\" \"$@\"\n",
+    );
+
+    let output = run_cresca_with_git_wrapper(&repo, &wrapper, &["review", "main", "develop"]);
+
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("unsupported filesystem entry"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(repo.snapshot(), before);
+    assert!(
+        std::fs::symlink_metadata(&fifo_path)
+            .expect("pre-existing FIFO must survive")
+            .file_type()
+            .is_fifo(),
+        "pre-existing FIFO should remain a FIFO"
+    );
+    assert!(!repo.ref_exists("refs/heads/review-main-develop"));
+    assert_eq!(
+        repo.review_metadata_values("review-main-develop"),
+        (Vec::new(), Vec::new(), Vec::new())
+    );
 }
 
 #[test]
@@ -124,6 +189,8 @@ fn test_review_config_failure_removes_partial_identity_scope_and_restores_config
 #[test]
 fn test_review_materialization_failure_restores_index_worktree_and_generated_paths() {
     let (repo, _) = setup_linear_range();
+    std::fs::create_dir_all(repo.path().join("pre-existing-empty/nested"))
+        .expect("empty directory fixture should be created");
     let before = repo.snapshot();
     let wrapper = install_git_wrapper(
         &repo,
@@ -136,6 +203,24 @@ fn test_review_materialization_failure_restores_index_worktree_and_generated_pat
     assert!(String::from_utf8_lossy(&output.stderr).contains("unstage changes for review"));
     assert_eq!(repo.snapshot(), before);
     assert!(!repo.path().join("generated-after-materialization").exists());
+}
+
+#[test]
+fn test_repository_snapshot_includes_raw_config_index_and_empty_directories() {
+    let repo = TempGitRepo::new();
+    std::fs::create_dir_all(repo.path().join("empty/also-empty"))
+        .expect("empty directory fixture should be created");
+
+    let snapshot = repo.snapshot();
+
+    assert_eq!(snapshot.raw_local_config, repo.raw_local_config_bytes());
+    assert_eq!(snapshot.raw_index, repo.real_index_bytes());
+    assert!(snapshot
+        .directories
+        .contains(&std::path::PathBuf::from("empty")));
+    assert!(snapshot
+        .directories
+        .contains(&std::path::PathBuf::from("empty/also-empty")));
 }
 
 #[test]

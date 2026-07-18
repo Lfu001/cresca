@@ -7,7 +7,7 @@ use clap::{builder::Styles, ArgAction, Args, Parser, Subcommand};
 use colored::Colorize;
 use commands::{approve_changes, get_review_status, prepare_review_branch};
 use git::{
-    current_branch_name, current_review_metadata, is_clean, read_review_scope,
+    current_branch_name, current_review_metadata, read_review_scope,
     resolve_remote_tracking_branch, ReviewMetadata, ReviewMetadataError, ReviewScopeError,
 };
 use std::process::exit;
@@ -115,19 +115,14 @@ fn run() -> Result<(), CliError> {
             };
         }
         Commands::Review(args) => {
-            if !is_clean(cli.verbose)? {
-                eprintln!("{}: Uncommitted changes found. Please commit or stash them before starting review.", "error".red().bold());
-                exit(1);
-            }
-
-            prepare_review_branch(
+            let has_unreviewed_changes = prepare_review_branch(
                 &args.to,
                 &args.from,
                 args.skip_to.as_deref(),
                 args.stop_at.as_deref(),
                 cli.verbose,
             )?;
-            if is_clean(cli.verbose)? {
+            if !has_unreviewed_changes {
                 println!("Review branch prepared successfully. However, it seems like there are no unreviewed changes.");
             } else {
                 println!("Review branch prepared successfully. Stage the changes you have reviewed and run `{}` to approve them.", "cresca approve".green());

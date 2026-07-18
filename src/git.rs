@@ -329,7 +329,7 @@ pub fn read_review_scope(branch: &str, verbose: bool) -> Result<ReviewScope, Rev
 ///
 /// # Returns
 ///
-/// * `std::process::Output` - The output of the git command.
+/// * `Result<Output, GitCommandError>` - The output, or a fully captured Git failure.
 pub fn run_git_command(
     description: &str,
     args: &[&str],
