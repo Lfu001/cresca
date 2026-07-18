@@ -652,6 +652,89 @@ fn test_changed_entry_beneath_restrictive_directory_is_restored() {
 }
 
 #[test]
+fn test_failed_backup_copy_restores_widened_file_mode_and_continues() {
+    let (repo, _) = setup_linear_range();
+    add_ignored_paths(&repo, "copy-failure/\n");
+    let directory = repo.path().join("copy-failure");
+    std::fs::create_dir(&directory).expect("copy-failure directory should be created");
+    repo.write_file("copy-failure/readonly.txt", "original readonly content\n");
+    repo.write_file(
+        "copy-failure/zz-independent.txt",
+        "independent original content\n",
+    );
+    std::fs::set_permissions(
+        directory.join("readonly.txt"),
+        std::fs::Permissions::from_mode(0o444),
+    )
+    .unwrap();
+    std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let _mode_guard = RestoreDirectoryMode {
+        path: directory.clone(),
+    };
+    let wrapper = install_git_wrapper(
+        &repo,
+        "#!/bin/sh\ncase \"$*\" in\n  *'config --local --replace-all branch.review-main-develop.cresca-scope'*)\n    \"$CRESCA_REAL_GIT\" \"$@\" || exit $?\n    /bin/chmod 755 copy-failure\n    /bin/chmod 644 copy-failure/readonly.txt\n    printf 'changed readonly content\\n' > copy-failure/readonly.txt\n    /bin/chmod 444 copy-failure/readonly.txt\n    /bin/rm -f copy-failure/zz-independent.txt\n    /bin/chmod 555 copy-failure\n    for backup in .git/cresca-review-*/worktree/copy-failure/readonly.txt; do\n      if [ -f \"$backup\" ]; then /bin/rm -f \"$backup\"; fi\n    done\n    printf 'late backup-copy failure\\n' >&2\n    exit 65\n    ;;\nesac\nexec \"$CRESCA_REAL_GIT\" \"$@\"\n",
+    );
+
+    let output = run_cresca_with_git_wrapper(&repo, &wrapper, &["review", "main", "develop"]);
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("late backup-copy failure"), "{stderr}");
+    assert!(
+        stderr.contains("restore file `copy-failure/readonly.txt`"),
+        "{stderr}"
+    );
+    assert_eq!(
+        std::fs::symlink_metadata(directory.join("readonly.txt"))
+            .unwrap()
+            .mode()
+            & 0o777,
+        0o444,
+        "a failed backup copy must not leave the user's file writable"
+    );
+    assert_eq!(
+        repo.read_file("copy-failure/zz-independent.txt"),
+        "independent original content\n",
+        "a failed path must not skip later independent restoration"
+    );
+}
+
+#[test]
+fn test_generated_nested_mode_zero_directory_is_removed_on_rollback() {
+    let (repo, _) = setup_linear_range();
+    let before = repo.snapshot();
+    let generated = repo.path().join("generated-locked");
+    let nested = generated.join("nested");
+    let _nested_guard = RestoreDirectoryMode {
+        path: nested.clone(),
+    };
+    let _generated_guard = RestoreDirectoryMode {
+        path: generated.clone(),
+    };
+    let wrapper = install_git_wrapper(
+        &repo,
+        "#!/bin/sh\ncase \"$*\" in\n  *'config --local --replace-all branch.review-main-develop.cresca-scope'*)\n    \"$CRESCA_REAL_GIT\" \"$@\" || exit $?\n    /bin/mkdir -p generated-locked/nested\n    printf 'generated locked content\\n' > generated-locked/nested/file.txt\n    /bin/chmod 000 generated-locked/nested\n    /bin/chmod 000 generated-locked\n    printf 'late generated-directory failure\\n' >&2\n    exit 66\n    ;;\nesac\nexec \"$CRESCA_REAL_GIT\" \"$@\"\n",
+    );
+
+    let output = run_cresca_with_git_wrapper(&repo, &wrapper, &["review", "main", "develop"]);
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("late generated-directory failure"),
+        "{stderr}"
+    );
+    let survived = generated.exists();
+    if survived {
+        let _ = std::fs::set_permissions(&generated, std::fs::Permissions::from_mode(0o755));
+        let _ = std::fs::set_permissions(&nested, std::fs::Permissions::from_mode(0o755));
+    }
+    assert!(!survived, "generated mode-000 directory survived rollback");
+    assert_eq!(repo.snapshot(), before);
+}
+
+#[test]
 fn test_review_preserves_custom_tmpdir_for_git_helpers() {
     let (repo, _) = setup_linear_range();
     let custom_tmpdir = tempfile::TempDir::new().expect("custom TMPDIR should be created");

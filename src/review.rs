@@ -535,10 +535,15 @@ fn scan_worktree(root: &Path) -> io::Result<BTreeMap<PathBuf, Entry>> {
     Ok(entries)
 }
 
-fn scan_worktree_tolerant(root: &Path, diagnostics: &mut Vec<String>) -> BTreeMap<PathBuf, Entry> {
+fn scan_worktree_tolerant(
+    root: &Path,
+    expected: &BTreeMap<PathBuf, Entry>,
+    diagnostics: &mut Vec<String>,
+) -> BTreeMap<PathBuf, Entry> {
     fn visit(
         root: &Path,
         directory: &Path,
+        expected: &BTreeMap<PathBuf, Entry>,
         entries: &mut BTreeMap<PathBuf, Entry>,
         diagnostics: &mut Vec<String>,
     ) {
@@ -609,22 +614,31 @@ fn scan_worktree_tolerant(root: &Path, diagnostics: &mut Vec<String>) -> BTreeMa
                 }
             };
             let is_directory = matches!(entry, Entry::Directory { .. });
+            let visit_directory =
+                is_directory && matches!(expected.get(&relative), Some(Entry::Directory { .. }));
             entries.insert(relative, entry);
-            if is_directory {
-                visit(root, &path, entries, diagnostics);
+            if visit_directory {
+                visit(root, &path, expected, entries, diagnostics);
             }
         }
     }
 
     let mut entries = BTreeMap::new();
-    visit(root, root, &mut entries, diagnostics);
+    visit(root, root, expected, &mut entries, diagnostics);
     entries
 }
 
 fn remove_path(path: &Path) -> io::Result<()> {
     match fs::symlink_metadata(path) {
         Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
-            fs::remove_dir_all(path)
+            let widened = metadata.permissions().mode() | 0o700;
+            if widened != metadata.permissions().mode() {
+                fs::set_permissions(path, fs::Permissions::from_mode(widened))?;
+            }
+            for child in fs::read_dir(path)? {
+                remove_path(&child?.path())?;
+            }
+            fs::remove_dir(path)
         }
         Ok(_) => fs::remove_file(path),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
@@ -638,7 +652,7 @@ fn reconcile_worktree(
     backup_root: &Path,
     diagnostics: &mut Vec<String>,
 ) {
-    let current = scan_worktree_tolerant(root, diagnostics);
+    let current = scan_worktree_tolerant(root, expected, diagnostics);
     let mut extras: Vec<_> = current
         .keys()
         .filter(|relative| !expected.contains_key(*relative))
@@ -654,7 +668,7 @@ fn reconcile_worktree(
 
     let mut directories_to_widen = BTreeSet::new();
     for relative in extras.iter().chain(mismatches.iter()) {
-        let mut ancestor = relative.parent();
+        let mut ancestor = Some(relative.as_path());
         while let Some(path) = ancestor {
             if matches!(expected.get(path), Some(Entry::Directory { .. })) {
                 directories_to_widen.insert(path.to_path_buf());
@@ -662,23 +676,44 @@ fn reconcile_worktree(
             ancestor = path.parent();
         }
     }
+    let mut deferred_directory_modes = BTreeMap::new();
     for relative in directories_to_widen {
         let Some(Entry::Directory { mode }) = expected.get(&relative) else {
             continue;
         };
         let widened = *mode | 0o700;
-        if widened != *mode {
-            if let Err(error) =
-                fs::set_permissions(root.join(&relative), fs::Permissions::from_mode(widened))
-            {
-                diagnostics.push(format!(
-                    "temporarily widen directory `{}` for rollback: {error}",
-                    relative.display()
-                ));
+        let current_mode = fs::symlink_metadata(root.join(&relative))
+            .ok()
+            .filter(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink())
+            .map(|metadata| metadata.mode());
+        let ready_for_descendants = match current_mode {
+            Some(current) if current == widened => true,
+            Some(_) => {
+                if let Err(error) =
+                    fs::set_permissions(root.join(&relative), fs::Permissions::from_mode(widened))
+                {
+                    diagnostics.push(format!(
+                        "temporarily widen directory `{}` for rollback: {error}",
+                        relative.display()
+                    ));
+                    false
+                } else {
+                    true
+                }
             }
+            None => false,
+        };
+        if ready_for_descendants && widened != *mode {
+            deferred_directory_modes.insert(relative, *mode);
         }
     }
 
+    let current = scan_worktree_tolerant(root, expected, diagnostics);
+    extras = current
+        .keys()
+        .filter(|relative| !expected.contains_key(*relative))
+        .cloned()
+        .collect();
     extras.sort_by_key(|path| std::cmp::Reverse(path.components().count()));
     for relative in extras {
         if let Err(error) = remove_path(&root.join(&relative)) {
@@ -693,10 +728,21 @@ fn reconcile_worktree(
         if entry_matches(root, relative, entry, backup_root).unwrap_or(false) {
             continue;
         }
-        if let Entry::Directory { .. } = entry {
+        if let Entry::Directory { mode } = entry {
             let path = root.join(relative);
-            if !matches!(fs::symlink_metadata(&path), Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink())
+            if matches!(fs::symlink_metadata(&path), Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink())
             {
+                if !deferred_directory_modes.contains_key(relative) {
+                    if let Err(error) =
+                        fs::set_permissions(&path, fs::Permissions::from_mode(*mode))
+                    {
+                        diagnostics.push(format!(
+                            "restore directory mode `{}`: {error}",
+                            relative.display()
+                        ));
+                    }
+                }
+            } else {
                 if let Err(error) = remove_path(&path) {
                     diagnostics.push(format!(
                         "replace path `{}` with directory: {error}",
@@ -709,6 +755,8 @@ fn reconcile_worktree(
                         "restore directory `{}`: {error}",
                         relative.display()
                     ));
+                } else {
+                    deferred_directory_modes.insert(relative.clone(), *mode);
                 }
             }
         }
@@ -718,6 +766,7 @@ fn reconcile_worktree(
         match entry {
             Entry::Directory { .. } | Entry::Other { .. } => {}
             Entry::File { mode } => {
+                let mut widened_existing_file = false;
                 let existing_regular = matches!(
                     fs::symlink_metadata(&path),
                     Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink()
@@ -743,6 +792,7 @@ fn reconcile_worktree(
                         ));
                         continue;
                     }
+                    widened_existing_file = true;
                 }
                 if matches!(fs::symlink_metadata(&path), Ok(metadata) if !metadata.is_file() || metadata.file_type().is_symlink())
                 {
@@ -760,12 +810,21 @@ fn reconcile_worktree(
                             "create parent for `{}`: {error}",
                             relative.display()
                         ));
+                        if widened_existing_file {
+                            if let Err(error) =
+                                fs::set_permissions(&path, fs::Permissions::from_mode(*mode))
+                            {
+                                diagnostics.push(format!(
+                                    "restore mode for `{}`: {error}",
+                                    relative.display()
+                                ));
+                            }
+                        }
                         continue;
                     }
                 }
                 if let Err(error) = fs::copy(backup_root.join(relative), &path) {
                     diagnostics.push(format!("restore file `{}`: {error}", relative.display()));
-                    continue;
                 }
                 if let Err(error) = fs::set_permissions(&path, fs::Permissions::from_mode(*mode)) {
                     diagnostics.push(format!(
@@ -804,16 +863,14 @@ fn reconcile_worktree(
             }
         }
     }
-    for (relative, entry) in expected.iter().rev() {
-        if let Entry::Directory { mode } = entry {
-            if let Err(error) =
-                fs::set_permissions(root.join(relative), fs::Permissions::from_mode(*mode))
-            {
-                diagnostics.push(format!(
-                    "restore directory mode `{}`: {error}",
-                    relative.display()
-                ));
-            }
+    for (relative, mode) in deferred_directory_modes.iter().rev() {
+        if let Err(error) =
+            fs::set_permissions(root.join(relative), fs::Permissions::from_mode(*mode))
+        {
+            diagnostics.push(format!(
+                "restore directory mode `{}`: {error}",
+                relative.display()
+            ));
         }
     }
 }
