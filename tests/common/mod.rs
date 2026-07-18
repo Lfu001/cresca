@@ -1,4 +1,5 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
+use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use tempfile::TempDir;
@@ -22,6 +23,15 @@ pub struct RepoState {
     pub raw_local_config: Vec<u8>,
     pub raw_index: Vec<u8>,
     pub directories: BTreeSet<PathBuf>,
+    pub direct_worktree: BTreeMap<PathBuf, WorktreeEntryState>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum WorktreeEntryState {
+    Directory { mode: u32 },
+    File { mode: u32, bytes: Vec<u8> },
+    Symlink { target: PathBuf },
+    Other { mode: u32 },
 }
 
 impl TempGitRepo {
@@ -254,7 +264,68 @@ impl TempGitRepo {
         result
     }
 
-    fn git_path(&self, name: &str) -> PathBuf {
+    /// Captures direct filesystem state, including ignored entries Git diffs cannot observe.
+    pub fn direct_worktree_state(&self) -> BTreeMap<PathBuf, WorktreeEntryState> {
+        fn visit(
+            root: &Path,
+            directory: &Path,
+            result: &mut BTreeMap<PathBuf, WorktreeEntryState>,
+        ) {
+            for child in
+                std::fs::read_dir(directory).expect("worktree directory should be readable")
+            {
+                let child = child.expect("worktree entry should be readable");
+                if directory == root && child.file_name() == ".git" {
+                    continue;
+                }
+                let path = child.path();
+                let relative = path
+                    .strip_prefix(root)
+                    .expect("worktree entry must be under root")
+                    .to_path_buf();
+                let metadata = std::fs::symlink_metadata(&path)
+                    .expect("worktree entry metadata should be readable");
+                let entry = if metadata.file_type().is_symlink() {
+                    WorktreeEntryState::Symlink {
+                        target: std::fs::read_link(&path)
+                            .expect("worktree symlink target should be readable"),
+                    }
+                } else if metadata.is_dir() {
+                    WorktreeEntryState::Directory {
+                        mode: metadata.mode(),
+                    }
+                } else if metadata.is_file() {
+                    WorktreeEntryState::File {
+                        mode: metadata.mode(),
+                        bytes: std::fs::read(&path).expect("worktree file should be readable"),
+                    }
+                } else {
+                    assert!(
+                        metadata.file_type().is_fifo()
+                            || metadata.file_type().is_socket()
+                            || metadata.file_type().is_block_device()
+                            || metadata.file_type().is_char_device(),
+                        "unexpected worktree entry type: {}",
+                        relative.display()
+                    );
+                    WorktreeEntryState::Other {
+                        mode: metadata.mode(),
+                    }
+                };
+                let recurse = matches!(entry, WorktreeEntryState::Directory { .. });
+                result.insert(relative, entry);
+                if recurse {
+                    visit(root, &path, result);
+                }
+            }
+        }
+
+        let mut result = BTreeMap::new();
+        visit(self.path(), self.path(), &mut result);
+        result
+    }
+
+    pub fn git_path(&self, name: &str) -> PathBuf {
         let path = PathBuf::from(self.git_stdout(&["rev-parse", "--git-path", name]));
         if path.is_absolute() {
             path
@@ -288,6 +359,7 @@ impl TempGitRepo {
         let raw_local_config = self.raw_local_config_bytes();
         let raw_index = self.real_index_bytes();
         let directories = self.directory_set();
+        let direct_worktree = self.direct_worktree_state();
 
         RepoState {
             branch,
@@ -299,6 +371,7 @@ impl TempGitRepo {
             raw_local_config,
             raw_index,
             directories,
+            direct_worktree,
         }
     }
 

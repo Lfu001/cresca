@@ -6,6 +6,14 @@ use crate::git::{
 use crate::review::{ReviewError, ReviewTransaction};
 use std::ops::Not;
 
+struct ReviewPlan {
+    metadata: ReviewMetadata,
+    merge_base: String,
+    auto_approve_parent: Option<String>,
+    selection: ReviewBranchSelection,
+    scope: ReviewScope,
+}
+
 /// Prepare the review branch using Squash Merge approach.
 ///
 /// # Arguments
@@ -22,18 +30,16 @@ pub fn prepare_review_branch(
     stop_at: Option<&str>,
     verbose: bool,
 ) -> Result<bool, ReviewError> {
-    let mut transaction = ReviewTransaction::begin(verbose)?;
-    transaction
-        .execute(|| prepare_review_branch_inner(to_branch, from_branch, skip_to, stop_at, verbose))
-}
+    // Review preparation never relies on the ambient temporary directory. In particular, Git
+    // launchers on some platforms create helper files there before Cresca can discover the repo.
+    std::env::set_var("TMPDIR", "/tmp");
+    let root = ReviewTransaction::repository_root(verbose)?;
+    std::env::set_current_dir(&root).map_err(|error| {
+        ReviewError::Message(format!(
+            "failed to anchor review preparation at repository root: {error}"
+        ))
+    })?;
 
-fn prepare_review_branch_inner(
-    to_branch: &str,
-    from_branch: &str,
-    skip_to: Option<&str>,
-    stop_at: Option<&str>,
-    verbose: bool,
-) -> Result<bool, ReviewError> {
     if !is_clean(verbose)? {
         return Err(ReviewError::Message(
             "Uncommitted changes found. Please commit or stash them before starting review."
@@ -41,6 +47,18 @@ fn prepare_review_branch_inner(
         ));
     }
 
+    let plan = prepare_review_plan(to_branch, from_branch, skip_to, stop_at, verbose)?;
+    let mut transaction = ReviewTransaction::begin(root, verbose)?;
+    transaction.execute(|| apply_review_plan(plan, verbose))
+}
+
+fn prepare_review_plan(
+    to_branch: &str,
+    from_branch: &str,
+    skip_to: Option<&str>,
+    stop_at: Option<&str>,
+    verbose: bool,
+) -> Result<ReviewPlan, ReviewError> {
     let metadata = ReviewMetadata {
         target: to_branch.to_string(),
         source: from_branch.to_string(),
@@ -48,22 +66,16 @@ fn prepare_review_branch_inner(
     let resolved_to = resolve_remote_tracking_branch(to_branch, verbose)?;
     let resolved_from = resolve_remote_tracking_branch(from_branch, verbose)?;
 
-    let tracking_to = resolved_to.tracking_ref;
-    let tracking_from = resolved_from.tracking_ref;
-
-    // Fetch the target branch
-    run_git_command(
-        &format!("fetch target branch from {}", resolved_to.remote),
-        &["fetch", &resolved_to.remote, &resolved_to.remote_branch],
-        false,
+    let tracking_to = fetch_remote_commit(
+        "target",
+        &resolved_to.remote,
+        &resolved_to.remote_branch,
         verbose,
     )?;
-
-    // Fetch the source branch
-    run_git_command(
-        &format!("fetch source branch from {}", resolved_from.remote),
-        &["fetch", &resolved_from.remote, &resolved_from.remote_branch],
-        false,
+    let tracking_from = fetch_remote_commit(
+        "source",
+        &resolved_from.remote,
+        &resolved_from.remote_branch,
         verbose,
     )?;
 
@@ -71,7 +83,7 @@ fn prepare_review_branch_inner(
     let merge_base_output = run_git_command(
         "get merge base",
         &["merge-base", &tracking_to, &tracking_from],
-        false,
+        &[],
         verbose,
     )?;
     let merge_base = String::from_utf8_lossy(&merge_base_output.stdout)
@@ -82,7 +94,7 @@ fn prepare_review_branch_inner(
     let valid_commits = run_git_command(
         "get valid commit range",
         &["rev-list", &format!("{}..{}", merge_base, tracking_from)],
-        false,
+        &[],
         verbose,
     )?;
     let valid_list = String::from_utf8_lossy(&valid_commits.stdout);
@@ -115,7 +127,7 @@ fn prepare_review_branch_inner(
             let skip_to_commits = run_git_command(
                 "get commits after skip_to",
                 &["rev-list", &format!("{}..{}", skip_hash, tracking_from)],
-                false,
+                &[],
                 verbose,
             )?;
             let skip_to_list = String::from_utf8_lossy(&skip_to_commits.stdout);
@@ -143,7 +155,7 @@ fn prepare_review_branch_inner(
     let scope_end_output = run_git_command(
         "resolve review range endpoint",
         &["rev-parse", "--verify", &scope_end_commit],
-        false,
+        &[],
         verbose,
     )?;
     let scope = ReviewScope {
@@ -157,7 +169,7 @@ fn prepare_review_branch_inner(
         let has_earlier = run_git_command(
             "check earlier commits",
             &["rev-list", &format!("{}..{}", merge_base, parent)],
-            true,
+            &[],
             verbose,
         )?;
         (!has_earlier.stdout.is_empty()).then_some(parent)
@@ -170,21 +182,79 @@ fn prepare_review_branch_inner(
         ReviewBranchSelectionError::Conflict(message) => ReviewError::Message(message),
     })?;
 
+    Ok(ReviewPlan {
+        metadata,
+        merge_base,
+        auto_approve_parent,
+        selection,
+        scope,
+    })
+}
+
+fn fetch_remote_commit(
+    role: &str,
+    remote: &str,
+    remote_branch: &str,
+    verbose: bool,
+) -> Result<String, ReviewError> {
+    let remote_ref = format!("refs/heads/{remote_branch}");
+    let output = run_git_command(
+        &format!("resolve {role} branch on {remote}"),
+        &["ls-remote", "--exit-code", remote, &remote_ref],
+        &[],
+        verbose,
+    )?;
+    let oid = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().next())
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            ReviewError::Message(format!(
+                "Remote branch `{remote}/{remote_branch}` did not resolve to a commit."
+            ))
+        })?
+        .to_string();
+    run_git_command(
+        &format!("fetch {role} branch from {remote}"),
+        &[
+            "fetch",
+            "--no-write-fetch-head",
+            "--refmap=",
+            remote,
+            &remote_ref,
+        ],
+        &[],
+        verbose,
+    )?;
+    let commit = format!("{oid}^{{commit}}");
+    let output = run_git_command(
+        &format!("validate fetched {role} commit"),
+        &["rev-parse", "--verify", &commit],
+        &[],
+        verbose,
+    )?;
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+fn apply_review_plan(plan: ReviewPlan, verbose: bool) -> Result<bool, ReviewError> {
+    let ReviewPlan {
+        metadata,
+        merge_base,
+        auto_approve_parent,
+        selection,
+        scope,
+    } = plan;
     let (review_branch, is_new) = match selection {
         ReviewBranchSelection::Existing(name) => {
-            run_git_command(
-                "switch to review branch",
-                &["switch", &name],
-                false,
-                verbose,
-            )?;
+            run_git_command("switch to review branch", &["switch", &name], &[], verbose)?;
             (name, false)
         }
         ReviewBranchSelection::New(name) => {
             run_git_command(
                 "create review branch from merge-base",
                 &["checkout", "-b", &name, &merge_base],
-                false,
+                &[],
                 verbose,
             )?;
             (name, true)
@@ -205,13 +275,13 @@ fn prepare_review_branch_inner(
                 "theirs",
                 &parent,
             ],
-            false,
+            &[],
             verbose,
         )?;
         run_git_command(
             "commit auto-approved changes",
             &["commit", "--quiet", "-m", "Auto-approve earlier commits"],
-            false,
+            &[],
             verbose,
         )?;
     }
@@ -231,12 +301,12 @@ fn prepare_review_branch_inner(
             "theirs",
             &target_commit,
         ],
-        false,
+        &[],
         verbose,
     )?;
 
     // Unstage changes for review
-    run_git_command("unstage changes for review", &["reset"], false, verbose)?;
+    run_git_command("unstage changes for review", &["reset"], &[], verbose)?;
     if is_new {
         write_review_metadata(&review_branch, &metadata, verbose)?;
     }
@@ -256,21 +326,17 @@ fn prepare_review_branch_inner(
 /// * `Err(())` - If there are no staged changes
 pub fn approve_changes(verbose: bool) -> Result<bool, crate::git::GitCommandError> {
     // Check if there are staged changes
-    let has_staged_changes = run_git_command(
-        "check staged changes",
-        &["diff", "--cached"],
-        false,
-        verbose,
-    )?
-    .stdout
-    .is_empty()
-    .not();
+    let has_staged_changes =
+        run_git_command("check staged changes", &["diff", "--cached"], &[], verbose)?
+            .stdout
+            .is_empty()
+            .not();
 
     if has_staged_changes {
         run_git_command(
             "commit reviewed changes",
             &["commit", "--quiet", "-m", "Approve reviewed changes"],
-            false,
+            &[],
             verbose,
         )?;
     }
@@ -278,10 +344,10 @@ pub fn approve_changes(verbose: bool) -> Result<bool, crate::git::GitCommandErro
     run_git_command(
         "discard unreviewed changes",
         &["restore", "--source=HEAD", "--worktree", "--", "."],
-        false,
+        &[],
         verbose,
     )?;
-    run_git_command("discard untracked files", &["clean", "-fd"], false, verbose)?;
+    run_git_command("discard untracked files", &["clean", "-fd"], &[], verbose)?;
 
     Ok(has_staged_changes)
 }
@@ -315,7 +381,7 @@ pub fn get_review_status(
     let stat_output = run_git_command(
         "get diff stats",
         &["diff", "--stat", "HEAD", compare_ref],
-        false,
+        &[],
         verbose,
     )?;
     let stat_str = String::from_utf8_lossy(&stat_output.stdout);
@@ -348,7 +414,7 @@ pub fn get_review_status(
     let files_output = run_git_command(
         "get changed files",
         &["diff", "--name-only", "HEAD", compare_ref],
-        false,
+        &[],
         verbose,
     )?;
     let files: Vec<String> = String::from_utf8_lossy(&files_output.stdout)

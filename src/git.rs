@@ -89,7 +89,7 @@ fn local_branch_exists(branch: &str, verbose: bool) -> Result<bool, GitCommandEr
             "--quiet",
             &format!("refs/heads/{branch}"),
         ],
-        true,
+        &[1],
         verbose,
     )?
     .status
@@ -150,7 +150,7 @@ fn review_config_values(
     let output = run_git_command(
         "read review metadata",
         &["config", "--local", "--get-all", &key],
-        true,
+        &[1],
         verbose,
     )?;
     if output.status.success() {
@@ -220,7 +220,7 @@ pub fn write_review_metadata(
         run_git_command(
             "clear review metadata version marker",
             &["config", "--local", "--unset-all", &version_key],
-            false,
+            &[],
             verbose,
         )?;
     }
@@ -233,7 +233,7 @@ pub fn write_review_metadata(
             &target_key,
             &metadata.target,
         ],
-        false,
+        &[],
         verbose,
     )?;
     run_git_command(
@@ -245,7 +245,7 @@ pub fn write_review_metadata(
             &source_key,
             &metadata.source,
         ],
-        false,
+        &[],
         verbose,
     )?;
     run_git_command(
@@ -257,7 +257,7 @@ pub fn write_review_metadata(
             &version_key,
             REVIEW_METADATA_VERSION,
         ],
-        false,
+        &[],
         verbose,
     )?;
     Ok(())
@@ -273,7 +273,7 @@ pub fn write_review_scope(
     run_git_command(
         "record review range",
         &["config", "--local", "--replace-all", &key, &value],
-        false,
+        &[],
         verbose,
     )?;
     Ok(())
@@ -302,7 +302,7 @@ pub fn read_review_scope(branch: &str, verbose: bool) -> Result<ReviewScope, Rev
     let output = run_git_command(
         "validate review range endpoint",
         &["rev-parse", "--verify", &revision],
-        true,
+        &[1, 128],
         verbose,
     )
     .map_err(ReviewScopeError::Git)?;
@@ -324,7 +324,7 @@ pub fn read_review_scope(branch: &str, verbose: bool) -> Result<ReviewScope, Rev
 ///
 /// * `description` - The description of the git command.
 /// * `args` - The arguments to pass to the git command.
-/// * `maybe_error` - Whether the git command might fail intentionally.
+/// * `allowed_exit_codes` - Exact nonzero exit codes accepted for an expected negative probe.
 /// * `verbose` - Whether to print the git command and its output.
 ///
 /// # Returns
@@ -333,19 +333,28 @@ pub fn read_review_scope(branch: &str, verbose: bool) -> Result<ReviewScope, Rev
 pub fn run_git_command(
     description: &str,
     args: &[&str],
-    maybe_error: bool,
+    allowed_exit_codes: &[i32],
     verbose: bool,
 ) -> Result<Output, GitCommandError> {
     if verbose {
         println!("[git {}]", args.join(" ").yellow());
     }
-    let output = Command::new("git").args(args).output();
+    let mut command = Command::new("git");
+    command.args(args);
+    if args.first() == Some(&"status") {
+        command.env("GIT_OPTIONAL_LOCKS", "0");
+    }
+    let output = command.output();
     match output {
         Ok(output) => {
             if output.status.success() && !output.stdout.is_empty() && verbose {
                 println!("{}", String::from_utf8_lossy(&output.stdout));
             }
-            if !output.status.success() && !maybe_error {
+            let allowed = output
+                .status
+                .code()
+                .is_some_and(|code| allowed_exit_codes.contains(&code));
+            if !output.status.success() && !allowed {
                 return Err(GitCommandError {
                     description: description.to_string(),
                     args: args.iter().map(|arg| (*arg).to_string()).collect(),
@@ -375,7 +384,7 @@ pub fn is_clean(verbose: bool) -> Result<bool, GitCommandError> {
     Ok(run_git_command(
         "check working directory status",
         &["status", "--porcelain"],
-        false,
+        &[],
         verbose,
     )?
     .stdout
@@ -386,7 +395,7 @@ pub fn current_branch_name(verbose: bool) -> Result<String, GitCommandError> {
     let output = run_git_command(
         "get current branch",
         &["rev-parse", "--abbrev-ref", "HEAD"],
-        false,
+        &[],
         verbose,
     )?;
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
@@ -429,14 +438,14 @@ pub fn resolve_remote_tracking_branch(
             "--quiet",
             &format!("refs/remotes/{}", branch_or_ref),
         ],
-        true,
+        &[1, 128],
         verbose,
     )?;
 
     if verify_output.status.success() {
         // It's a remote tracking branch. We need to split it into remote and branch.
         // Assuming format is <remote>/<branch_name>. We can get remotes to find the remote name.
-        let remotes_output = run_git_command("get remotes", &["remote"], false, verbose)?;
+        let remotes_output = run_git_command("get remotes", &["remote"], &[], verbose)?;
         let remotes_str = String::from_utf8_lossy(&remotes_output.stdout);
         let mut best_remote = String::new();
         for remote in remotes_str.lines() {
@@ -469,7 +478,7 @@ pub fn resolve_remote_tracking_branch(
             "--abbrev-ref",
             &format!("{}@{{upstream}}", branch_or_ref),
         ],
-        true,
+        &[1, 128],
         verbose,
     )?;
 
@@ -482,7 +491,7 @@ pub fn resolve_remote_tracking_branch(
         let remote_output = run_git_command(
             "get configured remote",
             &["config", &format!("branch.{}.remote", branch_or_ref)],
-            true,
+            &[1],
             verbose,
         )?;
 
@@ -520,7 +529,7 @@ pub fn resolve_remote_tracking_branch(
             "origin",
             &format!("refs/heads/{}", branch_or_ref),
         ],
-        true,
+        &[2],
         verbose,
     )?;
 
