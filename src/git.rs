@@ -1,5 +1,6 @@
 use colored::Colorize;
-use std::process::{Command, ExitStatus, Output};
+use std::io::Write;
+use std::process::{Command, ExitStatus, Output, Stdio};
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct GitCommandError {
@@ -298,19 +299,20 @@ pub fn read_review_scope(branch: &str, verbose: bool) -> Result<ReviewScope, Rev
     {
         return Err(ReviewScopeError::Invalid);
     }
-    let revision = format!("{end_oid}^{{commit}}");
-    let output = run_git_command(
+    let revision = format!("{end_oid}^{{commit}}\n");
+    let output = run_git_command_with_input(
         "validate review range endpoint",
-        &["rev-parse", "--verify", &revision],
-        &[1, 128],
+        &["cat-file", "--batch-check=%(objectname)"],
+        revision.as_bytes(),
+        &[],
         verbose,
     )
     .map_err(ReviewScopeError::Git)?;
-    if !output.status.success() {
+    let result = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if result.ends_with(" missing") {
         return Err(ReviewScopeError::UnavailableCommit(end_oid.to_string()));
     }
-    let canonical = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if canonical != end_oid {
+    if result != end_oid {
         return Err(ReviewScopeError::Invalid);
     }
     Ok(ReviewScope {
@@ -344,7 +346,55 @@ pub fn run_git_command(
     if args.first() == Some(&"status") {
         command.env("GIT_OPTIONAL_LOCKS", "0");
     }
-    let output = command.output();
+    evaluate_git_output(
+        description,
+        args,
+        allowed_exit_codes,
+        verbose,
+        command.output(),
+    )
+}
+
+pub fn run_git_command_with_input(
+    description: &str,
+    args: &[&str],
+    input: &[u8],
+    allowed_exit_codes: &[i32],
+    verbose: bool,
+) -> Result<Output, GitCommandError> {
+    if verbose {
+        println!("[git {}]", args.join(" ").yellow());
+    }
+    let mut command = Command::new("git");
+    command
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let output = match command.spawn() {
+        Ok(mut child) => {
+            let write_result = child
+                .stdin
+                .take()
+                .expect("piped Git stdin must be available")
+                .write_all(input);
+            match (write_result, child.wait_with_output()) {
+                (Err(error), Ok(output)) if output.status.success() => Err(error),
+                (_, output) => output,
+            }
+        }
+        Err(error) => Err(error),
+    };
+    evaluate_git_output(description, args, allowed_exit_codes, verbose, output)
+}
+
+fn evaluate_git_output(
+    description: &str,
+    args: &[&str],
+    allowed_exit_codes: &[i32],
+    verbose: bool,
+    output: std::io::Result<Output>,
+) -> Result<Output, GitCommandError> {
     match output {
         Ok(output) => {
             if output.status.success() && !output.stdout.is_empty() && verbose {
@@ -438,7 +488,7 @@ pub fn resolve_remote_tracking_branch(
             "--quiet",
             &format!("refs/remotes/{}", branch_or_ref),
         ],
-        &[1, 128],
+        &[1],
         verbose,
     )?;
 
@@ -474,19 +524,22 @@ pub fn resolve_remote_tracking_branch(
     let upstream_output = run_git_command(
         "get upstream branch",
         &[
-            "rev-parse",
-            "--abbrev-ref",
-            &format!("{}@{{upstream}}", branch_or_ref),
+            "for-each-ref",
+            "--format=%(refname) %(upstream:short)",
+            &format!("refs/heads/{branch_or_ref}"),
         ],
-        &[1, 128],
+        &[],
         verbose,
     )?;
 
-    if upstream_output.status.success() {
-        let tracking_ref = String::from_utf8_lossy(&upstream_output.stdout)
-            .trim()
-            .to_string();
-
+    let local_ref = format!("refs/heads/{branch_or_ref}");
+    let tracking_ref = String::from_utf8_lossy(&upstream_output.stdout)
+        .lines()
+        .filter_map(|line| line.split_once(' '))
+        .find_map(|(name, upstream)| (name == local_ref).then_some(upstream))
+        .unwrap_or_default()
+        .to_string();
+    if !tracking_ref.is_empty() {
         // Extract remote and remote_branch from tracking_ref using the configured remote for the branch
         let remote_output = run_git_command(
             "get configured remote",

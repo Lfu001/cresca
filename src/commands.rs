@@ -12,6 +12,7 @@ struct ReviewPlan {
     auto_approve_parent: Option<String>,
     selection: ReviewBranchSelection,
     scope: ReviewScope,
+    tracking_updates: Vec<(String, String)>,
 }
 
 /// Prepare the review branch using Squash Merge approach.
@@ -30,9 +31,6 @@ pub fn prepare_review_branch(
     stop_at: Option<&str>,
     verbose: bool,
 ) -> Result<bool, ReviewError> {
-    // Review preparation never relies on the ambient temporary directory. In particular, Git
-    // launchers on some platforms create helper files there before Cresca can discover the repo.
-    std::env::set_var("TMPDIR", "/tmp");
     let root = ReviewTransaction::repository_root(verbose)?;
     std::env::set_current_dir(&root).map_err(|error| {
         ReviewError::Message(format!(
@@ -181,6 +179,16 @@ fn prepare_review_plan(
         ReviewBranchSelectionError::Git(error) => ReviewError::Git(error),
         ReviewBranchSelectionError::Conflict(message) => ReviewError::Message(message),
     })?;
+    let tracking_updates = vec![
+        (
+            format!("refs/remotes/{}", resolved_to.tracking_ref),
+            tracking_to,
+        ),
+        (
+            format!("refs/remotes/{}", resolved_from.tracking_ref),
+            tracking_from,
+        ),
+    ];
 
     Ok(ReviewPlan {
         metadata,
@@ -188,6 +196,7 @@ fn prepare_review_plan(
         auto_approve_parent,
         selection,
         scope,
+        tracking_updates,
     })
 }
 
@@ -220,6 +229,7 @@ fn fetch_remote_commit(
         &[
             "fetch",
             "--no-write-fetch-head",
+            "--no-tags",
             "--refmap=",
             remote,
             &remote_ref,
@@ -244,7 +254,17 @@ fn apply_review_plan(plan: ReviewPlan, verbose: bool) -> Result<bool, ReviewErro
         auto_approve_parent,
         selection,
         scope,
+        tracking_updates,
     } = plan;
+    for (number, (tracking_ref, oid)) in tracking_updates.iter().enumerate() {
+        let role = if number == 0 { "target" } else { "source" };
+        run_git_command(
+            &format!("publish fetched {role} tracking ref"),
+            &["update-ref", tracking_ref, oid],
+            &[],
+            verbose,
+        )?;
+    }
     let (review_branch, is_new) = match selection {
         ReviewBranchSelection::Existing(name) => {
             run_git_command("switch to review branch", &["switch", &name], &[], verbose)?;
@@ -266,6 +286,8 @@ fn apply_review_plan(plan: ReviewPlan, verbose: bool) -> Result<bool, ReviewErro
         run_git_command(
             "auto-approve earlier commits",
             &[
+                "-c",
+                "rerere.enabled=false",
                 "merge",
                 "--squash",
                 "--ff",
@@ -292,6 +314,8 @@ fn apply_review_plan(plan: ReviewPlan, verbose: bool) -> Result<bool, ReviewErro
     run_git_command(
         "squash merge remaining changes",
         &[
+            "-c",
+            "rerere.enabled=false",
             "merge",
             "--squash",
             "--ff",

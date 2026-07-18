@@ -1,5 +1,5 @@
 use crate::git::{run_git_command, GitCommandError};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{self, Read};
 use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
@@ -42,6 +42,7 @@ pub struct ReviewTransaction {
     head_ref: Option<String>,
     head_oid: String,
     heads: BTreeMap<String, String>,
+    remote_refs: BTreeMap<String, String>,
     config_path: PathBuf,
     config: Vec<u8>,
     index_path: PathBuf,
@@ -84,6 +85,7 @@ impl ReviewTransaction {
         // Local branch refs are transactional state; reflogs are intentionally outside the
         // rollback contract because Git appends to them while restoring those refs.
         let heads = read_heads(verbose)?;
+        let remote_refs = read_refs("refs/remotes/", verbose)?;
         let config_path = resolve_git_path(&root, "config", verbose)?;
         let index_path = resolve_git_path(&root, "index", verbose)?;
         let scratch_parent = config_path.parent().ok_or_else(|| {
@@ -113,9 +115,11 @@ impl ReviewTransaction {
             "MERGE_HEAD",
             "MERGE_MSG",
             "MERGE_MODE",
+            "MERGE_RR",
             "AUTO_MERGE",
             "CHERRY_PICK_HEAD",
             "REVERT_HEAD",
+            "COMMIT_EDITMSG",
         ];
         let mut admin_files = Vec::new();
         for (number, name) in admin_names.iter().enumerate() {
@@ -160,6 +164,7 @@ impl ReviewTransaction {
             head_ref,
             head_oid,
             heads,
+            remote_refs,
             config_path,
             config,
             index_path,
@@ -234,6 +239,13 @@ impl ReviewTransaction {
             }
             Err(error) => diagnostics.push(format!("read local heads for rollback: {error:?}")),
         }
+        restore_refs(
+            "remote-tracking",
+            "refs/remotes/",
+            &self.remote_refs,
+            self.verbose,
+            &mut diagnostics,
+        );
 
         let checkout_result = match &self.head_ref {
             Some(reference) => run(
@@ -319,6 +331,13 @@ impl ReviewTransaction {
             Err(error) => diagnostics.push(format!("verify refs: {error:?}")),
             _ => {}
         }
+        match read_refs("refs/remotes/", self.verbose) {
+            Ok(refs) if refs != self.remote_refs => {
+                diagnostics.push("remote-tracking refs differ after rollback".to_string())
+            }
+            Err(error) => diagnostics.push(format!("verify remote-tracking refs: {error:?}")),
+            _ => {}
+        }
         match fs::read(&self.config_path) {
             Ok(config) if config != self.config => {
                 diagnostics.push("local config differs after rollback".to_string())
@@ -399,13 +418,17 @@ fn resolve_git_path(root: &Path, name: &str, verbose: bool) -> Result<PathBuf, R
 }
 
 fn read_heads(verbose: bool) -> Result<BTreeMap<String, String>, GitCommandError> {
+    read_refs("refs/heads/", verbose)
+}
+
+fn read_refs(prefix: &str, verbose: bool) -> Result<BTreeMap<String, String>, GitCommandError> {
     let output = run_git_command(
-        "list local heads",
+        "list repository refs",
         &[
             "for-each-ref",
             "--sort=refname",
             "--format=%(refname) %(objectname)",
-            "refs/heads/",
+            prefix,
         ],
         &[],
         verbose,
@@ -415,6 +438,44 @@ fn read_heads(verbose: bool) -> Result<BTreeMap<String, String>, GitCommandError
         .filter_map(|line| line.split_once(' '))
         .map(|(name, oid)| (name.to_string(), oid.to_string()))
         .collect())
+}
+
+fn restore_refs(
+    label: &str,
+    prefix: &str,
+    expected: &BTreeMap<String, String>,
+    verbose: bool,
+    diagnostics: &mut Vec<String>,
+) {
+    let current = match read_refs(prefix, verbose) {
+        Ok(current) => current,
+        Err(error) => {
+            diagnostics.push(format!("read {label} refs for rollback: {error:?}"));
+            return;
+        }
+    };
+    for name in current.keys().filter(|name| !expected.contains_key(*name)) {
+        if let Err(error) = run_git_command(
+            &format!("remove generated {label} ref"),
+            &["update-ref", "-d", name],
+            &[],
+            verbose,
+        ) {
+            diagnostics.push(format!("remove generated {label} ref `{name}`: {error:?}"));
+        }
+    }
+    for (name, oid) in expected {
+        if current.get(name) != Some(oid) {
+            if let Err(error) = run_git_command(
+                &format!("restore {label} ref"),
+                &["update-ref", name, oid],
+                &[],
+                verbose,
+            ) {
+                diagnostics.push(format!("restore {label} ref `{name}`: {error:?}"));
+            }
+        }
+    }
 }
 
 fn copy_if_present(source: &Path, destination: &Path) -> io::Result<bool> {
@@ -583,6 +644,41 @@ fn reconcile_worktree(
         .filter(|relative| !expected.contains_key(*relative))
         .cloned()
         .collect();
+    let mismatches: Vec<_> = expected
+        .iter()
+        .filter_map(|(relative, entry)| {
+            (!entry_matches(root, relative, entry, backup_root).unwrap_or(false))
+                .then_some(relative.clone())
+        })
+        .collect();
+
+    let mut directories_to_widen = BTreeSet::new();
+    for relative in extras.iter().chain(mismatches.iter()) {
+        let mut ancestor = relative.parent();
+        while let Some(path) = ancestor {
+            if matches!(expected.get(path), Some(Entry::Directory { .. })) {
+                directories_to_widen.insert(path.to_path_buf());
+            }
+            ancestor = path.parent();
+        }
+    }
+    for relative in directories_to_widen {
+        let Some(Entry::Directory { mode }) = expected.get(&relative) else {
+            continue;
+        };
+        let widened = *mode | 0o700;
+        if widened != *mode {
+            if let Err(error) =
+                fs::set_permissions(root.join(&relative), fs::Permissions::from_mode(widened))
+            {
+                diagnostics.push(format!(
+                    "temporarily widen directory `{}` for rollback: {error}",
+                    relative.display()
+                ));
+            }
+        }
+    }
+
     extras.sort_by_key(|path| std::cmp::Reverse(path.components().count()));
     for relative in extras {
         if let Err(error) = remove_path(&root.join(&relative)) {
@@ -594,6 +690,9 @@ fn reconcile_worktree(
     }
 
     for (relative, entry) in expected {
+        if entry_matches(root, relative, entry, backup_root).unwrap_or(false) {
+            continue;
+        }
         if let Entry::Directory { .. } = entry {
             let path = root.join(relative);
             if !matches!(fs::symlink_metadata(&path), Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink())
@@ -619,6 +718,32 @@ fn reconcile_worktree(
         match entry {
             Entry::Directory { .. } | Entry::Other { .. } => {}
             Entry::File { mode } => {
+                let existing_regular = matches!(
+                    fs::symlink_metadata(&path),
+                    Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink()
+                );
+                if existing_regular {
+                    if matches!(files_equal(&path, &backup_root.join(relative)), Ok(true)) {
+                        if let Err(error) =
+                            fs::set_permissions(&path, fs::Permissions::from_mode(*mode))
+                        {
+                            diagnostics.push(format!(
+                                "restore mode for `{}`: {error}",
+                                relative.display()
+                            ));
+                        }
+                        continue;
+                    }
+                    if let Err(error) =
+                        fs::set_permissions(&path, fs::Permissions::from_mode(*mode | 0o600))
+                    {
+                        diagnostics.push(format!(
+                            "temporarily make file `{}` writable: {error}",
+                            relative.display()
+                        ));
+                        continue;
+                    }
+                }
                 if matches!(fs::symlink_metadata(&path), Ok(metadata) if !metadata.is_file() || metadata.file_type().is_symlink())
                 {
                     if let Err(error) = remove_path(&path) {
@@ -650,6 +775,13 @@ fn reconcile_worktree(
                 }
             }
             Entry::Symlink { target } => {
+                if matches!(
+                    fs::symlink_metadata(&path),
+                    Ok(metadata) if metadata.file_type().is_symlink()
+                ) && fs::read_link(&path).ok().as_ref() == Some(target)
+                {
+                    continue;
+                }
                 if let Err(error) = remove_path(&path) {
                     diagnostics.push(format!(
                         "replace path `{}` with symlink: {error}",
@@ -683,6 +815,33 @@ fn reconcile_worktree(
                 ));
             }
         }
+    }
+}
+
+fn entry_matches(
+    root: &Path,
+    relative: &Path,
+    expected: &Entry,
+    backup_root: &Path,
+) -> io::Result<bool> {
+    let path = root.join(relative);
+    let metadata = match fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    match expected {
+        Entry::Directory { mode } => {
+            Ok(metadata.is_dir() && !metadata.file_type().is_symlink() && metadata.mode() == *mode)
+        }
+        Entry::File { mode } => Ok(metadata.is_file()
+            && !metadata.file_type().is_symlink()
+            && metadata.mode() == *mode
+            && files_equal(&path, &backup_root.join(relative))?),
+        Entry::Symlink { target } => {
+            Ok(metadata.file_type().is_symlink() && fs::read_link(path)? == *target)
+        }
+        Entry::Other { mode } => Ok(metadata.mode() == *mode),
     }
 }
 

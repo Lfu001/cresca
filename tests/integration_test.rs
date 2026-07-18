@@ -1,9 +1,9 @@
 mod common;
 
 use common::TempGitRepo;
-use std::collections::BTreeSet;
-use std::os::unix::fs::{FileTypeExt, PermissionsExt};
-use std::path::Path;
+use std::collections::{BTreeMap, BTreeSet};
+use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
+use std::path::{Path, PathBuf};
 
 fn install_git_wrapper(repo: &TempGitRepo, script: &str) -> tempfile::TempDir {
     let wrapper_dir = tempfile::TempDir::new().expect("wrapper directory should be created");
@@ -73,6 +73,63 @@ fn add_ignored_paths(repo: &TempGitRepo, patterns: &str) {
     repo.git(&["push", "origin", "main"]);
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum TreeEntry {
+    Directory(u32),
+    File(u32, Vec<u8>),
+    Symlink(PathBuf),
+}
+
+fn snapshot_tree(root: &Path) -> BTreeMap<PathBuf, TreeEntry> {
+    fn visit(root: &Path, directory: &Path, entries: &mut BTreeMap<PathBuf, TreeEntry>) {
+        for child in std::fs::read_dir(directory).expect("snapshot directory should be readable") {
+            let child = child.expect("snapshot entry should be readable");
+            let path = child.path();
+            let relative = path
+                .strip_prefix(root)
+                .expect("snapshot entry should be below root")
+                .to_path_buf();
+            let metadata = std::fs::symlink_metadata(&path)
+                .expect("snapshot entry metadata should be readable");
+            if metadata.file_type().is_symlink() {
+                entries.insert(
+                    relative,
+                    TreeEntry::Symlink(
+                        std::fs::read_link(path).expect("snapshot symlink should be readable"),
+                    ),
+                );
+            } else if metadata.is_dir() {
+                entries.insert(relative, TreeEntry::Directory(metadata.mode()));
+                visit(root, &path, entries);
+            } else {
+                entries.insert(
+                    relative,
+                    TreeEntry::File(
+                        metadata.mode(),
+                        std::fs::read(path).expect("snapshot file should be readable"),
+                    ),
+                );
+            }
+        }
+    }
+
+    let mut entries = BTreeMap::new();
+    if root.exists() {
+        visit(root, root, &mut entries);
+    }
+    entries
+}
+
+struct RestoreDirectoryMode {
+    path: PathBuf,
+}
+
+impl Drop for RestoreDirectoryMode {
+    fn drop(&mut self) {
+        let _ = std::fs::set_permissions(&self.path, std::fs::Permissions::from_mode(0o755));
+    }
+}
+
 #[test]
 fn test_dirty_review_rejects_before_scanning_ignored_fifo() {
     let (repo, _) = setup_linear_range();
@@ -107,6 +164,7 @@ fn test_tmpdir_inside_worktree_does_not_endanger_transaction_backup() {
     add_ignored_paths(&repo, ".scratch/\n");
     let scratch_parent = repo.path().join(".scratch");
     std::fs::create_dir(&scratch_parent).expect("in-worktree TMPDIR should be created");
+    repo.write_file(".scratch/sentinel.txt", "user TMPDIR sentinel\n");
     let before = repo.snapshot();
     let wrapper = install_git_wrapper(
         &repo,
@@ -124,13 +182,27 @@ fn test_tmpdir_inside_worktree_does_not_endanger_transaction_backup() {
         .expect("Failed to execute cresca");
 
     assert!(!output.status.success());
-    assert_eq!(repo.snapshot(), before);
+    let after = repo.snapshot();
+    assert_eq!(after.branch, before.branch);
+    assert_eq!(after.head, before.head);
+    assert_eq!(after.local_heads, before.local_heads);
+    assert_eq!(after.status, before.status);
+    assert_eq!(after.cached_diff, before.cached_diff);
+    assert_eq!(after.worktree_diff, before.worktree_diff);
+    assert_eq!(after.raw_local_config, before.raw_local_config);
+    assert_eq!(after.raw_index, before.raw_index);
+    assert_eq!(
+        repo.read_file(".scratch/sentinel.txt"),
+        "user TMPDIR sentinel\n"
+    );
+    let cresca_scratch: Vec<_> = std::fs::read_dir(&scratch_parent)
+        .expect("in-worktree TMPDIR should remain")
+        .map(|entry| entry.expect("TMPDIR entry should be readable").file_name())
+        .filter(|name| name.to_string_lossy().starts_with("cresca-review-"))
+        .collect();
     assert!(
-        std::fs::read_dir(&scratch_parent)
-            .expect("in-worktree TMPDIR should remain")
-            .next()
-            .is_none(),
-        "transaction scratch must be cleaned without deleting its parent"
+        cresca_scratch.is_empty(),
+        "transaction backup must not be placed in ambient TMPDIR: {cresca_scratch:?}"
     );
 }
 
@@ -309,6 +381,302 @@ fn test_partial_reconcile_failure_still_restores_independent_paths() {
         "{stderr}"
     );
     assert_eq!(repo.read_file("a-restore.txt"), "must be restored\n");
+}
+
+#[test]
+fn test_successful_review_publishes_fetched_source_for_status_all() {
+    let (repo, _) = setup_linear_range();
+    let stale_source = repo.rev_parse("refs/remotes/origin/develop");
+    repo.switch_branch("develop");
+    repo.write_file("advanced-source.txt", "advanced remote source\n");
+    repo.git(&["add", "advanced-source.txt"]);
+    repo.commit("Advance source after tracking ref became stale");
+    let advanced_source = repo.rev_parse("HEAD");
+    repo.git(&["push", "origin", "develop"]);
+    repo.git(&["update-ref", "refs/remotes/origin/develop", &stale_source]);
+    repo.switch_branch("main");
+
+    let review = repo.run_cresca(&["review", "main", "develop"]);
+    assert!(
+        review.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&review.stdout),
+        String::from_utf8_lossy(&review.stderr)
+    );
+    assert_eq!(
+        repo.rev_parse("refs/remotes/origin/develop"),
+        advanced_source,
+        "successful review must publish the source fetched during preflight"
+    );
+    let all = run_status_stdout(&repo, &["status", "--all"]);
+    assert!(all.contains("    - advanced-source.txt\n"), "{all}");
+}
+
+#[test]
+fn test_tracking_ref_publication_failure_rolls_back_exact_state() {
+    let (repo, _) = setup_linear_range();
+    let before = repo.snapshot();
+    let before_target = repo.rev_parse("refs/remotes/origin/main");
+    let before_source = repo.rev_parse("refs/remotes/origin/develop");
+    let wrapper = install_git_wrapper(
+        &repo,
+        "#!/bin/sh\nif [ \"$1\" = update-ref ] && [ \"$2\" = refs/remotes/origin/develop ]; then\n  \"$CRESCA_REAL_GIT\" \"$@\" || exit $?\n  printf 'injected tracking publication failure\\n' >&2\n  exit 58\nfi\nexec \"$CRESCA_REAL_GIT\" \"$@\"\n",
+    );
+
+    let output = run_cresca_with_git_wrapper(&repo, &wrapper, &["review", "main", "develop"]);
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("injected tracking publication failure"),
+        "{stderr}"
+    );
+    assert_eq!(repo.snapshot(), before);
+    assert_eq!(repo.rev_parse("refs/remotes/origin/main"), before_target);
+    assert_eq!(repo.rev_parse("refs/remotes/origin/develop"), before_source);
+}
+
+#[test]
+fn test_isolated_fetch_does_not_auto_follow_tags_on_late_failure() {
+    let (repo, _) = setup_linear_range();
+    repo.switch_branch("develop");
+    repo.write_file("tagged-source.txt", "tagged source\n");
+    repo.git(&["add", "tagged-source.txt"]);
+    repo.commit("Add remotely tagged source");
+    repo.git(&["tag", "remote-review-tag"]);
+    repo.git(&["push", "origin", "develop", "refs/tags/remote-review-tag"]);
+    repo.git(&["tag", "-d", "remote-review-tag"]);
+    repo.switch_branch("main");
+    assert!(!repo.ref_exists("refs/tags/remote-review-tag"));
+    let wrapper = install_git_wrapper(
+        &repo,
+        "#!/bin/sh\ncase \" $* \" in\n  *' fetch '*)\n    case \" $* \" in\n      *' --no-tags '*) ;;\n      *) printf 'isolated fetch omitted --no-tags\\n' >&2; exit 59 ;;\n    esac\n    ;;\nesac\ncase \"$*\" in\n  *'config --local --replace-all branch.review-main-develop.cresca-scope'*)\n    \"$CRESCA_REAL_GIT\" \"$@\" || exit $?\n    printf 'late tagged review failure\\n' >&2\n    exit 60\n    ;;\nesac\nexec \"$CRESCA_REAL_GIT\" \"$@\"\n",
+    );
+
+    let output = run_cresca_with_git_wrapper(&repo, &wrapper, &["review", "main", "develop"]);
+
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("late tagged review failure"));
+    assert!(
+        !repo.ref_exists("refs/tags/remote-review-tag"),
+        "isolated fetch must not auto-follow a newly reachable remote tag"
+    );
+}
+
+#[test]
+fn test_fatal_remote_tracking_probe_is_rendered_without_mutation() {
+    let (repo, _) = setup_linear_range();
+    let before = repo.snapshot();
+    let wrapper = install_git_wrapper(
+        &repo,
+        "#!/bin/sh\nif [ \"$1\" = rev-parse ] && [ \"$2\" = --verify ] && [ \"$3\" = --quiet ]; then\n  printf 'fatal remote tracking probe\\n' >&2\n  exit 128\nfi\nexec \"$CRESCA_REAL_GIT\" \"$@\"\n",
+    );
+
+    let output = run_cresca_with_git_wrapper(&repo, &wrapper, &["review", "main", "develop"]);
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("verify if branch is already a remote tracking branch"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("exit status: 128"), "{stderr}");
+    assert!(stderr.contains("fatal remote tracking probe"), "{stderr}");
+    assert_eq!(repo.snapshot(), before);
+}
+
+#[test]
+fn test_fatal_upstream_probe_is_rendered_without_mutation() {
+    let (repo, _) = setup_linear_range();
+    repo.git(&["update-ref", "-d", "refs/remotes/origin/main"]);
+    repo.git(&["update-ref", "-d", "refs/remotes/origin/develop"]);
+    let before = repo.snapshot();
+    let wrapper = install_git_wrapper(
+        &repo,
+        "#!/bin/sh\nif [ \"$1\" = rev-parse ] && [ \"$2\" = --abbrev-ref ]; then\n  case \"$3\" in\n    *'@{upstream}') printf 'fatal upstream probe\\n' >&2; exit 128 ;;\n  esac\nfi\nif [ \"$1\" = for-each-ref ]; then\n  case \"$*\" in\n    *'%(upstream:short)'*) printf 'fatal upstream probe\\n' >&2; exit 128 ;;\n  esac\nfi\nexec \"$CRESCA_REAL_GIT\" \"$@\"\n",
+    );
+
+    let output = run_cresca_with_git_wrapper(&repo, &wrapper, &["review", "main", "develop"]);
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("get upstream branch"), "{stderr}");
+    assert!(stderr.contains("exit status: 128"), "{stderr}");
+    assert!(stderr.contains("fatal upstream probe"), "{stderr}");
+    assert_eq!(repo.snapshot(), before);
+}
+
+#[test]
+fn test_fatal_scope_object_probe_is_rendered_without_mutation() {
+    let repo = setup_identity_only_review_branch();
+    let scope = format!("1:{}", repo.rev_parse("HEAD"));
+    repo.git(&[
+        "config",
+        "--local",
+        "branch.review-main-develop.cresca-scope",
+        &scope,
+    ]);
+    let before = repo.snapshot();
+    let wrapper = install_git_wrapper(
+        &repo,
+        "#!/bin/sh\nif [ \"$1\" = rev-parse ] && [ \"$2\" = --verify ]; then\n  printf 'fatal scope object probe\\n' >&2\n  exit 128\nfi\nif [ \"$1\" = cat-file ]; then\n  case \"$2\" in\n    --batch-check*) printf 'fatal scope object probe\\n' >&2; exit 128 ;;\n  esac\nfi\nexec \"$CRESCA_REAL_GIT\" \"$@\"\n",
+    );
+
+    let output = run_cresca_with_git_wrapper(&repo, &wrapper, &["status"]);
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("validate review range endpoint"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("exit status: 128"), "{stderr}");
+    assert!(stderr.contains("fatal scope object probe"), "{stderr}");
+    assert_eq!(repo.snapshot(), before);
+}
+
+#[test]
+fn test_late_failure_restores_commit_editmsg_and_preserves_rerere_state() {
+    let (repo, range) = setup_linear_range();
+    repo.git(&["config", "rerere.enabled", "true"]);
+    let commit_editmsg = repo.git_path("COMMIT_EDITMSG");
+    let merge_rr = repo.git_path("MERGE_RR");
+    let rr_cache = repo.git_path("rr-cache");
+    std::fs::write(&commit_editmsg, b"original commit edit message\n")
+        .expect("COMMIT_EDITMSG fixture should be written");
+    std::fs::write(&merge_rr, b"original merge rr state\n")
+        .expect("MERGE_RR fixture should be written");
+    std::fs::create_dir_all(rr_cache.join("fixture"))
+        .expect("rerere fixture directory should be created");
+    std::fs::write(rr_cache.join("fixture/preimage"), b"original preimage\n")
+        .expect("rerere preimage should be written");
+    std::fs::write(rr_cache.join("fixture/postimage"), b"original postimage\n")
+        .expect("rerere postimage should be written");
+    let before_commit_editmsg = std::fs::read(&commit_editmsg).unwrap();
+    let before_merge_rr = std::fs::read(&merge_rr).unwrap();
+    let before_rr_cache = snapshot_tree(&rr_cache);
+    let wrapper = install_git_wrapper(
+        &repo,
+        "#!/bin/sh\ncase \" $* \" in\n  *' merge '*)\n    case \"$*\" in\n      '-c rerere.enabled=false merge '*) ;;\n      *) printf 'review merge inherited rerere\\n' >&2; exit 60 ;;\n    esac\n    ;;\nesac\ncase \"$*\" in\n  *'config --local --replace-all branch.review-main-develop.cresca-scope'*)\n    \"$CRESCA_REAL_GIT\" \"$@\" || exit $?\n    printf 'late rerere-state failure\\n' >&2\n    exit 61\n    ;;\nesac\nexec \"$CRESCA_REAL_GIT\" \"$@\"\n",
+    );
+
+    let output = run_cresca_with_git_wrapper(
+        &repo,
+        &wrapper,
+        &["review", "main", "develop", "--skip-to", &range.b[..8]],
+    );
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("late rerere-state failure"), "{stderr}");
+    assert_eq!(
+        std::fs::read(commit_editmsg).unwrap(),
+        before_commit_editmsg
+    );
+    assert_eq!(std::fs::read(merge_rr).unwrap(), before_merge_rr);
+    assert_eq!(snapshot_tree(&rr_cache), before_rr_cache);
+}
+
+#[test]
+fn test_unchanged_restrictive_ignored_entries_are_not_recreated_during_rollback() {
+    let (repo, _) = setup_linear_range();
+    add_ignored_paths(&repo, "restrictive/\n");
+    let directory = repo.path().join("restrictive");
+    std::fs::create_dir(&directory).expect("restrictive directory should be created");
+    repo.write_file("restrictive/readonly.txt", "unchanged readonly content\n");
+    std::os::unix::fs::symlink("readonly.txt", directory.join("readonly-link"))
+        .expect("restrictive symlink should be created");
+    std::fs::set_permissions(
+        directory.join("readonly.txt"),
+        std::fs::Permissions::from_mode(0o444),
+    )
+    .unwrap();
+    std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let _mode_guard = RestoreDirectoryMode {
+        path: directory.clone(),
+    };
+    let before = repo.snapshot();
+    let wrapper = install_git_wrapper(
+        &repo,
+        "#!/bin/sh\ncase \"$*\" in\n  *'config --local --replace-all branch.review-main-develop.cresca-scope'*)\n    \"$CRESCA_REAL_GIT\" \"$@\" || exit $?\n    printf 'late restrictive no-op failure\\n' >&2\n    exit 62\n    ;;\nesac\nexec \"$CRESCA_REAL_GIT\" \"$@\"\n",
+    );
+
+    let output = run_cresca_with_git_wrapper(&repo, &wrapper, &["review", "main", "develop"]);
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("late restrictive no-op failure"),
+        "{stderr}"
+    );
+    assert!(
+        !stderr.contains("Rollback or verification also failed"),
+        "{stderr}"
+    );
+    assert_eq!(repo.snapshot(), before);
+}
+
+#[test]
+fn test_changed_entry_beneath_restrictive_directory_is_restored() {
+    let (repo, _) = setup_linear_range();
+    add_ignored_paths(&repo, "restrictive/\n");
+    let directory = repo.path().join("restrictive");
+    std::fs::create_dir(&directory).expect("restrictive directory should be created");
+    repo.write_file("restrictive/readonly.txt", "original readonly content\n");
+    std::os::unix::fs::symlink("readonly.txt", directory.join("readonly-link"))
+        .expect("restrictive symlink should be created");
+    std::fs::set_permissions(
+        directory.join("readonly.txt"),
+        std::fs::Permissions::from_mode(0o444),
+    )
+    .unwrap();
+    std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let _mode_guard = RestoreDirectoryMode {
+        path: directory.clone(),
+    };
+    let before = repo.snapshot();
+    let wrapper = install_git_wrapper(
+        &repo,
+        "#!/bin/sh\ncase \"$*\" in\n  *'config --local --replace-all branch.review-main-develop.cresca-scope'*)\n    \"$CRESCA_REAL_GIT\" \"$@\" || exit $?\n    /bin/chmod 755 restrictive\n    /bin/chmod 644 restrictive/readonly.txt\n    printf 'changed content\\n' > restrictive/readonly.txt\n    /bin/rm -f restrictive/readonly-link\n    /bin/ln -s changed-target restrictive/readonly-link\n    /bin/chmod 555 restrictive\n    printf 'late restrictive mutation failure\\n' >&2\n    exit 63\n    ;;\nesac\nexec \"$CRESCA_REAL_GIT\" \"$@\"\n",
+    );
+
+    let output = run_cresca_with_git_wrapper(&repo, &wrapper, &["review", "main", "develop"]);
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("late restrictive mutation failure"),
+        "{stderr}"
+    );
+    assert_eq!(repo.snapshot(), before);
+}
+
+#[test]
+fn test_review_preserves_custom_tmpdir_for_git_helpers() {
+    let (repo, _) = setup_linear_range();
+    let custom_tmpdir = tempfile::TempDir::new().expect("custom TMPDIR should be created");
+    let wrapper = install_git_wrapper(
+        &repo,
+        "#!/bin/sh\nif [ \"$TMPDIR\" != \"$CRESCA_EXPECTED_TMPDIR\" ]; then\n  printf 'TMPDIR changed: %s\\n' \"$TMPDIR\" >&2\n  exit 64\nfi\nexec \"$CRESCA_REAL_GIT\" \"$@\"\n",
+    );
+
+    let output = std::process::Command::new(TempGitRepo::cresca_binary())
+        .args(["review", "main", "develop"])
+        .env("NO_COLOR", "1")
+        .env("PATH", wrapper.path())
+        .env("CRESCA_REAL_GIT", real_git_path())
+        .env("TMPDIR", custom_tmpdir.path())
+        .env("CRESCA_EXPECTED_TMPDIR", custom_tmpdir.path())
+        .current_dir(repo.path())
+        .output()
+        .expect("Failed to execute cresca");
+
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 #[test]
@@ -527,7 +895,11 @@ fn test_failed_rereview_restores_previous_review_and_status_remains_usable() {
 #[test]
 fn test_review_failure_cleans_transaction_scratch_directory() {
     let (repo, _) = setup_linear_range();
-    let scratch_parent = tempfile::TempDir::new().expect("scratch parent should be created");
+    let scratch_parent = repo
+        .git_path("config")
+        .parent()
+        .expect("Git config should have a private parent")
+        .to_path_buf();
     let wrapper = install_git_wrapper(
         &repo,
         "#!/bin/sh\nif [ \"$1\" = checkout ] && [ \"$2\" = -b ]; then\n  \"$CRESCA_REAL_GIT\" \"$@\" || exit $?\n  printf 'injected scratch cleanup failure\\n' >&2\n  exit 51\nfi\nexec \"$CRESCA_REAL_GIT\" \"$@\"\n",
@@ -538,13 +910,12 @@ fn test_review_failure_cleans_transaction_scratch_directory() {
         .env("NO_COLOR", "1")
         .env("PATH", wrapper.path())
         .env("CRESCA_REAL_GIT", real_git_path())
-        .env("TMPDIR", scratch_parent.path())
         .current_dir(repo.path())
         .output()
         .expect("Failed to execute cresca");
 
     assert!(!output.status.success());
-    let cresca_scratch: Vec<_> = std::fs::read_dir(scratch_parent.path())
+    let cresca_scratch: Vec<_> = std::fs::read_dir(&scratch_parent)
         .expect("scratch parent should remain readable")
         .map(|entry| entry.expect("scratch entry should be readable").file_name())
         .filter(|name| name.to_string_lossy().starts_with("cresca-review-"))
