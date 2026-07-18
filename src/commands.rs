@@ -1,10 +1,10 @@
 use crate::git::{
     resolve_remote_tracking_branch, run_git_command, select_review_branch, write_review_metadata,
-    write_review_scope, ReviewBranchSelection, ReviewMetadata, ReviewScope,
+    write_review_scope, ReviewBranchSelection, ReviewBranchSelectionError, ReviewMetadata,
+    ReviewScope,
 };
-use colored::Colorize;
+use crate::review::{ReviewError, ReviewTransaction};
 use std::ops::Not;
-use std::process::exit;
 
 /// Prepare the review branch using Squash Merge approach.
 ///
@@ -21,13 +21,14 @@ pub fn prepare_review_branch(
     skip_to: Option<&str>,
     stop_at: Option<&str>,
     verbose: bool,
-) {
+) -> Result<(), ReviewError> {
+    let mut transaction = ReviewTransaction::begin(verbose)?;
     let metadata = ReviewMetadata {
         target: to_branch.to_string(),
         source: from_branch.to_string(),
     };
-    let resolved_to = resolve_remote_tracking_branch(to_branch, verbose);
-    let resolved_from = resolve_remote_tracking_branch(from_branch, verbose);
+    let resolved_to = resolve_remote_tracking_branch(to_branch, verbose)?;
+    let resolved_from = resolve_remote_tracking_branch(from_branch, verbose)?;
 
     let tracking_to = resolved_to.tracking_ref;
     let tracking_from = resolved_from.tracking_ref;
@@ -38,7 +39,7 @@ pub fn prepare_review_branch(
         &["fetch", &resolved_to.remote, &resolved_to.remote_branch],
         false,
         verbose,
-    );
+    )?;
 
     // Fetch the source branch
     run_git_command(
@@ -46,7 +47,7 @@ pub fn prepare_review_branch(
         &["fetch", &resolved_from.remote, &resolved_from.remote_branch],
         false,
         verbose,
-    );
+    )?;
 
     // Get merge-base
     let merge_base_output = run_git_command(
@@ -54,7 +55,7 @@ pub fn prepare_review_branch(
         &["merge-base", &tracking_to, &tracking_from],
         false,
         verbose,
-    );
+    )?;
     let merge_base = String::from_utf8_lossy(&merge_base_output.stdout)
         .trim()
         .to_string();
@@ -65,7 +66,7 @@ pub fn prepare_review_branch(
         &["rev-list", &format!("{}..{}", merge_base, tracking_from)],
         false,
         verbose,
-    );
+    )?;
     let valid_list = String::from_utf8_lossy(&valid_commits.stdout);
     let valid_hashes: Vec<&str> = valid_list.lines().collect();
 
@@ -73,14 +74,10 @@ pub fn prepare_review_branch(
     if let Some(hash) = skip_to {
         let is_valid = valid_hashes.iter().any(|line| line.starts_with(hash));
         if !is_valid {
-            eprintln!(
-                "{}: Commit {} is not in the range {}..{}",
-                "error".red().bold(),
-                hash,
-                to_branch,
-                from_branch
-            );
-            exit(1);
+            return Err(ReviewError::Message(format!(
+                "Commit {} is not in the range {}..{}",
+                hash, to_branch, from_branch
+            )));
         }
     }
 
@@ -89,14 +86,10 @@ pub fn prepare_review_branch(
         // stop_at must be in the valid range
         let is_valid = valid_hashes.iter().any(|line| line.starts_with(hash));
         if !is_valid {
-            eprintln!(
-                "{}: Commit {} is not in the range {}..{}",
-                "error".red().bold(),
-                hash,
-                to_branch,
-                from_branch
-            );
-            exit(1);
+            return Err(ReviewError::Message(format!(
+                "Commit {} is not in the range {}..{}",
+                hash, to_branch, from_branch
+            )));
         }
 
         // If skip_to is also specified, stop_at must be at or after skip_to
@@ -106,7 +99,7 @@ pub fn prepare_review_branch(
                 &["rev-list", &format!("{}..{}", skip_hash, tracking_from)],
                 false,
                 verbose,
-            );
+            )?;
             let skip_to_list = String::from_utf8_lossy(&skip_to_commits.stdout);
             let is_after_skip = skip_to_list.lines().any(|line| line.starts_with(hash))
                 || valid_hashes
@@ -119,13 +112,10 @@ pub fn prepare_review_branch(
                 .any(|line| line.starts_with(hash) && line.starts_with(skip_hash));
 
             if !is_after_skip && !stop_at_equals_skip_to {
-                eprintln!(
-                    "{}: --stop-at ({}) must be at or after --skip-to ({})",
-                    "error".red().bold(),
-                    hash,
-                    skip_hash
-                );
-                exit(1);
+                return Err(ReviewError::Message(format!(
+                    "--stop-at ({}) must be at or after --skip-to ({})",
+                    hash, skip_hash
+                )));
             }
         }
     }
@@ -137,47 +127,55 @@ pub fn prepare_review_branch(
         &["rev-parse", "--verify", &scope_end_commit],
         false,
         verbose,
-    );
+    )?;
     let scope = ReviewScope {
         end_oid: String::from_utf8_lossy(&scope_end_output.stdout)
             .trim()
             .to_string(),
     };
 
-    let (review_branch, is_new) = match select_review_branch(&metadata, verbose) {
-        ReviewBranchSelection::Existing(name) => {
-            run_git_command(
-                "switch to review branch",
-                &["switch", &name],
-                false,
-                verbose,
-            );
-            (name, false)
-        }
-        ReviewBranchSelection::New(name) => {
-            run_git_command(
-                "create review branch from merge-base",
-                &["checkout", "-b", &name, &merge_base],
-                false,
-                verbose,
-            );
-            (name, true)
-        }
-    };
-
-    if let Some(hash) = skip_to {
-        // Auto-approve commits before skip_to by squash merging them
+    let auto_approve_parent = if let Some(hash) = skip_to {
         let parent = format!("{}^", hash);
-
-        // Check if there are commits before skip_to
         let has_earlier = run_git_command(
             "check earlier commits",
             &["rev-list", &format!("{}..{}", merge_base, parent)],
             true,
             verbose,
-        );
+        )?;
+        (!has_earlier.stdout.is_empty()).then_some(parent)
+    } else {
+        None
+    };
 
-        if !has_earlier.stdout.is_empty() {
+    let selection = select_review_branch(&metadata, verbose).map_err(|error| match error {
+        ReviewBranchSelectionError::Git(error) => ReviewError::Git(error),
+        ReviewBranchSelectionError::Conflict(message) => ReviewError::Message(message),
+    })?;
+
+    transaction.execute(|| {
+        let (review_branch, is_new) = match selection {
+            ReviewBranchSelection::Existing(name) => {
+                run_git_command(
+                    "switch to review branch",
+                    &["switch", &name],
+                    false,
+                    verbose,
+                )?;
+                (name, false)
+            }
+            ReviewBranchSelection::New(name) => {
+                run_git_command(
+                    "create review branch from merge-base",
+                    &["checkout", "-b", &name, &merge_base],
+                    false,
+                    verbose,
+                )?;
+                (name, true)
+            }
+        };
+
+        if let Some(parent) = auto_approve_parent {
+            // Auto-approve commits before skip_to by squash merging them
             run_git_command(
                 "auto-approve earlier commits",
                 &[
@@ -192,41 +190,42 @@ pub fn prepare_review_branch(
                 ],
                 false,
                 verbose,
-            );
+            )?;
             run_git_command(
                 "commit auto-approved changes",
                 &["commit", "--quiet", "-m", "Auto-approve earlier commits"],
                 false,
                 verbose,
-            );
+            )?;
         }
-    }
 
-    let target_commit = scope.end_oid.clone();
+        let target_commit = scope.end_oid.clone();
 
-    // Squash merge remaining changes
-    run_git_command(
-        "squash merge remaining changes",
-        &[
-            "merge",
-            "--squash",
-            "--ff",
-            "--quiet",
-            "--no-stat",
-            "-X",
-            "theirs",
-            &target_commit,
-        ],
-        false,
-        verbose,
-    );
+        // Squash merge remaining changes
+        run_git_command(
+            "squash merge remaining changes",
+            &[
+                "merge",
+                "--squash",
+                "--ff",
+                "--quiet",
+                "--no-stat",
+                "-X",
+                "theirs",
+                &target_commit,
+            ],
+            false,
+            verbose,
+        )?;
 
-    // Unstage changes for review
-    run_git_command("unstage changes for review", &["reset"], false, verbose);
-    if is_new {
-        write_review_metadata(&review_branch, &metadata, verbose);
-    }
-    write_review_scope(&review_branch, &scope, verbose);
+        // Unstage changes for review
+        run_git_command("unstage changes for review", &["reset"], false, verbose)?;
+        if is_new {
+            write_review_metadata(&review_branch, &metadata, verbose)?;
+        }
+        write_review_scope(&review_branch, &scope, verbose)?;
+        Ok(())
+    })
 }
 
 /// Commit reviewed changes and discard unreviewed ones
@@ -239,14 +238,14 @@ pub fn prepare_review_branch(
 ///
 /// * `Ok(())` - If there are staged changes
 /// * `Err(())` - If there are no staged changes
-pub fn approve_changes(verbose: bool) -> Result<(), ()> {
+pub fn approve_changes(verbose: bool) -> Result<bool, crate::git::GitCommandError> {
     // Check if there are staged changes
     let has_staged_changes = run_git_command(
         "check staged changes",
         &["diff", "--cached"],
         false,
         verbose,
-    )
+    )?
     .stdout
     .is_empty()
     .not();
@@ -257,7 +256,7 @@ pub fn approve_changes(verbose: bool) -> Result<(), ()> {
             &["commit", "--quiet", "-m", "Approve reviewed changes"],
             false,
             verbose,
-        );
+        )?;
     }
 
     run_git_command(
@@ -265,13 +264,10 @@ pub fn approve_changes(verbose: bool) -> Result<(), ()> {
         &["restore", "--source=HEAD", "--worktree", "--", "."],
         false,
         verbose,
-    );
-    run_git_command("discard untracked files", &["clean", "-fd"], false, verbose);
+    )?;
+    run_git_command("discard untracked files", &["clean", "-fd"], false, verbose)?;
 
-    match has_staged_changes {
-        true => Ok(()),
-        false => Err(()),
-    }
+    Ok(has_staged_changes)
 }
 
 /// Review status information
@@ -294,14 +290,18 @@ pub struct ReviewStatus {
 /// # Returns
 ///
 /// * `ReviewStatus` - The remaining diff statistics
-pub fn get_review_status(compare_ref: &str, display_label: &str, verbose: bool) -> ReviewStatus {
+pub fn get_review_status(
+    compare_ref: &str,
+    display_label: &str,
+    verbose: bool,
+) -> Result<ReviewStatus, crate::git::GitCommandError> {
     // Get diff stats summary (use HEAD..branch for direct comparison, not HEAD...branch)
     let stat_output = run_git_command(
         "get diff stats",
         &["diff", "--stat", "HEAD", compare_ref],
         false,
         verbose,
-    );
+    )?;
     let stat_str = String::from_utf8_lossy(&stat_output.stdout);
 
     // Parse stats from last line (e.g., " 4 files changed, 7 insertions(+), 2 deletions(-)")
@@ -334,18 +334,18 @@ pub fn get_review_status(compare_ref: &str, display_label: &str, verbose: bool) 
         &["diff", "--name-only", "HEAD", compare_ref],
         false,
         verbose,
-    );
+    )?;
     let files: Vec<String> = String::from_utf8_lossy(&files_output.stdout)
         .lines()
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string())
         .collect();
 
-    ReviewStatus {
+    Ok(ReviewStatus {
         display_label: display_label.to_string(),
         file_count,
         insertions,
         deletions,
         files,
-    }
+    })
 }

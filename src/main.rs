@@ -1,5 +1,6 @@
 mod commands;
 mod git;
+mod review;
 
 use clap::builder::styling::{AnsiColor, Effects};
 use clap::{builder::Styles, ArgAction, Args, Parser, Subcommand};
@@ -10,6 +11,24 @@ use git::{
     resolve_remote_tracking_branch, ReviewMetadata, ReviewMetadataError, ReviewScopeError,
 };
 use std::process::exit;
+
+#[derive(Debug)]
+enum CliError {
+    Git(git::GitCommandError),
+    Review(review::ReviewError),
+}
+
+impl From<git::GitCommandError> for CliError {
+    fn from(error: git::GitCommandError) -> Self {
+        Self::Git(error)
+    }
+}
+
+impl From<review::ReviewError> for CliError {
+    fn from(error: review::ReviewError) -> Self {
+        Self::Review(error)
+    }
+}
 
 const STYLES: Styles = Styles::styled()
     .header(AnsiColor::Green.on_default().effects(Effects::BOLD))
@@ -73,21 +92,30 @@ struct ReviewArgs {
 }
 
 fn main() {
+    if let Err(error) = run() {
+        render_error(&error);
+        exit(1);
+    }
+}
+
+fn run() -> Result<(), CliError> {
     let cli = Cli::parse();
 
     match &cli.command {
         Commands::Approve => {
-            if let Err(error) = current_review_metadata(cli.verbose) {
-                exit_invalid_review_branch(error);
+            match current_review_metadata(cli.verbose) {
+                Ok(_) => {}
+                Err(ReviewMetadataError::Git(error)) => return Err(error.into()),
+                Err(error) => exit_invalid_review_branch(error),
             }
             let res = approve_changes(cli.verbose);
-            match res {
-                Err(_) => println!("There are no reviewed changes to approve. Ending the review."),
-                Ok(_) => println!("Reviewed changes were approved successfully."),
+            match res? {
+                false => println!("There are no reviewed changes to approve. Ending the review."),
+                true => println!("Reviewed changes were approved successfully."),
             };
         }
         Commands::Review(args) => {
-            if !is_clean(cli.verbose) {
+            if !is_clean(cli.verbose)? {
                 eprintln!("{}: Uncommitted changes found. Please commit or stash them before starting review.", "error".red().bold());
                 exit(1);
             }
@@ -98,34 +126,40 @@ fn main() {
                 args.skip_to.as_deref(),
                 args.stop_at.as_deref(),
                 cli.verbose,
-            );
-            if is_clean(cli.verbose) {
+            )?;
+            if is_clean(cli.verbose)? {
                 println!("Review branch prepared successfully. However, it seems like there are no unreviewed changes.");
             } else {
                 println!("Review branch prepared successfully. Stage the changes you have reviewed and run `{}` to approve them.", "cresca approve".green());
             }
         }
         Commands::Status(args) => {
-            let metadata = current_review_metadata(cli.verbose)
-                .unwrap_or_else(|error| exit_invalid_review_branch(error));
+            let metadata = match current_review_metadata(cli.verbose) {
+                Ok(metadata) => metadata,
+                Err(ReviewMetadataError::Git(error)) => return Err(error.into()),
+                Err(error) => exit_invalid_review_branch(error),
+            };
             let (heading, compare_ref, display_label) = if args.all {
-                let resolved = resolve_remote_tracking_branch(&metadata.source, cli.verbose);
+                let resolved = resolve_remote_tracking_branch(&metadata.source, cli.verbose)?;
                 (
                     "full pull request",
                     resolved.tracking_ref,
                     format!("to {}", metadata.source),
                 )
             } else {
-                let branch = current_branch_name(cli.verbose);
-                let scope = read_review_scope(&branch, cli.verbose)
-                    .unwrap_or_else(|error| exit_invalid_review_scope(error, &metadata));
+                let branch = current_branch_name(cli.verbose)?;
+                let scope = match read_review_scope(&branch, cli.verbose) {
+                    Ok(scope) => scope,
+                    Err(ReviewScopeError::Git(error)) => return Err(error.into()),
+                    Err(error) => exit_invalid_review_scope(error, &metadata),
+                };
                 (
                     "current range",
                     scope.end_oid,
                     "in current review range".to_string(),
                 )
             };
-            let status = get_review_status(&compare_ref, &display_label, cli.verbose);
+            let status = get_review_status(&compare_ref, &display_label, cli.verbose)?;
             println!("📋 Review status ({}):", heading);
             println!(
                 "  Remaining diff {}: {} file(s), {} insertion(s), {} deletion(s)",
@@ -149,6 +183,44 @@ fn main() {
             }
         }
     }
+    Ok(())
+}
+
+fn render_error(error: &CliError) {
+    match error {
+        CliError::Git(error) => render_git_error(error),
+        CliError::Review(error) => render_review_error(error),
+    }
+}
+
+fn render_review_error(error: &review::ReviewError) {
+    match error {
+        review::ReviewError::Git(error) => render_git_error(error),
+        review::ReviewError::Message(message) => {
+            eprintln!("{}: {message}", "error".red().bold());
+        }
+        review::ReviewError::Rollback {
+            original,
+            diagnostics,
+        } => {
+            render_review_error(original);
+            eprintln!("Rollback or verification also failed:");
+            eprintln!("{diagnostics}");
+        }
+    }
+}
+
+fn render_git_error(error: &git::GitCommandError) {
+    eprintln!("{}: Failed to {}.", "error".red().bold(), error.description);
+    eprintln!("Git arguments: {}", error.args.join(" "));
+    match error.status {
+        Some(status) => eprintln!("Git exit status: {status}"),
+        None => eprintln!("Git exit status: unavailable"),
+    }
+    eprintln!("Git stdout:");
+    eprintln!("{}", String::from_utf8_lossy(&error.stdout));
+    eprintln!("Git stderr:");
+    eprintln!("{}", String::from_utf8_lossy(&error.stderr));
 }
 
 fn exit_invalid_review_scope(error: ReviewScopeError, metadata: &ReviewMetadata) -> ! {
@@ -161,6 +233,10 @@ fn exit_invalid_review_scope(error: ReviewScopeError, metadata: &ReviewMetadata)
         ReviewScopeError::Invalid => "range metadata is invalid".to_string(),
         ReviewScopeError::UnavailableCommit(oid) => {
             format!("saved range endpoint '{oid}' is unavailable")
+        }
+        ReviewScopeError::Git(error) => {
+            render_git_error(&error);
+            exit(1);
         }
     };
     eprintln!(

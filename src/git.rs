@@ -1,5 +1,14 @@
 use colored::Colorize;
-use std::process::{exit, Command, Output};
+use std::process::{Command, ExitStatus, Output};
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct GitCommandError {
+    pub description: String,
+    pub args: Vec<String>,
+    pub status: Option<ExitStatus>,
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
+}
 
 pub const REVIEW_METADATA_VERSION: &str = "1";
 pub const REVIEW_SCOPE_VERSION: &str = "1";
@@ -21,6 +30,7 @@ pub enum ReviewMetadataError {
     Missing,
     UnsupportedVersion(String),
     Invalid,
+    Git(GitCommandError),
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -30,12 +40,19 @@ pub enum ReviewScopeError {
     UnsupportedVersion(String),
     Invalid,
     UnavailableCommit(String),
+    Git(GitCommandError),
 }
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum ReviewBranchSelection {
     New(String),
     Existing(String),
+}
+
+#[derive(Debug)]
+pub enum ReviewBranchSelectionError {
+    Git(GitCommandError),
+    Conflict(String),
 }
 
 fn readable_review_branch(metadata: &ReviewMetadata) -> String {
@@ -63,8 +80,8 @@ fn suffixed_review_branch(base: &str, metadata: &ReviewMetadata) -> String {
     format!("{base}-{:016x}", review_identity_hash(metadata))
 }
 
-fn local_branch_exists(branch: &str, verbose: bool) -> bool {
-    run_git_command(
+fn local_branch_exists(branch: &str, verbose: bool) -> Result<bool, GitCommandError> {
+    Ok(run_git_command(
         "check existence of review branch",
         &[
             "show-ref",
@@ -74,77 +91,103 @@ fn local_branch_exists(branch: &str, verbose: bool) -> bool {
         ],
         true,
         verbose,
-    )
+    )?
     .status
-    .success()
+    .success())
 }
 
-pub fn select_review_branch(metadata: &ReviewMetadata, verbose: bool) -> ReviewBranchSelection {
+pub fn select_review_branch(
+    metadata: &ReviewMetadata,
+    verbose: bool,
+) -> Result<ReviewBranchSelection, ReviewBranchSelectionError> {
     let base = readable_review_branch(metadata);
-    let base_exists = local_branch_exists(&base, verbose);
+    let base_exists =
+        local_branch_exists(&base, verbose).map_err(ReviewBranchSelectionError::Git)?;
     match (base_exists, read_review_metadata(&base, verbose)) {
-        (false, Err(ReviewMetadataError::Missing)) => return ReviewBranchSelection::New(base),
+        (false, Err(ReviewMetadataError::Missing)) => return Ok(ReviewBranchSelection::New(base)),
         (true, Ok(existing)) if existing == *metadata => {
-            return ReviewBranchSelection::Existing(base)
+            return Ok(ReviewBranchSelection::Existing(base))
+        }
+        (_, Err(ReviewMetadataError::Git(error))) => {
+            return Err(ReviewBranchSelectionError::Git(error))
         }
         _ => {}
     }
 
     let suffix = suffixed_review_branch(&base, metadata);
-    let suffix_exists = local_branch_exists(&suffix, verbose);
+    let suffix_exists =
+        local_branch_exists(&suffix, verbose).map_err(ReviewBranchSelectionError::Git)?;
     match (suffix_exists, read_review_metadata(&suffix, verbose)) {
-        (false, Err(ReviewMetadataError::Missing)) => return ReviewBranchSelection::New(suffix),
+        (false, Err(ReviewMetadataError::Missing)) => {
+            return Ok(ReviewBranchSelection::New(suffix))
+        }
         (true, Ok(existing)) if existing == *metadata => {
-            return ReviewBranchSelection::Existing(suffix)
+            return Ok(ReviewBranchSelection::Existing(suffix))
+        }
+        (_, Err(ReviewMetadataError::Git(error))) => {
+            return Err(ReviewBranchSelectionError::Git(error))
         }
         _ => {}
     }
 
-    eprintln!(
-        "{}: Found conflicting review branches `{}` and `{}` with missing, invalid, or different metadata. Inspect and delete or rename the conflicting local review branch before retrying.",
-        "error".red().bold(),
+    Err(ReviewBranchSelectionError::Conflict(format!(
+        "Found conflicting review branches `{}` and `{}` with missing, invalid, or different metadata. Inspect and delete or rename the conflicting local review branch before retrying.",
         base,
         suffix
-    );
-    exit(1);
+    )))
 }
 
 fn review_config_key(branch: &str, field: &str) -> String {
     format!("branch.{branch}.cresca-{field}")
 }
 
-fn review_config_values(branch: &str, field: &str, verbose: bool) -> Vec<String> {
+fn review_config_values(
+    branch: &str,
+    field: &str,
+    verbose: bool,
+) -> Result<Vec<String>, GitCommandError> {
     let key = review_config_key(branch, field);
     let output = run_git_command(
         "read review metadata",
         &["config", "--local", "--get-all", &key],
         true,
         verbose,
-    );
+    )?;
     if output.status.success() {
-        return String::from_utf8_lossy(&output.stdout)
+        return Ok(String::from_utf8_lossy(&output.stdout)
             .lines()
             .map(str::to_owned)
-            .collect();
+            .collect());
     }
 
     if output.status.code() == Some(1) && output.stderr.is_empty() {
-        return Vec::new();
+        return Ok(Vec::new());
     }
 
-    eprintln!("{}: Failed to read review metadata.", "error".red().bold());
-    eprintln!("Original error from git:");
-    eprintln!("\t{}", String::from_utf8_lossy(&output.stderr));
-    exit(1);
+    Err(GitCommandError {
+        description: "read review metadata".to_string(),
+        args: vec![
+            "config".to_string(),
+            "--local".to_string(),
+            "--get-all".to_string(),
+            key,
+        ],
+        status: Some(output.status),
+        stdout: output.stdout,
+        stderr: output.stderr,
+    })
 }
 
 pub fn read_review_metadata(
     branch: &str,
     verbose: bool,
 ) -> Result<ReviewMetadata, ReviewMetadataError> {
-    let versions = review_config_values(branch, "version", verbose);
-    let targets = review_config_values(branch, "target", verbose);
-    let sources = review_config_values(branch, "source", verbose);
+    let versions =
+        review_config_values(branch, "version", verbose).map_err(ReviewMetadataError::Git)?;
+    let targets =
+        review_config_values(branch, "target", verbose).map_err(ReviewMetadataError::Git)?;
+    let sources =
+        review_config_values(branch, "source", verbose).map_err(ReviewMetadataError::Git)?;
 
     match (versions.as_slice(), targets.as_slice(), sources.as_slice()) {
         ([version], [target], [source])
@@ -163,19 +206,23 @@ pub fn read_review_metadata(
     }
 }
 
-pub fn write_review_metadata(branch: &str, metadata: &ReviewMetadata, verbose: bool) {
+pub fn write_review_metadata(
+    branch: &str,
+    metadata: &ReviewMetadata,
+    verbose: bool,
+) -> Result<(), GitCommandError> {
     let version_key = review_config_key(branch, "version");
     let target_key = review_config_key(branch, "target");
     let source_key = review_config_key(branch, "source");
 
-    let existing_versions = review_config_values(branch, "version", verbose);
+    let existing_versions = review_config_values(branch, "version", verbose)?;
     if !existing_versions.is_empty() {
         run_git_command(
             "clear review metadata version marker",
             &["config", "--local", "--unset-all", &version_key],
             false,
             verbose,
-        );
+        )?;
     }
     run_git_command(
         "record review target",
@@ -188,7 +235,7 @@ pub fn write_review_metadata(branch: &str, metadata: &ReviewMetadata, verbose: b
         ],
         false,
         verbose,
-    );
+    )?;
     run_git_command(
         "record review source",
         &[
@@ -200,7 +247,7 @@ pub fn write_review_metadata(branch: &str, metadata: &ReviewMetadata, verbose: b
         ],
         false,
         verbose,
-    );
+    )?;
     run_git_command(
         "commit review metadata",
         &[
@@ -212,10 +259,15 @@ pub fn write_review_metadata(branch: &str, metadata: &ReviewMetadata, verbose: b
         ],
         false,
         verbose,
-    );
+    )?;
+    Ok(())
 }
 
-pub fn write_review_scope(branch: &str, scope: &ReviewScope, verbose: bool) {
+pub fn write_review_scope(
+    branch: &str,
+    scope: &ReviewScope,
+    verbose: bool,
+) -> Result<(), GitCommandError> {
     let key = review_config_key(branch, "scope");
     let value = format!("{}:{}", REVIEW_SCOPE_VERSION, scope.end_oid);
     run_git_command(
@@ -223,11 +275,12 @@ pub fn write_review_scope(branch: &str, scope: &ReviewScope, verbose: bool) {
         &["config", "--local", "--replace-all", &key, &value],
         false,
         verbose,
-    );
+    )?;
+    Ok(())
 }
 
 pub fn read_review_scope(branch: &str, verbose: bool) -> Result<ReviewScope, ReviewScopeError> {
-    let values = review_config_values(branch, "scope", verbose);
+    let values = review_config_values(branch, "scope", verbose).map_err(ReviewScopeError::Git)?;
     let value = match values.as_slice() {
         [] => return Err(ReviewScopeError::Missing),
         [value] => value,
@@ -251,7 +304,8 @@ pub fn read_review_scope(branch: &str, verbose: bool) -> Result<ReviewScope, Rev
         &["rev-parse", "--verify", &revision],
         true,
         verbose,
-    );
+    )
+    .map_err(ReviewScopeError::Git)?;
     if !output.status.success() {
         return Err(ReviewScopeError::UnavailableCommit(end_oid.to_string()));
     }
@@ -281,7 +335,7 @@ pub fn run_git_command(
     args: &[&str],
     maybe_error: bool,
     verbose: bool,
-) -> Output {
+) -> Result<Output, GitCommandError> {
     if verbose {
         println!("[git {}]", args.join(" ").yellow());
     }
@@ -292,18 +346,23 @@ pub fn run_git_command(
                 println!("{}", String::from_utf8_lossy(&output.stdout));
             }
             if !output.status.success() && !maybe_error {
-                eprintln!("{}: Failed to {}.", "error".red().bold(), description);
-                eprintln!("Original error from git:");
-                eprintln!("\t{}", String::from_utf8_lossy(&output.stderr));
-                exit(1);
+                return Err(GitCommandError {
+                    description: description.to_string(),
+                    args: args.iter().map(|arg| (*arg).to_string()).collect(),
+                    status: Some(output.status),
+                    stdout: output.stdout,
+                    stderr: output.stderr,
+                });
             }
-            output
+            Ok(output)
         }
-        Err(e) => {
-            eprintln!("{}: Failed to {}.", "error".red().bold(), description);
-            eprintln!("{}", e);
-            exit(1);
-        }
+        Err(e) => Err(GitCommandError {
+            description: description.to_string(),
+            args: args.iter().map(|arg| (*arg).to_string()).collect(),
+            status: None,
+            stdout: Vec::new(),
+            stderr: e.to_string().into_bytes(),
+        }),
     }
 }
 
@@ -312,29 +371,29 @@ pub fn run_git_command(
 /// # Arguments
 ///
 /// * `verbose` - Whether to print the git command and its output.
-pub fn is_clean(verbose: bool) -> bool {
-    run_git_command(
+pub fn is_clean(verbose: bool) -> Result<bool, GitCommandError> {
+    Ok(run_git_command(
         "check working directory status",
         &["status", "--porcelain"],
         false,
         verbose,
-    )
+    )?
     .stdout
-    .is_empty()
+    .is_empty())
 }
 
-pub fn current_branch_name(verbose: bool) -> String {
+pub fn current_branch_name(verbose: bool) -> Result<String, GitCommandError> {
     let output = run_git_command(
         "get current branch",
         &["rev-parse", "--abbrev-ref", "HEAD"],
         false,
         verbose,
-    );
-    String::from_utf8_lossy(&output.stdout).trim().to_string()
+    )?;
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
 pub fn current_review_metadata(verbose: bool) -> Result<ReviewMetadata, ReviewMetadataError> {
-    let branch = current_branch_name(verbose);
+    let branch = current_branch_name(verbose).map_err(ReviewMetadataError::Git)?;
     if !branch.starts_with("review-") {
         return Err(ReviewMetadataError::InvalidBranchName);
     }
@@ -357,7 +416,10 @@ pub struct ResolvedBranch {
 /// 1. If it's already a valid remote tracking branch (e.g., origin/main).
 /// 2. If it's a local branch with an upstream configured (e.g., @{upstream}).
 /// 3. Fallback: assumes it's on 'origin' if it exists there.
-pub fn resolve_remote_tracking_branch(branch_or_ref: &str, verbose: bool) -> ResolvedBranch {
+pub fn resolve_remote_tracking_branch(
+    branch_or_ref: &str,
+    verbose: bool,
+) -> Result<ResolvedBranch, GitCommandError> {
     // 1. Check if it's already a valid remote-tracking branch
     let verify_output = run_git_command(
         "verify if branch is already a remote tracking branch",
@@ -369,12 +431,12 @@ pub fn resolve_remote_tracking_branch(branch_or_ref: &str, verbose: bool) -> Res
         ],
         true,
         verbose,
-    );
+    )?;
 
     if verify_output.status.success() {
         // It's a remote tracking branch. We need to split it into remote and branch.
         // Assuming format is <remote>/<branch_name>. We can get remotes to find the remote name.
-        let remotes_output = run_git_command("get remotes", &["remote"], false, verbose);
+        let remotes_output = run_git_command("get remotes", &["remote"], false, verbose)?;
         let remotes_str = String::from_utf8_lossy(&remotes_output.stdout);
         let mut best_remote = String::new();
         for remote in remotes_str.lines() {
@@ -391,11 +453,11 @@ pub fn resolve_remote_tracking_branch(branch_or_ref: &str, verbose: bool) -> Res
                 .strip_prefix(&format!("{}/", best_remote))
                 .unwrap()
                 .to_string();
-            return ResolvedBranch {
+            return Ok(ResolvedBranch {
                 remote: best_remote,
                 remote_branch,
                 tracking_ref: branch_or_ref.to_string(),
-            };
+            });
         }
     }
 
@@ -409,7 +471,7 @@ pub fn resolve_remote_tracking_branch(branch_or_ref: &str, verbose: bool) -> Res
         ],
         true,
         verbose,
-    );
+    )?;
 
     if upstream_output.status.success() {
         let tracking_ref = String::from_utf8_lossy(&upstream_output.stdout)
@@ -422,7 +484,7 @@ pub fn resolve_remote_tracking_branch(branch_or_ref: &str, verbose: bool) -> Res
             &["config", &format!("branch.{}.remote", branch_or_ref)],
             true,
             verbose,
-        );
+        )?;
 
         let remote = if remote_output.status.success() {
             String::from_utf8_lossy(&remote_output.stdout)
@@ -441,11 +503,11 @@ pub fn resolve_remote_tracking_branch(branch_or_ref: &str, verbose: bool) -> Res
             branch_or_ref.to_string() // fallback
         };
 
-        return ResolvedBranch {
+        return Ok(ResolvedBranch {
             remote,
             remote_branch,
             tracking_ref,
-        };
+        });
     }
 
     // 3. Fallback: check if the branch exists on any remote (default to 'origin' if it's there)
@@ -460,23 +522,23 @@ pub fn resolve_remote_tracking_branch(branch_or_ref: &str, verbose: bool) -> Res
         ],
         true,
         verbose,
-    );
+    )?;
 
     if ls_remote_output.status.success() {
-        return ResolvedBranch {
+        return Ok(ResolvedBranch {
             remote: "origin".to_string(),
             remote_branch: branch_or_ref.to_string(),
             tracking_ref: format!("origin/{}", branch_or_ref),
-        };
+        });
     }
 
     // If we reach here, we can't reliably resolve it. Default to origin/branch and let git fail natively later
     // if it's really invalid.
-    ResolvedBranch {
+    Ok(ResolvedBranch {
         remote: "origin".to_string(),
         remote_branch: branch_or_ref.to_string(),
         tracking_ref: format!("origin/{}", branch_or_ref),
-    }
+    })
 }
 
 #[cfg(test)]
