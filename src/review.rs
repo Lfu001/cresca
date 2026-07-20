@@ -247,18 +247,32 @@ fn ambiguous_exact_rename_paths(
     verbose: bool,
     env: Option<&[(&str, &OsStr)]>,
 ) -> Result<Vec<String>, ReviewError> {
+    let correspondence_key = |entry: &(String, String)| {
+        let compatible_type = if entry.0 == "100644" || entry.0 == "100755" {
+            "regular".to_string()
+        } else {
+            entry.0.clone()
+        };
+        (compatible_type, entry.1.clone())
+    };
     let base = tree_entries(old_base, verbose, env)?;
     let review = tree_entries(old_review, verbose, env)?;
     let mut removed: BTreeMap<(String, String), Vec<&[u8]>> = BTreeMap::new();
     let mut added: BTreeMap<(String, String), Vec<&[u8]>> = BTreeMap::new();
     for (path, entry) in &base {
         if !review.contains_key(path) {
-            removed.entry(entry.clone()).or_default().push(path);
+            removed
+                .entry(correspondence_key(entry))
+                .or_default()
+                .push(path);
         }
     }
     for (path, entry) in &review {
         if !base.contains_key(path) {
-            added.entry(entry.clone()).or_default().push(path);
+            added
+                .entry(correspondence_key(entry))
+                .or_default()
+                .push(path);
         }
     }
 

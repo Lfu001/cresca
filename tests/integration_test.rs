@@ -2286,6 +2286,82 @@ fn test_rereview_does_not_transfer_approval_through_ambiguous_identical_rename()
     );
 }
 
+#[test]
+fn test_rereview_downgrades_ambiguous_identical_rename_across_executable_mode() {
+    let repo = TempGitRepo::new();
+    repo.write_file("left-mode.txt", "identical mixed-mode content\n");
+    repo.write_file("right-mode.txt", "identical mixed-mode content\n");
+    repo.git(&["add", "."]);
+    repo.commit("Add mixed-mode rename candidates");
+    repo.git(&["push", "origin", "main"]);
+    repo.create_branch("develop");
+    repo.git(&["rm", "left-mode.txt", "right-mode.txt"]);
+    repo.write_file("renamed-executable.txt", "identical mixed-mode content\n");
+    let mut permissions = std::fs::metadata(repo.path().join("renamed-executable.txt"))
+        .expect("mixed-mode destination should exist")
+        .permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(repo.path().join("renamed-executable.txt"), permissions)
+        .expect("mixed-mode destination should become executable");
+    repo.write_file("unrelated-approved.txt", "unrelated approved content\n");
+    repo.git(&["add", "."]);
+    repo.commit("Approve ambiguous executable rename");
+    repo.git(&["push", "-u", "origin", "develop"]);
+    repo.switch_branch("main");
+    assert!(repo
+        .run_cresca(&["review", "main", "develop"])
+        .status
+        .success());
+    repo.git(&["add", "-A"]);
+    assert!(repo.run_cresca(&["approve"]).status.success());
+
+    repo.switch_branch("main");
+    repo.write_file("left-mode.txt", "new target left mode content\n");
+    repo.write_file("right-mode.txt", "new target right mode content\n");
+    repo.git(&["add", "."]);
+    repo.commit("Change mixed-mode target candidates");
+    repo.git(&["push", "origin", "main"]);
+    repo.git(&["checkout", "-B", "develop", "main"]);
+    repo.git(&["rm", "left-mode.txt", "right-mode.txt"]);
+    repo.write_file("renamed-executable.txt", "identical mixed-mode content\n");
+    let mut permissions = std::fs::metadata(repo.path().join("renamed-executable.txt"))
+        .expect("rebased mixed-mode destination should exist")
+        .permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(repo.path().join("renamed-executable.txt"), permissions)
+        .expect("rebased mixed-mode destination should become executable");
+    repo.write_file("unrelated-approved.txt", "unrelated approved content\n");
+    repo.git(&["add", "."]);
+    repo.commit("Reapply executable rename after base movement");
+    let endpoint = repo.rev_parse("HEAD");
+    repo.git(&["push", "--force", "origin", "develop"]);
+    repo.switch_branch("review-main-develop");
+
+    let output = repo.run_cresca(&["review", "main", "develop"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        repo.git_stdout(&["show", "HEAD:left-mode.txt"]),
+        "new target left mode content"
+    );
+    assert_eq!(
+        repo.git_stdout(&["show", "HEAD:right-mode.txt"]),
+        "new target right mode content"
+    );
+    assert!(!repo
+        .git_maybe(&["cat-file", "-e", "HEAD:renamed-executable.txt"])
+        .status
+        .success());
+    assert_eq!(
+        repo.git_stdout(&["show", "HEAD:unrelated-approved.txt"]),
+        "unrelated approved content"
+    );
+    assert_eq!(repo.worktree_diff(), repo.diff("HEAD", &endpoint));
+}
+
 /// Test that `cresca review --skip-to` auto-approves earlier commits.
 #[test]
 fn test_review_with_skip_to_option() {
