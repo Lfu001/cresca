@@ -61,10 +61,10 @@ pub fn unique_merge_base(left: &str, right: &str, verbose: bool) -> Result<Strin
 
 pub fn explicit_review_base(
     review_head: &str,
-    current_base: &str,
+    current_target: &str,
     verbose: bool,
 ) -> Result<Option<String>, ReviewError> {
-    let excluded_base = format!("^{current_base}");
+    let excluded_target = format!("^{current_target}");
     let output = run_git_command(
         "find explicit review base",
         &[
@@ -72,7 +72,7 @@ pub fn explicit_review_base(
             "--first-parent",
             "--format=%B%x00",
             review_head,
-            &excluded_base,
+            &excluded_target,
         ],
         &[],
         verbose,
@@ -173,7 +173,7 @@ fn tree_entry(
 ) -> Result<Option<(String, String)>, ReviewError> {
     let output = reconstruction_git(
         "inspect reconstruction tree entry",
-        &["ls-tree", "-z", revision, "--", path],
+        &["--literal-pathspecs", "ls-tree", "-z", revision, "--", path],
         &[],
         verbose,
         env,
@@ -410,7 +410,10 @@ pub fn reconstruct_approval_tree_with_env(
         ));
     }
 
-    let mut downgraded = ambiguous_exact_rename_paths(old_base, old_review, verbose, env)?;
+    let mut downgraded = ambiguous_exact_rename_paths(old_base, new_base, verbose, env)?;
+    downgraded.extend(ambiguous_exact_rename_paths(
+        old_base, old_review, verbose, env,
+    )?);
     for path in &conflict_paths {
         if merged.status.code() == Some(1)
             || !text_conflict_can_keep_hunks(old_base, new_base, old_review, path, verbose, env)?
@@ -444,7 +447,7 @@ pub fn reconstruct_approval_tree_with_env(
     for path in &downgraded {
         run_git_command_with_env(
             "downgrade conflicted path to new base",
-            &["reset", new_base, "--", path],
+            &["--literal-pathspecs", "reset", new_base, "--", path],
             &scratch_env,
             &[],
             verbose,

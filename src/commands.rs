@@ -499,7 +499,7 @@ pub fn get_full_review_status(
     let source_oid = resolve("resolve current review source", &source.tracking_ref)?;
     let review_head = resolve("resolve current review head", "HEAD")?;
     let new_base = unique_merge_base(&target_oid, &source_oid, verbose)?;
-    let old_base = match explicit_review_base(&review_head, &new_base, verbose)? {
+    let old_base = match explicit_review_base(&review_head, &target_oid, verbose)? {
         Some(base) => base,
         None => unique_merge_base(&review_head, &source_oid, verbose)?,
     };
