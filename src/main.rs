@@ -222,7 +222,7 @@ fn exit_invalid_review_scope(error: ReviewScopeError, metadata: &ReviewMetadata)
         }
         ReviewScopeError::Invalid => "range metadata is invalid".to_string(),
         ReviewScopeError::UnavailableCommit(oid) => {
-            format!("saved range endpoint '{oid}' is unavailable")
+            format!("saved review object '{oid}' is unavailable")
         }
         ReviewScopeError::Git(error) => {
             render_git_error(&error);

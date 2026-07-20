@@ -61,11 +61,19 @@ pub fn unique_merge_base(left: &str, right: &str, verbose: bool) -> Result<Strin
 
 pub fn explicit_review_base(
     review_head: &str,
+    current_base: &str,
     verbose: bool,
 ) -> Result<Option<String>, ReviewError> {
+    let excluded_base = format!("^{current_base}");
     let output = run_git_command(
         "find explicit review base",
-        &["log", "--first-parent", "--format=%B%x00", review_head],
+        &[
+            "log",
+            "--first-parent",
+            "--format=%B%x00",
+            review_head,
+            &excluded_base,
+        ],
         &[],
         verbose,
     )?;
@@ -193,6 +201,91 @@ fn tree_entry(
     Ok(Some((mode, oid)))
 }
 
+fn tree_entries(
+    revision: &str,
+    verbose: bool,
+    env: Option<&[(&str, &OsStr)]>,
+) -> Result<BTreeMap<Vec<u8>, (String, String)>, ReviewError> {
+    let output = reconstruction_git(
+        "inspect reconstruction tree",
+        &["ls-tree", "-rz", revision],
+        &[],
+        verbose,
+        env,
+    )?;
+    let mut entries = BTreeMap::new();
+    for record in output.stdout.split(|byte| *byte == 0) {
+        if record.is_empty() {
+            continue;
+        }
+        let Some(tab) = record.iter().position(|byte| *byte == b'\t') else {
+            return Err(ReviewError::Message(
+                "Git returned an invalid recursive tree entry.".to_string(),
+            ));
+        };
+        let header = std::str::from_utf8(&record[..tab]).map_err(|_| {
+            ReviewError::Message("Git returned a non-UTF-8 tree entry header.".to_string())
+        })?;
+        let mut fields = header.split_whitespace();
+        let mode = fields.next().unwrap_or_default();
+        let kind = fields.next().unwrap_or_default();
+        let oid = fields.next().unwrap_or_default();
+        if kind != "blob" || mode.is_empty() || oid.is_empty() {
+            continue;
+        }
+        entries.insert(
+            record[tab + 1..].to_vec(),
+            (mode.to_string(), oid.to_string()),
+        );
+    }
+    Ok(entries)
+}
+
+fn ambiguous_exact_rename_paths(
+    old_base: &str,
+    old_review: &str,
+    verbose: bool,
+    env: Option<&[(&str, &OsStr)]>,
+) -> Result<Vec<String>, ReviewError> {
+    let base = tree_entries(old_base, verbose, env)?;
+    let review = tree_entries(old_review, verbose, env)?;
+    let mut removed: BTreeMap<(String, String), Vec<&[u8]>> = BTreeMap::new();
+    let mut added: BTreeMap<(String, String), Vec<&[u8]>> = BTreeMap::new();
+    for (path, entry) in &base {
+        if !review.contains_key(path) {
+            removed.entry(entry.clone()).or_default().push(path);
+        }
+    }
+    for (path, entry) in &review {
+        if !base.contains_key(path) {
+            added.entry(entry.clone()).or_default().push(path);
+        }
+    }
+
+    let mut ambiguous = BTreeSet::new();
+    for (entry, removed_paths) in removed {
+        let Some(added_paths) = added.get(&entry) else {
+            continue;
+        };
+        if removed_paths.len() * added_paths.len() <= 1 {
+            continue;
+        }
+        ambiguous.extend(removed_paths);
+        ambiguous.extend(added_paths.iter().copied());
+    }
+    ambiguous
+        .into_iter()
+        .map(|path| {
+            std::str::from_utf8(path).map(str::to_string).map_err(|_| {
+                ReviewError::Message(
+                    "Git found ambiguous exact renames with a non-UTF-8 path; refusing the reconstructed tree."
+                        .to_string(),
+                )
+            })
+        })
+        .collect()
+}
+
 fn is_binary_blob(
     oid: &str,
     verbose: bool,
@@ -303,7 +396,7 @@ pub fn reconstruct_approval_tree_with_env(
         ));
     }
 
-    let mut downgraded = Vec::new();
+    let mut downgraded = ambiguous_exact_rename_paths(old_base, old_review, verbose, env)?;
     for path in &conflict_paths {
         if merged.status.code() == Some(1)
             || !text_conflict_can_keep_hunks(old_base, new_base, old_review, path, verbose, env)?

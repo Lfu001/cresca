@@ -1472,6 +1472,55 @@ fn test_review_includes_all_changes_from_source_only_merge() {
 }
 
 #[test]
+fn test_review_excludes_target_only_changes_after_clean_target_merge() {
+    let repo = TempGitRepo::new();
+    repo.create_branch("develop");
+    repo.write_file(
+        "source-before-merge.txt",
+        "source work before target merge\n",
+    );
+    repo.git(&["add", "source-before-merge.txt"]);
+    repo.commit("Add source work before target merge");
+    repo.switch_branch("main");
+    repo.write_file("target-only.txt", "updated target baseline\n");
+    repo.git(&["add", "target-only.txt"]);
+    repo.commit("Advance target independently");
+    repo.git(&["push", "origin", "main"]);
+    let updated_target = repo.rev_parse("HEAD");
+    repo.switch_branch("develop");
+    repo.git(&[
+        "merge",
+        "--no-ff",
+        "main",
+        "-m",
+        "Merge updated target cleanly",
+    ]);
+    repo.write_file("source-after-merge.txt", "source work after target merge\n");
+    repo.git(&["add", "source-after-merge.txt"]);
+    repo.commit("Add source work after target merge");
+    let endpoint = repo.rev_parse("HEAD");
+    repo.git(&["push", "-u", "origin", "develop"]);
+    repo.switch_branch("main");
+
+    let output = repo.run_cresca(&["review", "main", "develop"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(repo.rev_parse("HEAD"), updated_target);
+    assert_eq!(repo.worktree_diff(), repo.diff(&updated_target, &endpoint));
+    let status = repo.git_stdout(&["status", "--porcelain", "--untracked-files=all"]);
+    assert!(status.contains("source-before-merge.txt"), "{status}");
+    assert!(status.contains("source-after-merge.txt"), "{status}");
+    assert!(!status.contains("target-only.txt"), "{status}");
+    assert_eq!(
+        repo.read_file("target-only.txt"),
+        "updated target baseline\n"
+    );
+}
+
+#[test]
 fn test_review_uses_endpoint_tree_when_addition_and_deletion_cancel() {
     let repo = TempGitRepo::new();
     let base = repo.rev_parse("HEAD");
@@ -2166,6 +2215,75 @@ fn test_rereview_handles_mode_symlink_modify_delete_and_rename_delete_safely() {
     );
     assert!(repo.path().join("modify-delete.txt").exists());
     assert!(repo.path().join("rename-approved.txt").exists());
+}
+
+#[test]
+fn test_rereview_does_not_transfer_approval_through_ambiguous_identical_rename() {
+    let repo = TempGitRepo::new();
+    repo.write_file("left.txt", "identical base content\n");
+    repo.write_file("right.txt", "identical base content\n");
+    repo.git(&["add", "."]);
+    repo.commit("Add identical rename candidates");
+    repo.git(&["push", "origin", "main"]);
+    repo.create_branch("develop");
+    repo.git(&["rm", "left.txt", "right.txt"]);
+    repo.write_file("renamed-identical.txt", "identical base content\n");
+    repo.write_file("approved-addition.txt", "unambiguous approved addition\n");
+    repo.git(&["add", "."]);
+    repo.commit("Create ambiguous identical rename approval");
+    repo.git(&["push", "-u", "origin", "develop"]);
+    repo.switch_branch("main");
+    assert!(repo
+        .run_cresca(&["review", "main", "develop"])
+        .status
+        .success());
+    repo.git(&["add", "-A"]);
+    assert!(repo.run_cresca(&["approve"]).status.success());
+
+    repo.switch_branch("main");
+    repo.write_file("left.txt", "new target left content\n");
+    repo.write_file("right.txt", "new target right content\n");
+    repo.git(&["add", "."]);
+    repo.commit("Change both ambiguous target candidates");
+    repo.git(&["push", "origin", "main"]);
+    let new_base = repo.rev_parse("HEAD");
+    repo.git(&["checkout", "-B", "develop", "main"]);
+    repo.git(&["rm", "left.txt", "right.txt"]);
+    repo.write_file("renamed-identical.txt", "identical base content\n");
+    repo.write_file("approved-addition.txt", "unambiguous approved addition\n");
+    repo.git(&["add", "."]);
+    repo.commit("Reapply ambiguous rename after base movement");
+    let endpoint = repo.rev_parse("HEAD");
+    repo.git(&["push", "--force", "origin", "develop"]);
+    repo.switch_branch("review-main-develop");
+
+    let output = repo.run_cresca(&["review", "main", "develop"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        repo.git_stdout(&["show", "HEAD:left.txt"]),
+        "new target left content"
+    );
+    assert_eq!(
+        repo.git_stdout(&["show", "HEAD:right.txt"]),
+        "new target right content"
+    );
+    assert!(!repo
+        .git_maybe(&["cat-file", "-e", "HEAD:renamed-identical.txt"])
+        .status
+        .success());
+    assert_eq!(
+        repo.git_stdout(&["show", "HEAD:approved-addition.txt"]),
+        "unambiguous approved addition"
+    );
+    assert_eq!(repo.worktree_diff(), repo.diff("HEAD", &endpoint));
+    assert_ne!(
+        repo.rev_parse("HEAD^{tree}"),
+        repo.rev_parse(&format!("{new_base}^{{tree}}"))
+    );
 }
 
 /// Test that `cresca review --skip-to` auto-approves earlier commits.
@@ -3393,7 +3511,7 @@ fn test_status_rejects_unavailable_scope_commit_but_all_still_works() {
     ]);
     assert_scope_error_and_all_available(
         &repo,
-        &format!("saved range endpoint '{oid}' is unavailable"),
+        &format!("saved review object '{oid}' is unavailable"),
     );
 }
 
@@ -3410,7 +3528,7 @@ fn test_status_reports_missing_version_two_base_oid() {
     ]);
     assert_scope_error_and_all_available(
         &repo,
-        &format!("saved range endpoint '{missing_base}' is unavailable"),
+        &format!("saved review object '{missing_base}' is unavailable"),
     );
 }
 
@@ -3563,6 +3681,92 @@ fn test_status_all_uses_latest_explicit_base_after_repeated_base_updates() {
     assert!(!all.contains("second-target-only.txt"), "{all}");
     assert!(!all.contains("approved.txt"), "{all}");
     assert!(!all.contains("approved-after-first.txt"), "{all}");
+    assert_eq!(repo.snapshot(), before);
+}
+
+#[test]
+fn test_status_all_ignores_explicit_base_marker_in_current_target_ancestry() {
+    let repo = TempGitRepo::new();
+    repo.create_branch("legacy");
+    repo.write_file("legacy-approved.txt", "legacy approved content\n");
+    repo.git(&["add", "legacy-approved.txt"]);
+    repo.commit("Add legacy source content");
+    repo.git(&["push", "-u", "origin", "legacy"]);
+    repo.switch_branch("main");
+    assert!(repo
+        .run_cresca(&["review", "main", "legacy"])
+        .status
+        .success());
+    repo.git(&["add", "legacy-approved.txt"]);
+    assert!(repo.run_cresca(&["approve"]).status.success());
+
+    repo.switch_branch("main");
+    repo.write_file("legacy-target-base.txt", "legacy target baseline\n");
+    repo.git(&["add", "legacy-target-base.txt"]);
+    repo.commit("Advance target before legacy rereview");
+    repo.git(&["push", "origin", "main"]);
+    repo.git(&["checkout", "-B", "legacy", "main"]);
+    repo.write_file("legacy-approved.txt", "legacy approved content\n");
+    repo.git(&["add", "legacy-approved.txt"]);
+    repo.commit("Rebase legacy source");
+    repo.git(&["push", "--force", "origin", "legacy"]);
+    repo.switch_branch("review-main-legacy");
+    assert!(repo
+        .run_cresca(&["review", "main", "legacy"])
+        .status
+        .success());
+    let adopted_target = repo.rev_parse("HEAD");
+    assert!(repo
+        .git_stdout(&["show", "-s", "--format=%B", &adopted_target])
+        .contains("Cresca-Review-Base: "));
+
+    repo.git(&["branch", "-f", "main", &adopted_target]);
+    repo.switch_branch("main");
+    repo.git(&["push", "--force", "origin", "main"]);
+    repo.create_branch("next");
+    repo.write_file("next-approved.txt", "next approved content\n");
+    repo.git(&["add", "next-approved.txt"]);
+    repo.commit("Add next source content");
+    repo.git(&["push", "-u", "origin", "next"]);
+    repo.switch_branch("main");
+    assert!(repo
+        .run_cresca(&["review", "main", "next"])
+        .status
+        .success());
+    assert_eq!(repo.rev_parse("HEAD"), adopted_target);
+    repo.git(&["add", "next-approved.txt"]);
+    assert!(repo.run_cresca(&["approve"]).status.success());
+
+    repo.switch_branch("main");
+    repo.git(&["rm", "legacy-approved.txt"]);
+    repo.write_file("current-target-only.txt", "current target baseline\n");
+    repo.git(&["add", "current-target-only.txt"]);
+    repo.commit("Advance target after new review starts");
+    repo.git(&["push", "origin", "main"]);
+    repo.git(&["checkout", "-B", "next", "main"]);
+    repo.write_file("next-approved.txt", "next approved content\n");
+    repo.write_file("later.txt", "later next-source content\n");
+    repo.git(&["add", "."]);
+    repo.commit("Rebase next source and add later work");
+    repo.git(&["push", "--force", "origin", "next"]);
+    repo.switch_branch("review-main-next");
+    repo.git(&[
+        "config",
+        "--local",
+        "branch.review-main-next.cresca-scope",
+        "malformed",
+    ]);
+
+    let before = repo.snapshot();
+    let all = run_status_stdout(&repo, &["status", "--all"]);
+    assert!(
+        all.contains("1 file(s), +1 insertion(s), -0 deletion(s)"),
+        "{all}"
+    );
+    assert!(all.contains("    - later.txt\n"), "{all}");
+    assert!(!all.contains("legacy-approved.txt"), "{all}");
+    assert!(!all.contains("current-target-only.txt"), "{all}");
+    assert!(!all.contains("next-approved.txt"), "{all}");
     assert_eq!(repo.snapshot(), before);
 }
 
