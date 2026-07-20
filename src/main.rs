@@ -5,10 +5,10 @@ mod review;
 use clap::builder::styling::{AnsiColor, Effects};
 use clap::{builder::Styles, ArgAction, Args, Parser, Subcommand};
 use colored::Colorize;
-use commands::{approve_changes, get_review_status, prepare_review_branch};
+use commands::{approve_changes, get_full_review_status, get_review_status, prepare_review_branch};
 use git::{
-    current_branch_name, current_review_metadata, read_review_scope,
-    resolve_remote_tracking_branch, ReviewMetadata, ReviewMetadataError, ReviewScopeError,
+    current_branch_name, current_review_metadata, read_review_scope, ReviewMetadata,
+    ReviewMetadataError, ReviewScopeError,
 };
 use std::process::exit;
 
@@ -115,14 +115,14 @@ fn run() -> Result<(), CliError> {
             };
         }
         Commands::Review(args) => {
-            let has_unreviewed_changes = prepare_review_branch(
+            let preparation = prepare_review_branch(
                 &args.to,
                 &args.from,
                 args.skip_to.as_deref(),
                 args.stop_at.as_deref(),
                 cli.verbose,
             )?;
-            if !has_unreviewed_changes {
+            if !preparation.has_unreviewed_changes {
                 println!("Review branch prepared successfully. However, it seems like there are no unreviewed changes.");
             } else {
                 println!("Review branch prepared successfully. Stage the changes you have reviewed and run `{}` to approve them.", "cresca approve".green());
@@ -134,12 +134,10 @@ fn run() -> Result<(), CliError> {
                 Err(ReviewMetadataError::Git(error)) => return Err(error.into()),
                 Err(error) => exit_invalid_review_branch(error),
             };
-            let (heading, compare_ref, display_label) = if args.all {
-                let resolved = resolve_remote_tracking_branch(&metadata.source, cli.verbose)?;
+            let (heading, status) = if args.all {
                 (
                     "full pull request",
-                    resolved.tracking_ref,
-                    format!("to {}", metadata.source),
+                    get_full_review_status(&metadata, cli.verbose)?,
                 )
             } else {
                 let branch = current_branch_name(cli.verbose)?;
@@ -148,13 +146,10 @@ fn run() -> Result<(), CliError> {
                     Err(ReviewScopeError::Git(error)) => return Err(error.into()),
                     Err(error) => exit_invalid_review_scope(error, &metadata),
                 };
-                (
-                    "current range",
-                    scope.end_oid,
-                    "in current review range".to_string(),
-                )
+                let status =
+                    get_review_status(&scope.end_oid, "in current review range", cli.verbose)?;
+                ("current range", status)
             };
-            let status = get_review_status(&compare_ref, &display_label, cli.verbose)?;
             println!("📋 Review status ({}):", heading);
             println!(
                 "  Remaining diff {}: {} file(s), {} insertion(s), {} deletion(s)",

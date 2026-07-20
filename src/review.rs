@@ -1,10 +1,22 @@
-use crate::git::{run_git_command, GitCommandError};
+use crate::git::{run_git_command, run_git_command_with_env, GitCommandError};
 use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::OsStr;
 use std::fs;
 use std::io::{self, Read};
 use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use tempfile::TempDir;
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct ReviewPreparation {
+    pub has_unreviewed_changes: bool,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct ReconstructionOutcome {
+    pub tree_oid: String,
+    pub downgraded_paths: Vec<String>,
+}
 
 #[derive(Debug)]
 pub enum ReviewError {
@@ -20,6 +32,259 @@ impl From<GitCommandError> for ReviewError {
     fn from(error: GitCommandError) -> Self {
         Self::Git(error)
     }
+}
+
+pub fn unique_merge_base(left: &str, right: &str, verbose: bool) -> Result<String, ReviewError> {
+    let output = run_git_command(
+        "get unique merge base",
+        &["merge-base", "--all", left, right],
+        &[1],
+        verbose,
+    )?;
+    let bases: Vec<_> = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter(|line| !line.is_empty())
+        .map(str::to_owned)
+        .collect();
+    match bases.as_slice() {
+        [base] => Ok(base.clone()),
+        [] => Err(ReviewError::Message(format!(
+            "No unique safe merge base exists between `{left}` and `{right}`."
+        ))),
+        _ => Err(ReviewError::Message(format!(
+            "Multiple merge bases exist between `{left}` and `{right}`; refusing to guess approval history."
+        ))),
+    }
+}
+
+fn parse_merge_tree_output(stdout: &[u8]) -> (Option<String>, Vec<String>) {
+    let mut fields = stdout.split(|byte| *byte == 0);
+    let tree = fields
+        .next()
+        .and_then(|field| std::str::from_utf8(field).ok())
+        .map(str::trim)
+        .filter(|field| !field.is_empty())
+        .map(str::to_owned);
+    let mut paths = Vec::new();
+    for field in fields {
+        if field.is_empty() {
+            break;
+        }
+        paths.push(String::from_utf8_lossy(field).into_owned());
+    }
+    (tree, paths)
+}
+
+fn reconstruction_git(
+    description: &str,
+    args: &[&str],
+    allowed_exit_codes: &[i32],
+    verbose: bool,
+    env: Option<&[(&str, &OsStr)]>,
+) -> Result<std::process::Output, GitCommandError> {
+    match env {
+        Some(env) => run_git_command_with_env(description, args, env, allowed_exit_codes, verbose),
+        None => run_git_command(description, args, allowed_exit_codes, verbose),
+    }
+}
+
+fn tree_entry(
+    revision: &str,
+    path: &str,
+    verbose: bool,
+    env: Option<&[(&str, &OsStr)]>,
+) -> Result<Option<(String, String)>, ReviewError> {
+    let output = reconstruction_git(
+        "inspect reconstruction tree entry",
+        &["ls-tree", "-z", revision, "--", path],
+        &[],
+        verbose,
+        env,
+    )?;
+    if output.stdout.is_empty() {
+        return Ok(None);
+    }
+    let record = output
+        .stdout
+        .split(|byte| *byte == 0)
+        .next()
+        .unwrap_or_default();
+    let header = record
+        .split(|byte| *byte == b'\t')
+        .next()
+        .ok_or_else(|| ReviewError::Message("Git returned an invalid tree entry".to_string()))?;
+    let header = String::from_utf8_lossy(header);
+    let mut fields = header.split_whitespace();
+    let mode = fields.next().unwrap_or_default().to_string();
+    let kind = fields.next().unwrap_or_default();
+    let oid = fields.next().unwrap_or_default().to_string();
+    if kind != "blob" || mode.is_empty() || oid.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some((mode, oid)))
+}
+
+fn is_binary_blob(
+    oid: &str,
+    verbose: bool,
+    env: Option<&[(&str, &OsStr)]>,
+) -> Result<bool, ReviewError> {
+    let output = reconstruction_git(
+        "inspect conflicting blob",
+        &["cat-file", "blob", oid],
+        &[],
+        verbose,
+        env,
+    )?;
+    Ok(output.stdout.contains(&0))
+}
+
+fn text_conflict_can_keep_hunks(
+    old_base: &str,
+    new_base: &str,
+    old_review: &str,
+    path: &str,
+    verbose: bool,
+    env: Option<&[(&str, &OsStr)]>,
+) -> Result<bool, ReviewError> {
+    let Some(old) = tree_entry(old_base, path, verbose, env)? else {
+        return Ok(false);
+    };
+    let Some(new) = tree_entry(new_base, path, verbose, env)? else {
+        return Ok(false);
+    };
+    let Some(review) = tree_entry(old_review, path, verbose, env)? else {
+        return Ok(false);
+    };
+    let regular = |mode: &str| mode == "100644" || mode == "100755";
+    if old.0 != new.0 || old.0 != review.0 || !regular(&old.0) {
+        return Ok(false);
+    }
+    Ok(!is_binary_blob(&old.1, verbose, env)?
+        && !is_binary_blob(&new.1, verbose, env)?
+        && !is_binary_blob(&review.1, verbose, env)?)
+}
+
+pub fn reconstruct_approval_tree(
+    old_base: &str,
+    new_base: &str,
+    old_review: &str,
+    verbose: bool,
+) -> Result<ReconstructionOutcome, ReviewError> {
+    reconstruct_approval_tree_with_env(old_base, new_base, old_review, verbose, None)
+}
+
+pub fn reconstruct_approval_tree_with_env(
+    old_base: &str,
+    new_base: &str,
+    old_review: &str,
+    verbose: bool,
+    env: Option<&[(&str, &OsStr)]>,
+) -> Result<ReconstructionOutcome, ReviewError> {
+    let diagnostic = reconstruction_git(
+        "identify approval reconstruction conflicts",
+        &[
+            "merge-tree",
+            "--write-tree",
+            &format!("--merge-base={old_base}"),
+            "-Xfind-renames=100%",
+            "--messages",
+            "--name-only",
+            "-z",
+            new_base,
+            old_review,
+        ],
+        &[1],
+        verbose,
+        env,
+    )?;
+    let (_, conflict_paths) = parse_merge_tree_output(&diagnostic.stdout);
+    if diagnostic.status.code() == Some(1) && conflict_paths.is_empty() {
+        return Err(ReviewError::Message(
+            "Approval reconstruction conflicted but Git did not identify any paths; refusing the reconstructed tree."
+                .to_string(),
+        ));
+    }
+
+    let merged = reconstruction_git(
+        "reconstruct approved tree",
+        &[
+            "merge-tree",
+            "--write-tree",
+            &format!("--merge-base={old_base}"),
+            "-Xours",
+            "-Xfind-renames=100%",
+            "--no-messages",
+            new_base,
+            old_review,
+        ],
+        &[1],
+        verbose,
+        env,
+    )?;
+    let tree_oid = String::from_utf8_lossy(&merged.stdout)
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    if tree_oid.is_empty() {
+        return Err(ReviewError::Message(
+            "Git did not return a reconstructed approval tree.".to_string(),
+        ));
+    }
+
+    let mut downgraded = Vec::new();
+    for path in &conflict_paths {
+        if merged.status.code() == Some(1)
+            || !text_conflict_can_keep_hunks(old_base, new_base, old_review, path, verbose, env)?
+        {
+            downgraded.push(path.clone());
+        }
+    }
+    downgraded.sort();
+    downgraded.dedup();
+    if downgraded.is_empty() {
+        return Ok(ReconstructionOutcome {
+            tree_oid,
+            downgraded_paths: downgraded,
+        });
+    }
+
+    let scratch = TempDir::new().map_err(|error| {
+        ReviewError::Message(format!("failed to create scratch index: {error}"))
+    })?;
+    let index = scratch.path().join("index");
+    let mut scratch_env: Vec<(&str, &OsStr)> = env.unwrap_or_default().to_vec();
+    scratch_env.retain(|(key, _)| *key != "GIT_INDEX_FILE");
+    scratch_env.push(("GIT_INDEX_FILE", index.as_os_str()));
+    run_git_command_with_env(
+        "load reconstructed tree into scratch index",
+        &["read-tree", &tree_oid],
+        &scratch_env,
+        &[],
+        verbose,
+    )?;
+    for path in &downgraded {
+        run_git_command_with_env(
+            "downgrade conflicted path to new base",
+            &["reset", new_base, "--", path],
+            &scratch_env,
+            &[],
+            verbose,
+        )?;
+    }
+    let output = run_git_command_with_env(
+        "write reconstructed scratch index",
+        &["write-tree"],
+        &scratch_env,
+        &[],
+        verbose,
+    )?;
+    Ok(ReconstructionOutcome {
+        tree_oid: String::from_utf8_lossy(&output.stdout).trim().to_string(),
+        downgraded_paths: downgraded,
+    })
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

@@ -1,4 +1,5 @@
 use colored::Colorize;
+use std::ffi::OsStr;
 use std::io::Write;
 use std::process::{Command, ExitStatus, Output, Stdio};
 
@@ -12,7 +13,7 @@ pub struct GitCommandError {
 }
 
 pub const REVIEW_METADATA_VERSION: &str = "1";
-pub const REVIEW_SCOPE_VERSION: &str = "1";
+pub const REVIEW_SCOPE_VERSION: &str = "2";
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct ReviewMetadata {
@@ -22,6 +23,7 @@ pub struct ReviewMetadata {
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct ReviewScope {
+    pub base_oid: Option<String>,
     pub end_oid: String,
 }
 
@@ -270,7 +272,11 @@ pub fn write_review_scope(
     verbose: bool,
 ) -> Result<(), GitCommandError> {
     let key = review_config_key(branch, "scope");
-    let value = format!("{}:{}", REVIEW_SCOPE_VERSION, scope.end_oid);
+    let base_oid = scope
+        .base_oid
+        .as_deref()
+        .expect("successful review scopes must include an explicit base");
+    let value = format!("{}:{}:{}", REVIEW_SCOPE_VERSION, base_oid, scope.end_oid);
     run_git_command(
         "record review range",
         &["config", "--local", "--replace-all", &key, &value],
@@ -287,35 +293,53 @@ pub fn read_review_scope(branch: &str, verbose: bool) -> Result<ReviewScope, Rev
         [value] => value,
         _ => return Err(ReviewScopeError::Duplicate),
     };
-    let Some((version, end_oid)) = value.split_once(':') else {
+    let mut fields = value.split(':');
+    let Some(version) = fields.next() else {
         return Err(ReviewScopeError::Invalid);
     };
-    if version != REVIEW_SCOPE_VERSION {
-        return Err(ReviewScopeError::UnsupportedVersion(version.to_string()));
-    }
-    if end_oid.is_empty()
-        || end_oid.contains(':')
-        || !end_oid.bytes().all(|byte| byte.is_ascii_hexdigit())
-    {
+    let (base_oid, end_oid) = match version {
+        "1" => (None, fields.next()),
+        REVIEW_SCOPE_VERSION => (fields.next(), fields.next()),
+        _ => return Err(ReviewScopeError::UnsupportedVersion(version.to_string())),
+    };
+    if fields.next().is_some() {
         return Err(ReviewScopeError::Invalid);
     }
-    let revision = format!("{end_oid}^{{commit}}\n");
+    let Some(end_oid) = end_oid else {
+        return Err(ReviewScopeError::Invalid);
+    };
+    let valid_oid = |oid: &str| {
+        !oid.is_empty() && oid.len() == 40 && oid.bytes().all(|byte| byte.is_ascii_hexdigit())
+    };
+    if !valid_oid(end_oid) || base_oid.is_some_and(|oid| !valid_oid(oid)) {
+        return Err(ReviewScopeError::Invalid);
+    }
+    let mut revisions = String::new();
+    if let Some(base_oid) = base_oid {
+        revisions.push_str(&format!("{base_oid}^{{commit}}\n"));
+    }
+    revisions.push_str(&format!("{end_oid}^{{commit}}\n"));
     let output = run_git_command_with_input(
         "validate review range endpoint",
         &["cat-file", "--batch-check=%(objectname)"],
-        revision.as_bytes(),
+        revisions.as_bytes(),
         &[],
         verbose,
     )
     .map_err(ReviewScopeError::Git)?;
-    let result = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if result.ends_with(" missing") {
+    let results: Vec<_> = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::to_owned)
+        .collect();
+    if results.iter().any(|result| result.ends_with(" missing")) {
         return Err(ReviewScopeError::UnavailableCommit(end_oid.to_string()));
     }
-    if result != end_oid {
+    let expected: Vec<_> = base_oid.into_iter().chain([end_oid]).collect();
+    if results != expected {
         return Err(ReviewScopeError::Invalid);
     }
     Ok(ReviewScope {
+        base_oid: base_oid.map(str::to_string),
         end_oid: end_oid.to_string(),
     })
 }
@@ -345,6 +369,30 @@ pub fn run_git_command(
     command.args(args);
     if args.first() == Some(&"status") {
         command.env("GIT_OPTIONAL_LOCKS", "0");
+    }
+    evaluate_git_output(
+        description,
+        args,
+        allowed_exit_codes,
+        verbose,
+        command.output(),
+    )
+}
+
+pub fn run_git_command_with_env(
+    description: &str,
+    args: &[&str],
+    env: &[(&str, &OsStr)],
+    allowed_exit_codes: &[i32],
+    verbose: bool,
+) -> Result<Output, GitCommandError> {
+    if verbose {
+        println!("[git {}]", args.join(" ").yellow());
+    }
+    let mut command = Command::new("git");
+    command.args(args);
+    for (key, value) in env {
+        command.env(key, value);
     }
     evaluate_git_output(
         description,
