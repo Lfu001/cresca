@@ -331,10 +331,16 @@ pub fn read_review_scope(branch: &str, verbose: bool) -> Result<ReviewScope, Rev
         .lines()
         .map(str::to_owned)
         .collect();
-    if results.iter().any(|result| result.ends_with(" missing")) {
-        return Err(ReviewScopeError::UnavailableCommit(end_oid.to_string()));
-    }
     let expected: Vec<_> = base_oid.into_iter().chain([end_oid]).collect();
+    if let Some((_, missing_oid)) = results
+        .iter()
+        .zip(&expected)
+        .find(|(result, _)| result.ends_with(" missing"))
+    {
+        return Err(ReviewScopeError::UnavailableCommit(
+            (*missing_oid).to_string(),
+        ));
+    }
     if results != expected {
         return Err(ReviewScopeError::Invalid);
     }

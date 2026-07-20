@@ -4,8 +4,8 @@ use crate::git::{
     ReviewBranchSelectionError, ReviewMetadata, ReviewScope, ReviewScopeError,
 };
 use crate::review::{
-    reconstruct_approval_tree, reconstruct_approval_tree_with_env, unique_merge_base, ReviewError,
-    ReviewPreparation, ReviewTransaction,
+    explicit_review_base, reconstruct_approval_tree, reconstruct_approval_tree_with_env,
+    review_commit_message, unique_merge_base, ReviewError, ReviewPreparation, ReviewTransaction,
 };
 use std::ffi::OsStr;
 use std::ops::Not;
@@ -22,7 +22,7 @@ struct ReviewPlan {
     tracking_updates: Vec<(String, String)>,
 }
 
-/// Prepare the review branch using Squash Merge approach.
+/// Prepare a review branch with explicit approval-tree reconstruction.
 ///
 /// # Arguments
 ///
@@ -384,17 +384,18 @@ fn apply_review_plan(plan: ReviewPlan, verbose: bool) -> Result<ReviewPreparatio
     }
 
     let new_review = if !is_new || auto_approve_parent.is_some() {
-        let message = if is_new {
+        let subject = if is_new {
             "Auto-approve earlier commits"
         } else {
             "Reconstruct approved changes"
         };
+        let message = review_commit_message(subject, &new_base);
         let description = if is_new {
             "commit auto-approved changes"
         } else {
             "commit reconstructed approved tree"
         };
-        let commit = commit_tree(description, &approved_tree, &parent, message, verbose)?;
+        let commit = commit_tree(description, &approved_tree, &parent, &message, verbose)?;
         run_git_command(
             "update review ref to reconstructed approval",
             &[
@@ -497,7 +498,10 @@ pub fn get_full_review_status(
     let target_oid = resolve("resolve current review target", &target.tracking_ref)?;
     let source_oid = resolve("resolve current review source", &source.tracking_ref)?;
     let review_head = resolve("resolve current review head", "HEAD")?;
-    let old_base = unique_merge_base(&review_head, &source_oid, verbose)?;
+    let old_base = match explicit_review_base(&review_head, verbose)? {
+        Some(base) => base,
+        None => unique_merge_base(&review_head, &source_oid, verbose)?,
+    };
     let new_base = unique_merge_base(&target_oid, &source_oid, verbose)?;
 
     let object_path = run_git_command(

@@ -18,6 +18,8 @@ pub struct ReconstructionOutcome {
     pub downgraded_paths: Vec<String>,
 }
 
+const REVIEW_BASE_TRAILER: &str = "Cresca-Review-Base: ";
+
 #[derive(Debug)]
 pub enum ReviewError {
     Git(GitCommandError),
@@ -57,11 +59,72 @@ pub fn unique_merge_base(left: &str, right: &str, verbose: bool) -> Result<Strin
     }
 }
 
-fn parse_merge_tree_output(stdout: &[u8]) -> (Option<String>, Vec<String>) {
+pub fn explicit_review_base(
+    review_head: &str,
+    verbose: bool,
+) -> Result<Option<String>, ReviewError> {
+    let output = run_git_command(
+        "find explicit review base",
+        &["log", "--first-parent", "--format=%B%x00", review_head],
+        &[],
+        verbose,
+    )?;
+    for message in output.stdout.split(|byte| *byte == 0) {
+        let message = std::str::from_utf8(message).map_err(|_| {
+            ReviewError::Message(
+                "Review history contains a non-UTF-8 commit message; refusing to infer its approval base."
+                    .to_string(),
+            )
+        })?;
+        let markers: Vec<_> = message
+            .lines()
+            .filter_map(|line| line.strip_prefix(REVIEW_BASE_TRAILER))
+            .collect();
+        if markers.is_empty() {
+            continue;
+        }
+        let [base] = markers.as_slice() else {
+            return Err(ReviewError::Message(
+                "Review history contains ambiguous explicit base markers.".to_string(),
+            ));
+        };
+        if base.len() != 40 || !base.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(ReviewError::Message(
+                "Review history contains an invalid explicit base marker.".to_string(),
+            ));
+        }
+        let revision = format!("{base}^{{commit}}");
+        let resolved = run_git_command(
+            "validate explicit review base",
+            &["rev-parse", "--verify", &revision],
+            &[],
+            verbose,
+        )?;
+        let resolved = String::from_utf8_lossy(&resolved.stdout).trim().to_string();
+        if resolved != *base {
+            return Err(ReviewError::Message(
+                "Review history explicit base marker does not resolve exactly.".to_string(),
+            ));
+        }
+        return Ok(Some((*base).to_string()));
+    }
+    Ok(None)
+}
+
+pub fn review_commit_message(subject: &str, base: &str) -> String {
+    format!("{subject}\n\n{REVIEW_BASE_TRAILER}{base}")
+}
+
+fn parse_merge_tree_output(stdout: &[u8]) -> Result<(Option<String>, Vec<String>), ReviewError> {
     let mut fields = stdout.split(|byte| *byte == 0);
     let tree = fields
         .next()
-        .and_then(|field| std::str::from_utf8(field).ok())
+        .map(|field| {
+            std::str::from_utf8(field).map_err(|_| {
+                ReviewError::Message("Git returned a non-UTF-8 tree object ID.".to_string())
+            })
+        })
+        .transpose()?
         .map(str::trim)
         .filter(|field| !field.is_empty())
         .map(str::to_owned);
@@ -70,9 +133,15 @@ fn parse_merge_tree_output(stdout: &[u8]) -> (Option<String>, Vec<String>) {
         if field.is_empty() {
             break;
         }
-        paths.push(String::from_utf8_lossy(field).into_owned());
+        let path = std::str::from_utf8(field).map_err(|_| {
+            ReviewError::Message(
+                "Git reported a non-UTF-8 conflict path; refusing the reconstructed tree."
+                    .to_string(),
+            )
+        })?;
+        paths.push(path.to_string());
     }
-    (tree, paths)
+    Ok((tree, paths))
 }
 
 fn reconstruction_git(
@@ -198,7 +267,7 @@ pub fn reconstruct_approval_tree_with_env(
         verbose,
         env,
     )?;
-    let (_, conflict_paths) = parse_merge_tree_output(&diagnostic.stdout);
+    let (_, conflict_paths) = parse_merge_tree_output(&diagnostic.stdout)?;
     if diagnostic.status.code() == Some(1) && conflict_paths.is_empty() {
         return Err(ReviewError::Message(
             "Approval reconstruction conflicted but Git did not identify any paths; refusing the reconstructed tree."
@@ -1222,5 +1291,21 @@ fn files_equal(left: &Path, right: &Path) -> io::Result<bool> {
         if left_count == 0 {
             return Ok(true);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_merge_tree_output;
+
+    #[test]
+    fn merge_tree_output_rejects_non_utf8_conflict_paths() {
+        let mut output = b"0123456789012345678901234567890123456789\0".to_vec();
+        output.extend_from_slice(b"unsafe-\xff.bin\0\0");
+
+        let error = parse_merge_tree_output(&output)
+            .expect_err("non-UTF-8 conflict paths must fail closed before tree adoption");
+
+        assert!(format!("{error:?}").contains("non-UTF-8 conflict path"));
     }
 }
