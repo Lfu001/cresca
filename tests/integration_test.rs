@@ -384,7 +384,7 @@ fn test_partial_reconcile_failure_still_restores_independent_paths() {
 }
 
 #[test]
-fn test_successful_review_publishes_fetched_source_for_status_all() {
+fn test_successful_review_publishes_fetched_source_tracking_ref() {
     let (repo, _) = setup_linear_range();
     let stale_source = repo.rev_parse("refs/remotes/origin/develop");
     repo.switch_branch("develop");
@@ -408,8 +408,6 @@ fn test_successful_review_publishes_fetched_source_for_status_all() {
         advanced_source,
         "successful review must publish the source fetched during preflight"
     );
-    let all = run_status_stdout(&repo, &["status", "--all"]);
-    assert!(all.contains("    - advanced-source.txt\n"), "{all}");
 }
 
 #[test]
@@ -3777,7 +3775,7 @@ fn test_status_uses_metadata_for_hyphenated_target_and_slash_source() {
     assert!(output.stderr.is_empty());
 }
 
-fn assert_scope_error_and_all_available(repo: &TempGitRepo, expected_error: &str) {
+fn assert_scope_error_preserves_state(repo: &TempGitRepo, expected_error: &str) {
     let before = repo.snapshot();
     let output = repo.run_cresca(&["status"]);
     assert!(!output.status.success());
@@ -3788,28 +3786,17 @@ fn assert_scope_error_and_all_available(repo: &TempGitRepo, expected_error: &str
         "unexpected diagnostic: {stderr}"
     );
     assert!(stderr.contains("cresca review main develop"));
-    assert!(stderr.contains("cresca status --all"));
     assert_eq!(repo.snapshot(), before);
-
-    let all = repo.run_cresca(&["status", "--all"]);
-    assert!(
-        all.status.success(),
-        "stdout: {}\nstderr: {}",
-        String::from_utf8_lossy(&all.stdout),
-        String::from_utf8_lossy(&all.stderr)
-    );
-    assert!(String::from_utf8_lossy(&all.stdout).contains("    - develop.txt\n"));
-    assert!(all.stderr.is_empty());
 }
 
 #[test]
-fn test_status_requires_scope_metadata_but_all_works_for_pr12_identity() {
+fn test_status_requires_scope_metadata_for_pr12_identity() {
     let repo = setup_identity_only_review_branch();
-    assert_scope_error_and_all_available(&repo, "range metadata is missing");
+    assert_scope_error_preserves_state(&repo, "range metadata is missing");
 }
 
 #[test]
-fn test_status_rejects_duplicate_scope_values_but_all_still_works() {
+fn test_status_rejects_duplicate_scope_values() {
     let repo = setup_identity_only_review_branch();
     let value = format!("1:{}", repo.rev_parse("HEAD"));
     repo.git(&[
@@ -3826,11 +3813,11 @@ fn test_status_rejects_duplicate_scope_values_but_all_still_works() {
         "branch.review-main-develop.cresca-scope",
         &value,
     ]);
-    assert_scope_error_and_all_available(&repo, "range metadata has duplicate values");
+    assert_scope_error_preserves_state(&repo, "range metadata has duplicate values");
 }
 
 #[test]
-fn test_status_rejects_unsupported_scope_version_but_all_still_works() {
+fn test_status_rejects_unsupported_scope_version() {
     let repo = setup_identity_only_review_branch();
     let value = format!("3:{}", repo.rev_parse("HEAD"));
     repo.git(&[
@@ -3839,11 +3826,11 @@ fn test_status_rejects_unsupported_scope_version_but_all_still_works() {
         "branch.review-main-develop.cresca-scope",
         &value,
     ]);
-    assert_scope_error_and_all_available(&repo, "range metadata version '3' is unsupported");
+    assert_scope_error_preserves_state(&repo, "range metadata version '3' is unsupported");
 }
 
 #[test]
-fn test_status_rejects_malformed_scope_oid_but_all_still_works() {
+fn test_status_rejects_malformed_scope_oid() {
     let repo = setup_identity_only_review_branch();
     repo.git(&[
         "config",
@@ -3851,7 +3838,7 @@ fn test_status_rejects_malformed_scope_oid_but_all_still_works() {
         "branch.review-main-develop.cresca-scope",
         "1:not-an-oid",
     ]);
-    assert_scope_error_and_all_available(&repo, "range metadata is invalid");
+    assert_scope_error_preserves_state(&repo, "range metadata is invalid");
 }
 
 #[test]
@@ -3865,11 +3852,11 @@ fn test_status_rejects_abbreviated_scope_oid() {
         "branch.review-main-develop.cresca-scope",
         &value,
     ]);
-    assert_scope_error_and_all_available(&repo, "range metadata is invalid");
+    assert_scope_error_preserves_state(&repo, "range metadata is invalid");
 }
 
 #[test]
-fn test_status_rejects_unavailable_scope_commit_but_all_still_works() {
+fn test_status_rejects_unavailable_scope_commit() {
     let repo = setup_identity_only_review_branch();
     let oid = "0000000000000000000000000000000000000000";
     let value = format!("1:{oid}");
@@ -3879,7 +3866,7 @@ fn test_status_rejects_unavailable_scope_commit_but_all_still_works() {
         "branch.review-main-develop.cresca-scope",
         &value,
     ]);
-    assert_scope_error_and_all_available(
+    assert_scope_error_preserves_state(
         &repo,
         &format!("saved review object '{oid}' is unavailable"),
     );
@@ -3896,7 +3883,7 @@ fn test_status_reports_missing_version_two_base_oid() {
         "branch.review-main-develop.cresca-scope",
         &format!("2:{missing_base}:{endpoint}"),
     ]);
-    assert_scope_error_and_all_available(
+    assert_scope_error_preserves_state(
         &repo,
         &format!("saved review object '{missing_base}' is unavailable"),
     );
@@ -3924,409 +3911,10 @@ fn test_status_keeps_unbounded_review_tip_fixed_until_next_review() {
             "  Remaining diff in current review range: 0 file(s), +0 insertion(s), -0 deletion(s)\n",
         )
     );
-    assert_eq!(
-        run_status_stdout(&repo, &["status", "--all"]),
-        concat!(
-            "📋 Review status (full pull request):\n",
-            "  Remaining diff to develop: 1 file(s), +1 insertion(s), -0 deletion(s)\n",
-            "  Files remaining:\n",
-            "    - e.txt\n",
-        )
-    );
 }
 
 #[test]
-fn test_status_all_temporarily_reconstructs_after_target_and_source_rebase_without_mutation() {
-    let repo = TempGitRepo::new();
-    repo.create_branch("develop");
-    repo.write_file("approved.txt", "approved content\n");
-    repo.git(&["add", "approved.txt"]);
-    repo.commit("Add approved source content");
-    repo.git(&["push", "-u", "origin", "develop"]);
-    repo.switch_branch("main");
-    assert!(repo
-        .run_cresca(&["review", "main", "develop"])
-        .status
-        .success());
-    repo.git(&["add", "approved.txt"]);
-    assert!(repo.run_cresca(&["approve"]).status.success());
-
-    repo.switch_branch("main");
-    repo.write_file("target-only.txt", "new target baseline\n");
-    repo.git(&["add", "target-only.txt"]);
-    repo.commit("Advance target baseline");
-    repo.git(&["push", "origin", "main"]);
-    repo.git(&["checkout", "-B", "develop", "main"]);
-    repo.write_file("approved.txt", "approved content\n");
-    repo.write_file("later.txt", "new unreviewed content\n");
-    repo.git(&["add", "."]);
-    repo.commit("Rebase approved content and add later change");
-    repo.git(&["push", "--force", "origin", "develop"]);
-    repo.switch_branch("review-main-develop");
-
-    let before = repo.snapshot();
-    let objects_before = repo.git_stdout(&["count-objects", "-v"]);
-    let all = run_status_stdout(&repo, &["status", "--all"]);
-    assert!(
-        all.contains("1 file(s), +1 insertion(s), -0 deletion(s)"),
-        "{all}"
-    );
-    assert!(all.contains("    - later.txt\n"), "{all}");
-    assert!(!all.contains("target-only.txt"), "{all}");
-    assert!(!all.contains("approved.txt"), "{all}");
-    assert_eq!(repo.snapshot(), before);
-    assert_eq!(repo.git_stdout(&["count-objects", "-v"]), objects_before);
-}
-
-#[test]
-fn test_status_all_uses_latest_explicit_base_after_repeated_base_updates() {
-    let repo = TempGitRepo::new();
-    repo.write_file("deleted-from-target.txt", "initial target content\n");
-    repo.git(&["add", "deleted-from-target.txt"]);
-    repo.commit("Add initial target fixture");
-    repo.git(&["push", "origin", "main"]);
-    repo.create_branch("develop");
-    repo.write_file("approved.txt", "approved source content\n");
-    repo.git(&["add", "approved.txt"]);
-    repo.commit("Add approved source content");
-    repo.git(&["push", "-u", "origin", "develop"]);
-    repo.switch_branch("main");
-    assert!(repo
-        .run_cresca(&["review", "main", "develop"])
-        .status
-        .success());
-    repo.git(&["add", "approved.txt"]);
-    assert!(repo.run_cresca(&["approve"]).status.success());
-
-    repo.switch_branch("main");
-    repo.git(&["rm", "deleted-from-target.txt"]);
-    repo.write_file("first-target-only.txt", "first target baseline\n");
-    repo.git(&["add", "first-target-only.txt"]);
-    repo.commit("First target base update");
-    repo.git(&["push", "origin", "main"]);
-    repo.git(&["checkout", "-B", "develop", "main"]);
-    repo.write_file("approved.txt", "approved source content\n");
-    repo.write_file("approved-after-first.txt", "approved after first update\n");
-    repo.git(&["add", "approved.txt", "approved-after-first.txt"]);
-    repo.commit("Rebase source after first target update");
-    repo.git(&["push", "--force", "origin", "develop"]);
-    repo.switch_branch("review-main-develop");
-    assert!(repo
-        .run_cresca(&["review", "main", "develop"])
-        .status
-        .success());
-    repo.git(&["add", "approved-after-first.txt"]);
-    assert!(repo.run_cresca(&["approve"]).status.success());
-    assert!(repo.worktree_diff().is_empty());
-
-    repo.switch_branch("main");
-    repo.git(&["rm", "first-target-only.txt"]);
-    repo.write_file("second-target-only.txt", "second target baseline\n");
-    repo.git(&["add", "second-target-only.txt"]);
-    repo.commit("Second target base update");
-    repo.git(&["push", "origin", "main"]);
-    repo.git(&["checkout", "-B", "develop", "main"]);
-    repo.write_file("approved.txt", "approved source content\n");
-    repo.write_file("approved-after-first.txt", "approved after first update\n");
-    repo.write_file("later.txt", "later unreviewed content\n");
-    repo.git(&["add", "."]);
-    repo.commit("Rebase source after second target update");
-    repo.git(&["push", "--force", "origin", "develop"]);
-    repo.switch_branch("review-main-develop");
-    repo.git(&[
-        "config",
-        "--local",
-        "branch.review-main-develop.cresca-scope",
-        "malformed",
-    ]);
-
-    let before = repo.snapshot();
-    let all = run_status_stdout(&repo, &["status", "--all"]);
-    assert!(
-        all.contains("1 file(s), +1 insertion(s), -0 deletion(s)"),
-        "{all}"
-    );
-    assert!(all.contains("    - later.txt\n"), "{all}");
-    assert!(!all.contains("first-target-only.txt"), "{all}");
-    assert!(!all.contains("second-target-only.txt"), "{all}");
-    assert!(!all.contains("approved.txt"), "{all}");
-    assert!(!all.contains("approved-after-first.txt"), "{all}");
-    assert_eq!(repo.snapshot(), before);
-}
-
-#[test]
-fn test_status_all_ignores_explicit_base_marker_in_current_target_ancestry() {
-    let repo = TempGitRepo::new();
-    repo.create_branch("legacy");
-    repo.write_file("legacy-approved.txt", "legacy approved content\n");
-    repo.git(&["add", "legacy-approved.txt"]);
-    repo.commit("Add legacy source content");
-    repo.git(&["push", "-u", "origin", "legacy"]);
-    repo.switch_branch("main");
-    assert!(repo
-        .run_cresca(&["review", "main", "legacy"])
-        .status
-        .success());
-    repo.git(&["add", "legacy-approved.txt"]);
-    assert!(repo.run_cresca(&["approve"]).status.success());
-
-    repo.switch_branch("main");
-    repo.write_file("legacy-target-base.txt", "legacy target baseline\n");
-    repo.git(&["add", "legacy-target-base.txt"]);
-    repo.commit("Advance target before legacy rereview");
-    repo.git(&["push", "origin", "main"]);
-    repo.git(&["checkout", "-B", "legacy", "main"]);
-    repo.write_file("legacy-approved.txt", "legacy approved content\n");
-    repo.git(&["add", "legacy-approved.txt"]);
-    repo.commit("Rebase legacy source");
-    repo.git(&["push", "--force", "origin", "legacy"]);
-    repo.switch_branch("review-main-legacy");
-    assert!(repo
-        .run_cresca(&["review", "main", "legacy"])
-        .status
-        .success());
-    let adopted_target = repo.rev_parse("HEAD");
-    assert!(repo
-        .git_stdout(&["show", "-s", "--format=%B", &adopted_target])
-        .contains("Cresca-Review-Base: "));
-
-    repo.git(&["branch", "-f", "main", &adopted_target]);
-    repo.switch_branch("main");
-    repo.git(&["push", "--force", "origin", "main"]);
-    repo.create_branch("next");
-    repo.write_file("next-approved.txt", "next approved content\n");
-    repo.git(&["add", "next-approved.txt"]);
-    repo.commit("Add next source content");
-    repo.git(&["push", "-u", "origin", "next"]);
-    repo.switch_branch("main");
-    assert!(repo
-        .run_cresca(&["review", "main", "next"])
-        .status
-        .success());
-    assert_eq!(repo.rev_parse("HEAD"), adopted_target);
-    repo.git(&["add", "next-approved.txt"]);
-    assert!(repo.run_cresca(&["approve"]).status.success());
-
-    repo.switch_branch("main");
-    repo.git(&["rm", "legacy-approved.txt"]);
-    repo.write_file("current-target-only.txt", "current target baseline\n");
-    repo.git(&["add", "current-target-only.txt"]);
-    repo.commit("Advance target after new review starts");
-    repo.git(&["push", "origin", "main"]);
-    repo.git(&["checkout", "-B", "next", "main"]);
-    repo.write_file("next-approved.txt", "next approved content\n");
-    repo.write_file("later.txt", "later next-source content\n");
-    repo.git(&["add", "."]);
-    repo.commit("Rebase next source and add later work");
-    repo.git(&["push", "--force", "origin", "next"]);
-    repo.switch_branch("review-main-next");
-    repo.git(&[
-        "config",
-        "--local",
-        "branch.review-main-next.cresca-scope",
-        "malformed",
-    ]);
-
-    let before = repo.snapshot();
-    let all = run_status_stdout(&repo, &["status", "--all"]);
-    assert!(
-        all.contains("1 file(s), +1 insertion(s), -0 deletion(s)"),
-        "{all}"
-    );
-    assert!(all.contains("    - later.txt\n"), "{all}");
-    assert!(!all.contains("legacy-approved.txt"), "{all}");
-    assert!(!all.contains("current-target-only.txt"), "{all}");
-    assert!(!all.contains("next-approved.txt"), "{all}");
-    assert_eq!(repo.snapshot(), before);
-}
-
-#[test]
-fn test_status_all_ignores_inherited_target_marker_after_source_rebases_earlier() {
-    let repo = TempGitRepo::new();
-    repo.create_branch("legacy");
-    repo.write_file("legacy-approved.txt", "legacy approved content\n");
-    repo.git(&["add", "legacy-approved.txt"]);
-    repo.commit("Add legacy source content");
-    repo.git(&["push", "-u", "origin", "legacy"]);
-    repo.switch_branch("main");
-    assert!(repo
-        .run_cresca(&["review", "main", "legacy"])
-        .status
-        .success());
-    repo.git(&["add", "legacy-approved.txt"]);
-    assert!(repo.run_cresca(&["approve"]).status.success());
-
-    repo.switch_branch("main");
-    repo.write_file("legacy-target-base.txt", "legacy target baseline\n");
-    repo.git(&["add", "legacy-target-base.txt"]);
-    repo.commit("Advance target before legacy rereview");
-    repo.git(&["push", "origin", "main"]);
-    repo.git(&["checkout", "-B", "legacy", "main"]);
-    repo.write_file("legacy-approved.txt", "legacy approved content\n");
-    repo.git(&["add", "legacy-approved.txt"]);
-    repo.commit("Rebase legacy source");
-    repo.git(&["push", "--force", "origin", "legacy"]);
-    repo.switch_branch("review-main-legacy");
-    assert!(repo
-        .run_cresca(&["review", "main", "legacy"])
-        .status
-        .success());
-    let adopted_target = repo.rev_parse("HEAD");
-    let earlier_target_ancestor = repo.rev_parse("HEAD^");
-    assert!(repo
-        .git_stdout(&["show", "-s", "--format=%B", &adopted_target])
-        .contains("Cresca-Review-Base: "));
-
-    repo.git(&["branch", "-f", "main", &adopted_target]);
-    repo.switch_branch("main");
-    repo.git(&["push", "--force", "origin", "main"]);
-    repo.create_branch("next");
-    repo.write_file("next-approved.txt", "next approved content\n");
-    repo.git(&["add", "next-approved.txt"]);
-    repo.commit("Add next source content");
-    repo.git(&["push", "-u", "origin", "next"]);
-    repo.switch_branch("main");
-    assert!(repo
-        .run_cresca(&["review", "main", "next"])
-        .status
-        .success());
-    repo.git(&["add", "next-approved.txt"]);
-    assert!(repo.run_cresca(&["approve"]).status.success());
-
-    repo.git(&["checkout", "-B", "next", &earlier_target_ancestor]);
-    repo.write_file("next-approved.txt", "next approved content\n");
-    repo.write_file("later.txt", "later next-source content\n");
-    repo.git(&["add", "."]);
-    repo.commit("Force-rebase next source before inherited marker");
-    repo.git(&["push", "--force", "origin", "next"]);
-    repo.switch_branch("review-main-next");
-
-    let before = repo.snapshot();
-    let all = run_status_stdout(&repo, &["status", "--all"]);
-    assert!(
-        all.contains("2 file(s), +1 insertion(s), -1 deletion(s)"),
-        "{all}"
-    );
-    assert!(all.contains("    - later.txt\n"), "{all}");
-    assert!(all.contains("    - legacy-target-base.txt\n"), "{all}");
-    assert!(!all.contains("legacy-approved.txt"), "{all}");
-    assert!(!all.contains("next-approved.txt"), "{all}");
-    assert_eq!(repo.snapshot(), before);
-}
-
-#[test]
-fn test_status_all_fails_closed_for_unrelated_source_history_without_mutation() {
-    let repo = TempGitRepo::new();
-    repo.git(&["checkout", "--orphan", "develop"]);
-    repo.git(&["rm", "-rf", "."]);
-    repo.write_file("unrelated.txt", "unrelated source\n");
-    repo.git(&["add", "unrelated.txt"]);
-    repo.commit("Create unrelated source history");
-    repo.git(&["push", "-u", "origin", "develop"]);
-    repo.switch_branch("main");
-    repo.create_branch("review-main-develop");
-    repo.git(&[
-        "config",
-        "--local",
-        "branch.review-main-develop.cresca-version",
-        "1",
-    ]);
-    repo.git(&[
-        "config",
-        "--local",
-        "branch.review-main-develop.cresca-target",
-        "main",
-    ]);
-    repo.git(&[
-        "config",
-        "--local",
-        "branch.review-main-develop.cresca-source",
-        "develop",
-    ]);
-    let before = repo.snapshot();
-
-    let output = repo.run_cresca(&["status", "--all"]);
-    assert!(!output.status.success());
-    assert!(
-        String::from_utf8_lossy(&output.stderr).contains("No unique safe merge base"),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert_eq!(repo.snapshot(), before);
-}
-
-#[test]
-fn test_status_all_fails_closed_for_multiple_merge_bases_without_mutation() {
-    let repo = setup_multiple_merge_bases();
-    repo.create_branch("review-main-develop");
-    repo.git(&[
-        "config",
-        "--local",
-        "branch.review-main-develop.cresca-version",
-        "1",
-    ]);
-    repo.git(&[
-        "config",
-        "--local",
-        "branch.review-main-develop.cresca-target",
-        "main",
-    ]);
-    repo.git(&[
-        "config",
-        "--local",
-        "branch.review-main-develop.cresca-source",
-        "develop",
-    ]);
-    let before = repo.snapshot();
-
-    let output = repo.run_cresca(&["status", "--all"]);
-    assert!(!output.status.success());
-    assert!(
-        String::from_utf8_lossy(&output.stderr).contains("Multiple merge bases"),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert_eq!(repo.snapshot(), before);
-}
-
-#[test]
-fn test_status_all_fails_closed_for_ambiguous_explicit_base_correspondence() {
-    let (repo, _) = setup_linear_range();
-    assert!(repo
-        .run_cresca(&["review", "main", "develop"])
-        .status
-        .success());
-    repo.git(&["add", "-A"]);
-    assert!(repo.run_cresca(&["approve"]).status.success());
-    let previous = repo.rev_parse("HEAD");
-    let tree = repo.rev_parse("HEAD^{tree}");
-    let first_base = repo.rev_parse("origin/main");
-    let second_base = repo.rev_parse("origin/develop");
-    let message = format!(
-        "Ambiguous base fixture\n\nCresca-Review-Base: {first_base}\nCresca-Review-Base: {second_base}"
-    );
-    let ambiguous = repo.git_stdout(&["commit-tree", &tree, "-p", &previous, "-m", &message]);
-    repo.git(&[
-        "update-ref",
-        "refs/heads/review-main-develop",
-        &ambiguous,
-        &previous,
-    ]);
-    repo.git(&["reset", "--hard", &ambiguous]);
-    let before = repo.snapshot();
-
-    let output = repo.run_cresca(&["status", "--all"]);
-    assert!(!output.status.success());
-    assert!(
-        String::from_utf8_lossy(&output.stderr).contains("ambiguous explicit base markers"),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert_eq!(repo.snapshot(), before);
-}
-
-#[test]
-fn test_status_default_excludes_commits_after_stop_at_while_all_includes_them() {
+fn test_status_default_excludes_commits_after_stop_at() {
     let (repo, range) = setup_linear_range();
     assert!(repo
         .run_cresca(&["review", "main", "develop", "--stop-at", &range.c[..8],])
@@ -4339,12 +3927,6 @@ fn test_status_default_excludes_commits_after_stop_at_while_all_includes_them() 
     assert!(current.contains("    - removed-at-c.txt\n"));
     assert!(current.contains("    - shared.txt\n"));
     assert!(!current.contains("    - d.txt\n"));
-    let all = run_status_stdout(&repo, &["status", "--all"]);
-    assert!(all.contains("📋 Review status (full pull request):"));
-    assert!(all.contains("4 file(s), +3 insertion(s), -2 deletion(s)"));
-    for file in ["a.txt", "d.txt", "removed-at-c.txt", "shared.txt"] {
-        assert!(all.contains(&format!("    - {file}\n")));
-    }
 }
 
 #[test]
@@ -4369,15 +3951,10 @@ fn test_status_after_skip_stop_and_partial_approve_excludes_auto_approved_change
     assert!(current.contains("    - removed-at-c.txt\n"));
     assert!(!current.contains("a.txt"));
     assert!(!current.contains("d.txt"));
-    let all = run_status_stdout(&repo, &["status", "--all"]);
-    assert!(all.contains("2 file(s), +1 insertion(s), -1 deletion(s)"));
-    assert!(all.contains("    - d.txt\n"));
-    assert!(all.contains("    - removed-at-c.txt\n"));
-    assert!(!all.contains("a.txt"));
 }
 
 #[test]
-fn test_status_current_range_can_be_complete_while_full_pull_request_remains() {
+fn test_status_current_range_can_be_complete() {
     let (repo, range) = setup_linear_range();
     assert!(repo
         .run_cresca(&["review", "main", "develop", "--stop-at", &range.c[..8],])
@@ -4392,27 +3969,17 @@ fn test_status_current_range_can_be_complete_while_full_pull_request_remains() {
             "  Remaining diff in current review range: 0 file(s), +0 insertion(s), -0 deletion(s)\n",
         )
     );
-    assert_eq!(
-        run_status_stdout(&repo, &["status", "--all"]),
-        concat!(
-            "📋 Review status (full pull request):\n",
-            "  Remaining diff to develop: 1 file(s), +1 insertion(s), -0 deletion(s)\n",
-            "  Files remaining:\n",
-            "    - d.txt\n",
-        )
-    );
 }
 
 #[test]
-fn test_status_help_describes_all_scope() {
+fn test_status_rejects_all_option() {
     let repo = TempGitRepo::new();
-    let output = repo.run_cresca(&["status", "--help"]);
-    assert!(output.status.success());
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("Usage: cresca status [OPTIONS]"));
-    assert!(stdout.contains("--all"));
-    assert!(stdout.contains("full pull request"));
-    assert!(output.stderr.is_empty());
+    let before = repo.snapshot();
+    let output = repo.run_cresca(&["status", "--all"]);
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("unexpected argument '--all'"));
+    assert_eq!(repo.snapshot(), before);
 }
 
 #[test]

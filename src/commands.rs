@@ -4,12 +4,10 @@ use crate::git::{
     ReviewBranchSelectionError, ReviewMetadata, ReviewScope, ReviewScopeError,
 };
 use crate::review::{
-    explicit_review_base, reconstruct_approval_tree, reconstruct_approval_tree_with_env,
-    review_commit_message, unique_merge_base, ReviewError, ReviewPreparation, ReviewTransaction,
+    reconstruct_approval_tree, review_commit_message, unique_merge_base, ReviewError,
+    ReviewPreparation, ReviewTransaction,
 };
-use std::ffi::OsStr;
 use std::ops::Not;
-use std::{fs, path::PathBuf};
 
 struct ReviewPlan {
     metadata: ReviewMetadata,
@@ -480,74 +478,6 @@ pub struct ReviewStatus {
     pub files: Vec<String>,
 }
 
-pub fn get_full_review_status(
-    metadata: &ReviewMetadata,
-    verbose: bool,
-) -> Result<ReviewStatus, ReviewError> {
-    let target = resolve_remote_tracking_branch(&metadata.target, verbose)?;
-    let source = resolve_remote_tracking_branch(&metadata.source, verbose)?;
-    let resolve = |description: &str, revision: &str| -> Result<String, ReviewError> {
-        let output = run_git_command(
-            description,
-            &["rev-parse", "--verify", &format!("{revision}^{{commit}}")],
-            &[],
-            verbose,
-        )?;
-        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
-    };
-    let target_oid = resolve("resolve current review target", &target.tracking_ref)?;
-    let source_oid = resolve("resolve current review source", &source.tracking_ref)?;
-    let review_head = resolve("resolve current review head", "HEAD")?;
-    let new_base = unique_merge_base(&target_oid, &source_oid, verbose)?;
-    let old_base = match explicit_review_base(&review_head, &target_oid, verbose)? {
-        Some(base) => base,
-        None => unique_merge_base(&review_head, &source_oid, verbose)?,
-    };
-
-    let object_path = run_git_command(
-        "locate Git object database",
-        &["rev-parse", "--git-path", "objects"],
-        &[],
-        verbose,
-    )?;
-    let object_path = PathBuf::from(String::from_utf8_lossy(&object_path.stdout).trim());
-    let object_path = if object_path.is_absolute() {
-        object_path
-    } else {
-        ReviewTransaction::repository_root(verbose)?.join(object_path)
-    };
-    let scratch = tempfile::TempDir::new().map_err(|error| {
-        ReviewError::Message(format!(
-            "failed to create temporary status reconstruction area: {error}"
-        ))
-    })?;
-    let scratch_objects = scratch.path().join("objects");
-    fs::create_dir(&scratch_objects).map_err(|error| {
-        ReviewError::Message(format!(
-            "failed to initialize temporary status object database: {error}"
-        ))
-    })?;
-    let env = [
-        ("GIT_OBJECT_DIRECTORY", scratch_objects.as_os_str()),
-        ("GIT_ALTERNATE_OBJECT_DIRECTORIES", object_path.as_os_str()),
-    ];
-    let reconstructed = reconstruct_approval_tree_with_env(
-        &old_base,
-        &new_base,
-        &review_head,
-        verbose,
-        Some(&env),
-    )?;
-    get_review_status_between(
-        &reconstructed.tree_oid,
-        &source_oid,
-        &format!("to {}", metadata.source),
-        verbose,
-        Some(&env),
-    )
-    .map_err(ReviewError::Git)
-}
-
 /// Get review status (remaining diff stats)
 ///
 /// # Arguments
@@ -564,34 +494,21 @@ pub fn get_review_status(
     display_label: &str,
     verbose: bool,
 ) -> Result<ReviewStatus, crate::git::GitCommandError> {
-    get_review_status_between("HEAD", compare_ref, display_label, verbose, None)
+    calculate_review_status_between("HEAD", compare_ref, display_label, verbose)
 }
 
-fn status_git(
-    description: &str,
-    args: &[&str],
-    verbose: bool,
-    env: Option<&[(&str, &OsStr)]>,
-) -> Result<std::process::Output, crate::git::GitCommandError> {
-    match env {
-        Some(env) => crate::git::run_git_command_with_env(description, args, env, &[], verbose),
-        None => run_git_command(description, args, &[], verbose),
-    }
-}
-
-fn get_review_status_between(
+fn calculate_review_status_between(
     review_ref: &str,
     compare_ref: &str,
     display_label: &str,
     verbose: bool,
-    env: Option<&[(&str, &OsStr)]>,
 ) -> Result<ReviewStatus, crate::git::GitCommandError> {
     // Get diff stats summary (use HEAD..branch for direct comparison, not HEAD...branch)
-    let stat_output = status_git(
+    let stat_output = run_git_command(
         "get diff stats",
         &["diff", "--stat", review_ref, compare_ref],
+        &[],
         verbose,
-        env,
     )?;
     let stat_str = String::from_utf8_lossy(&stat_output.stdout);
 
@@ -620,11 +537,11 @@ fn get_review_status_between(
     }
 
     // Get list of changed files
-    let files_output = status_git(
+    let files_output = run_git_command(
         "get changed files",
         &["diff", "--name-only", review_ref, compare_ref],
+        &[],
         verbose,
-        env,
     )?;
     let files: Vec<String> = String::from_utf8_lossy(&files_output.stdout)
         .lines()

@@ -5,7 +5,7 @@ mod review;
 use clap::builder::styling::{AnsiColor, Effects};
 use clap::{builder::Styles, ArgAction, Args, Parser, Subcommand};
 use colored::Colorize;
-use commands::{approve_changes, get_full_review_status, get_review_status, prepare_review_branch};
+use commands::{approve_changes, get_review_status, prepare_review_branch};
 use git::{
     current_branch_name, current_review_metadata, read_review_scope, ReviewMetadata,
     ReviewMetadataError, ReviewScopeError,
@@ -65,14 +65,7 @@ enum Commands {
     /// Prepare a review branch.
     Review(ReviewArgs),
     /// Show remaining diff statistics.
-    Status(StatusArgs),
-}
-
-#[derive(Args)]
-struct StatusArgs {
-    /// Show unapproved changes across the full pull request.
-    #[arg(long)]
-    all: bool,
+    Status,
 }
 
 #[derive(Args)]
@@ -128,29 +121,20 @@ fn run() -> Result<(), CliError> {
                 println!("Review branch prepared successfully. Stage the changes you have reviewed and run `{}` to approve them.", "cresca approve".green());
             }
         }
-        Commands::Status(args) => {
+        Commands::Status => {
             let metadata = match current_review_metadata(cli.verbose) {
                 Ok(metadata) => metadata,
                 Err(ReviewMetadataError::Git(error)) => return Err(error.into()),
                 Err(error) => exit_invalid_review_branch(error),
             };
-            let (heading, status) = if args.all {
-                (
-                    "full pull request",
-                    get_full_review_status(&metadata, cli.verbose)?,
-                )
-            } else {
-                let branch = current_branch_name(cli.verbose)?;
-                let scope = match read_review_scope(&branch, cli.verbose) {
-                    Ok(scope) => scope,
-                    Err(ReviewScopeError::Git(error)) => return Err(error.into()),
-                    Err(error) => exit_invalid_review_scope(error, &metadata),
-                };
-                let status =
-                    get_review_status(&scope.end_oid, "in current review range", cli.verbose)?;
-                ("current range", status)
+            let branch = current_branch_name(cli.verbose)?;
+            let scope = match read_review_scope(&branch, cli.verbose) {
+                Ok(scope) => scope,
+                Err(ReviewScopeError::Git(error)) => return Err(error.into()),
+                Err(error) => exit_invalid_review_scope(error, &metadata),
             };
-            println!("📋 Review status ({}):", heading);
+            let status = get_review_status(&scope.end_oid, "in current review range", cli.verbose)?;
+            println!("📋 Review status (current range):");
             println!(
                 "  Remaining diff {}: {} file(s), {} insertion(s), {} deletion(s)",
                 status.display_label,
@@ -230,7 +214,7 @@ fn exit_invalid_review_scope(error: ReviewScopeError, metadata: &ReviewMetadata)
         }
     };
     eprintln!(
-        "{}: Cannot show current review range because {}. Rerun `cresca review {} {}` to record the range. `cresca status --all` is still available.",
+        "{}: Cannot show current review range because {}. Rerun `cresca review {} {}` to record the range.",
         "error".red().bold(),
         reason,
         metadata.target,

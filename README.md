@@ -72,12 +72,6 @@ Use `git log --oneline main..develop` to see available commits.
 cresca status
 ```
 
-Use `--all` to include unapproved changes after that range and show the remaining diff across the full pull request:
-
-```sh
-cresca status --all
-```
-
 ## License
 
 [MIT](https://github.com/Lfu001/cresca/blob/main/LICENSE)
