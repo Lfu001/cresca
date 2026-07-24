@@ -1,6 +1,5 @@
 use crate::git::{run_git_command, run_git_command_with_env, GitCommandError};
 use std::collections::{BTreeMap, BTreeSet};
-use std::ffi::OsStr;
 use std::fs;
 use std::io::{self, Read};
 use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
@@ -18,8 +17,6 @@ pub struct ReconstructionOutcome {
     pub downgraded_paths: Vec<String>,
 }
 
-const REVIEW_BASE_TRAILER: &str = "Cresca-Review-Base: ";
-
 #[derive(Debug)]
 pub enum ReviewError {
     Git(GitCommandError),
@@ -36,7 +33,11 @@ impl From<GitCommandError> for ReviewError {
     }
 }
 
-pub fn unique_merge_base(left: &str, right: &str, verbose: bool) -> Result<String, ReviewError> {
+pub fn find_unique_merge_base(
+    left: &str,
+    right: &str,
+    verbose: bool,
+) -> Result<String, ReviewError> {
     let output = run_git_command(
         "get unique merge base",
         &["merge-base", "--all", left, right],
@@ -57,70 +58,6 @@ pub fn unique_merge_base(left: &str, right: &str, verbose: bool) -> Result<Strin
             "Multiple merge bases exist between `{left}` and `{right}`; refusing to guess approval history."
         ))),
     }
-}
-
-pub fn explicit_review_base(
-    review_head: &str,
-    current_target: &str,
-    verbose: bool,
-) -> Result<Option<String>, ReviewError> {
-    let excluded_target = format!("^{current_target}");
-    let output = run_git_command(
-        "find explicit review base",
-        &[
-            "log",
-            "--first-parent",
-            "--format=%B%x00",
-            review_head,
-            &excluded_target,
-        ],
-        &[],
-        verbose,
-    )?;
-    for message in output.stdout.split(|byte| *byte == 0) {
-        let message = std::str::from_utf8(message).map_err(|_| {
-            ReviewError::Message(
-                "Review history contains a non-UTF-8 commit message; refusing to infer its approval base."
-                    .to_string(),
-            )
-        })?;
-        let markers: Vec<_> = message
-            .lines()
-            .filter_map(|line| line.strip_prefix(REVIEW_BASE_TRAILER))
-            .collect();
-        if markers.is_empty() {
-            continue;
-        }
-        let [base] = markers.as_slice() else {
-            return Err(ReviewError::Message(
-                "Review history contains ambiguous explicit base markers.".to_string(),
-            ));
-        };
-        if base.len() != 40 || !base.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-            return Err(ReviewError::Message(
-                "Review history contains an invalid explicit base marker.".to_string(),
-            ));
-        }
-        let revision = format!("{base}^{{commit}}");
-        let resolved = run_git_command(
-            "validate explicit review base",
-            &["rev-parse", "--verify", &revision],
-            &[],
-            verbose,
-        )?;
-        let resolved = String::from_utf8_lossy(&resolved.stdout).trim().to_string();
-        if resolved != *base {
-            return Err(ReviewError::Message(
-                "Review history explicit base marker does not resolve exactly.".to_string(),
-            ));
-        }
-        return Ok(Some((*base).to_string()));
-    }
-    Ok(None)
-}
-
-pub fn review_commit_message(subject: &str, base: &str) -> String {
-    format!("{subject}\n\n{REVIEW_BASE_TRAILER}{base}")
 }
 
 fn parse_merge_tree_output(stdout: &[u8]) -> Result<(Option<String>, Vec<String>), ReviewError> {
@@ -152,31 +89,25 @@ fn parse_merge_tree_output(stdout: &[u8]) -> Result<(Option<String>, Vec<String>
     Ok((tree, paths))
 }
 
-fn reconstruction_git(
+fn run_reconstruction_git_command(
     description: &str,
     args: &[&str],
     allowed_exit_codes: &[i32],
     verbose: bool,
-    env: Option<&[(&str, &OsStr)]>,
 ) -> Result<std::process::Output, GitCommandError> {
-    match env {
-        Some(env) => run_git_command_with_env(description, args, env, allowed_exit_codes, verbose),
-        None => run_git_command(description, args, allowed_exit_codes, verbose),
-    }
+    run_git_command(description, args, allowed_exit_codes, verbose)
 }
 
-fn tree_entry(
+fn read_tree_entry(
     revision: &str,
     path: &str,
     verbose: bool,
-    env: Option<&[(&str, &OsStr)]>,
 ) -> Result<Option<(String, String)>, ReviewError> {
-    let output = reconstruction_git(
+    let output = run_reconstruction_git_command(
         "inspect reconstruction tree entry",
         &["--literal-pathspecs", "ls-tree", "-z", revision, "--", path],
         &[],
         verbose,
-        env,
     )?;
     if output.stdout.is_empty() {
         return Ok(None);
@@ -201,17 +132,15 @@ fn tree_entry(
     Ok(Some((mode, oid)))
 }
 
-fn tree_entries(
+fn read_tree_entries(
     revision: &str,
     verbose: bool,
-    env: Option<&[(&str, &OsStr)]>,
 ) -> Result<BTreeMap<Vec<u8>, (String, String)>, ReviewError> {
-    let output = reconstruction_git(
+    let output = run_reconstruction_git_command(
         "inspect reconstruction tree",
         &["ls-tree", "-rz", revision],
         &[],
         verbose,
-        env,
     )?;
     let mut entries = BTreeMap::new();
     for record in output.stdout.split(|byte| *byte == 0) {
@@ -241,11 +170,10 @@ fn tree_entries(
     Ok(entries)
 }
 
-fn ambiguous_exact_rename_paths(
+fn find_ambiguous_exact_rename_paths(
     old_base: &str,
     old_review: &str,
     verbose: bool,
-    env: Option<&[(&str, &OsStr)]>,
 ) -> Result<Vec<String>, ReviewError> {
     let correspondence_key = |entry: &(String, String)| {
         let compatible_type = if entry.0 == "100644" || entry.0 == "100755" {
@@ -255,8 +183,8 @@ fn ambiguous_exact_rename_paths(
         };
         (compatible_type, entry.1.clone())
     };
-    let base = tree_entries(old_base, verbose, env)?;
-    let review = tree_entries(old_review, verbose, env)?;
+    let base = read_tree_entries(old_base, verbose)?;
+    let review = read_tree_entries(old_review, verbose)?;
     let mut removed: BTreeMap<(String, String), Vec<&[u8]>> = BTreeMap::new();
     let mut added: BTreeMap<(String, String), Vec<&[u8]>> = BTreeMap::new();
     for (path, entry) in &base {
@@ -300,17 +228,12 @@ fn ambiguous_exact_rename_paths(
         .collect()
 }
 
-fn is_binary_blob(
-    oid: &str,
-    verbose: bool,
-    env: Option<&[(&str, &OsStr)]>,
-) -> Result<bool, ReviewError> {
-    let output = reconstruction_git(
+fn is_binary_blob(oid: &str, verbose: bool) -> Result<bool, ReviewError> {
+    let output = run_reconstruction_git_command(
         "inspect conflicting blob",
         &["cat-file", "blob", oid],
         &[],
         verbose,
-        env,
     )?;
     Ok(output.stdout.contains(&0))
 }
@@ -321,24 +244,23 @@ fn text_conflict_can_keep_hunks(
     old_review: &str,
     path: &str,
     verbose: bool,
-    env: Option<&[(&str, &OsStr)]>,
 ) -> Result<bool, ReviewError> {
-    let Some(old) = tree_entry(old_base, path, verbose, env)? else {
+    let Some(old) = read_tree_entry(old_base, path, verbose)? else {
         return Ok(false);
     };
-    let Some(new) = tree_entry(new_base, path, verbose, env)? else {
+    let Some(new) = read_tree_entry(new_base, path, verbose)? else {
         return Ok(false);
     };
-    let Some(review) = tree_entry(old_review, path, verbose, env)? else {
+    let Some(review) = read_tree_entry(old_review, path, verbose)? else {
         return Ok(false);
     };
     let regular = |mode: &str| mode == "100644" || mode == "100755";
     if old.0 != new.0 || old.0 != review.0 || !regular(&old.0) {
         return Ok(false);
     }
-    Ok(!is_binary_blob(&old.1, verbose, env)?
-        && !is_binary_blob(&new.1, verbose, env)?
-        && !is_binary_blob(&review.1, verbose, env)?)
+    Ok(!is_binary_blob(&old.1, verbose)?
+        && !is_binary_blob(&new.1, verbose)?
+        && !is_binary_blob(&review.1, verbose)?)
 }
 
 pub fn reconstruct_approval_tree(
@@ -347,17 +269,7 @@ pub fn reconstruct_approval_tree(
     old_review: &str,
     verbose: bool,
 ) -> Result<ReconstructionOutcome, ReviewError> {
-    reconstruct_approval_tree_with_env(old_base, new_base, old_review, verbose, None)
-}
-
-pub fn reconstruct_approval_tree_with_env(
-    old_base: &str,
-    new_base: &str,
-    old_review: &str,
-    verbose: bool,
-    env: Option<&[(&str, &OsStr)]>,
-) -> Result<ReconstructionOutcome, ReviewError> {
-    let diagnostic = reconstruction_git(
+    let diagnostic = run_reconstruction_git_command(
         "identify approval reconstruction conflicts",
         &[
             "merge-tree",
@@ -372,7 +284,6 @@ pub fn reconstruct_approval_tree_with_env(
         ],
         &[1],
         verbose,
-        env,
     )?;
     let (_, conflict_paths) = parse_merge_tree_output(&diagnostic.stdout)?;
     if diagnostic.status.code() == Some(1) && conflict_paths.is_empty() {
@@ -382,7 +293,7 @@ pub fn reconstruct_approval_tree_with_env(
         ));
     }
 
-    let merged = reconstruction_git(
+    let merged = run_reconstruction_git_command(
         "reconstruct approved tree",
         &[
             "merge-tree",
@@ -396,7 +307,6 @@ pub fn reconstruct_approval_tree_with_env(
         ],
         &[1],
         verbose,
-        env,
     )?;
     let tree_oid = String::from_utf8_lossy(&merged.stdout)
         .lines()
@@ -410,13 +320,13 @@ pub fn reconstruct_approval_tree_with_env(
         ));
     }
 
-    let mut downgraded = ambiguous_exact_rename_paths(old_base, new_base, verbose, env)?;
-    downgraded.extend(ambiguous_exact_rename_paths(
-        old_base, old_review, verbose, env,
+    let mut downgraded = find_ambiguous_exact_rename_paths(old_base, new_base, verbose)?;
+    downgraded.extend(find_ambiguous_exact_rename_paths(
+        old_base, old_review, verbose,
     )?);
     for path in &conflict_paths {
         if merged.status.code() == Some(1)
-            || !text_conflict_can_keep_hunks(old_base, new_base, old_review, path, verbose, env)?
+            || !text_conflict_can_keep_hunks(old_base, new_base, old_review, path, verbose)?
         {
             downgraded.push(path.clone());
         }
@@ -434,9 +344,7 @@ pub fn reconstruct_approval_tree_with_env(
         ReviewError::Message(format!("failed to create scratch index: {error}"))
     })?;
     let index = scratch.path().join("index");
-    let mut scratch_env: Vec<(&str, &OsStr)> = env.unwrap_or_default().to_vec();
-    scratch_env.retain(|(key, _)| *key != "GIT_INDEX_FILE");
-    scratch_env.push(("GIT_INDEX_FILE", index.as_os_str()));
+    let scratch_env = [("GIT_INDEX_FILE", index.as_os_str())];
     run_git_command_with_env(
         "load reconstructed tree into scratch index",
         &["read-tree", &tree_oid],

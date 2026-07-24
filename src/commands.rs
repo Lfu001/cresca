@@ -4,8 +4,8 @@ use crate::git::{
     ReviewBranchSelectionError, ReviewMetadata, ReviewScope, ReviewScopeError,
 };
 use crate::review::{
-    reconstruct_approval_tree, review_commit_message, unique_merge_base, ReviewError,
-    ReviewPreparation, ReviewTransaction,
+    find_unique_merge_base, reconstruct_approval_tree, ReviewError, ReviewPreparation,
+    ReviewTransaction,
 };
 use std::ops::Not;
 
@@ -98,7 +98,7 @@ fn prepare_review_plan(
         &resolved_to.remote_branch,
         verbose,
     )?;
-    let new_base = unique_merge_base(&tracking_to, &endpoint, verbose)?;
+    let new_base = find_unique_merge_base(&tracking_to, &endpoint, verbose)?;
 
     let valid_commits = run_git_command(
         "get valid commit range",
@@ -303,7 +303,7 @@ fn merge_auto_approved_tree(
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
-fn commit_tree(
+fn create_commit_from_tree(
     description: &str,
     tree: &str,
     parent: &str,
@@ -374,18 +374,18 @@ fn apply_review_plan(plan: ReviewPlan, verbose: bool) -> Result<ReviewPreparatio
     }
 
     let new_review = if !is_new || auto_approve_parent.is_some() {
-        let subject = if is_new {
+        let message = if is_new {
             "Auto-approve earlier commits"
         } else {
             "Reconstruct approved changes"
         };
-        let message = review_commit_message(subject, &new_base);
         let description = if is_new {
             "commit auto-approved changes"
         } else {
             "commit reconstructed approved tree"
         };
-        let commit = commit_tree(description, &approved_tree, &parent, &message, verbose)?;
+        let commit =
+            create_commit_from_tree(description, &approved_tree, &parent, message, verbose)?;
         run_git_command(
             "update review ref to reconstructed approval",
             &[
