@@ -160,7 +160,7 @@ fn prepare_review_plan(
     }
 
     let scope = ReviewScope {
-        base_oid: Some(new_base.clone()),
+        base_oid: new_base.clone(),
         end_oid: endpoint,
     };
 
@@ -199,21 +199,13 @@ fn prepare_review_plan(
             )
             .trim()
             .to_string();
-            let old_base = match read_review_scope(branch, verbose) {
-                Ok(saved) => match saved.base_oid {
-                    Some(base) => base,
-                    None => unique_merge_base(&old_review, &saved.end_oid, verbose)?,
-                },
-                Err(ReviewScopeError::Missing) => {
-                    unique_merge_base(&old_review, &tracking_from, verbose)?
-                }
-                Err(ReviewScopeError::Git(error)) => return Err(error.into()),
-                Err(error) => {
-                    return Err(ReviewError::Message(format!(
-                        "Cannot safely migrate existing review range metadata: {error:?}"
-                    )))
-                }
-            };
+            let saved = read_review_scope(branch, verbose).map_err(|error| match error {
+                ReviewScopeError::Git(error) => ReviewError::Git(error),
+                error => ReviewError::Message(format!(
+                    "Cannot read existing review range metadata: {error:?}"
+                )),
+            })?;
+            let old_base = saved.base_oid;
             (Some(old_review), Some(old_base))
         }
     };

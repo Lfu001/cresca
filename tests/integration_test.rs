@@ -507,7 +507,8 @@ fn test_fatal_upstream_probe_is_rendered_without_mutation() {
 #[test]
 fn test_fatal_scope_object_probe_is_rendered_without_mutation() {
     let repo = setup_identity_only_review_branch();
-    let scope = format!("1:{}", repo.rev_parse("HEAD"));
+    let endpoint = repo.rev_parse("HEAD");
+    let scope = format!("1:{endpoint}:{endpoint}");
     repo.git(&[
         "config",
         "--local",
@@ -1156,7 +1157,7 @@ fn test_review_records_source_tip_as_full_scope_end_without_stop_at() {
     );
     assert_eq!(
         repo.review_scope_values("review-main-develop"),
-        vec![format!("2:{}:{}", range.base, range.d)]
+        vec![format!("1:{}:{}", range.base, range.d)]
     );
 }
 
@@ -1171,7 +1172,7 @@ fn test_review_records_stop_at_as_full_scope_end() {
     );
     assert_eq!(
         repo.review_scope_values("review-main-develop"),
-        vec![format!("2:{}:{}", range.base, range.c)]
+        vec![format!("1:{}:{}", range.base, range.c)]
     );
 }
 
@@ -1194,7 +1195,7 @@ fn test_review_scope_end_is_independent_of_skip_to() {
     );
     assert_eq!(
         repo.review_scope_values("review-main-develop"),
-        vec![format!("2:{}:{}", range.base, range.c)]
+        vec![format!("1:{}:{}", range.base, range.c)]
     );
 }
 
@@ -1215,7 +1216,7 @@ fn test_successful_rereview_replaces_scope_end() {
     );
     assert_eq!(
         repo.review_scope_values("review-main-develop"),
-        vec![format!("2:{}:{}", range.base, range.d)]
+        vec![format!("1:{}:{}", range.base, range.d)]
     );
 }
 
@@ -1229,7 +1230,7 @@ fn test_failed_rereview_preserves_previous_scope_end() {
     repo.git(&["add", "-A"]);
     assert!(repo.run_cresca(&["approve"]).status.success());
     let before = repo.review_scope_values("review-main-develop");
-    assert_eq!(before, vec![format!("2:{}:{}", range.base, range.c)]);
+    assert_eq!(before, vec![format!("1:{}:{}", range.base, range.c)]);
     let output = repo.run_cresca(&["review", "main", "develop", "--stop-at", "does-not-exist"]);
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -1238,7 +1239,7 @@ fn test_failed_rereview_preserves_previous_scope_end() {
 }
 
 #[test]
-fn test_rereview_migrates_version_one_scope_to_explicit_base() {
+fn test_rereview_rejects_legacy_scope_shape_without_mutation() {
     let (repo, range) = setup_linear_range();
     assert!(repo
         .run_cresca(&["review", "main", "develop", "--stop-at", &range.c[..8]])
@@ -1253,35 +1254,23 @@ fn test_rereview_migrates_version_one_scope_to_explicit_base() {
         &format!("1:{}", range.c),
     ]);
 
+    let before = repo.snapshot();
     let output = repo.run_cresca(&["review", "main", "develop"]);
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert_eq!(
-        repo.review_scope_values("review-main-develop"),
-        vec![format!("2:{}:{}", range.base, range.d)]
-    );
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr)
+        .contains("Cannot read existing review range metadata: Invalid"));
+    assert_eq!(repo.snapshot(), before);
 }
 
 #[test]
-fn test_existing_identity_review_without_scope_migrates_only_from_unique_base() {
+fn test_rereview_requires_scope_metadata_without_mutation() {
     let repo = setup_identity_only_review_branch();
-    let old_head = repo.rev_parse("HEAD");
-
+    let before = repo.snapshot();
     let output = repo.run_cresca(&["review", "main", "develop"]);
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let endpoint = repo.rev_parse("origin/develop");
-    assert_eq!(repo.rev_parse("HEAD^"), old_head);
-    assert_eq!(
-        repo.review_scope_values("review-main-develop"),
-        vec![format!("2:{old_head}:{endpoint}")]
-    );
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr)
+        .contains("Cannot read existing review range metadata: Missing"));
+    assert_eq!(repo.snapshot(), before);
 }
 
 fn assert_review_matches(
@@ -1935,7 +1924,7 @@ fn test_rereview_reconstructs_approved_tree_after_target_update_and_source_rebas
     assert!(repo.worktree_diff().is_empty());
     assert_eq!(
         repo.review_scope_values("review-main-develop"),
-        vec![format!("2:{new_base}:{endpoint}")]
+        vec![format!("1:{new_base}:{endpoint}")]
     );
 }
 
@@ -3798,7 +3787,8 @@ fn test_status_requires_scope_metadata_for_pr12_identity() {
 #[test]
 fn test_status_rejects_duplicate_scope_values() {
     let repo = setup_identity_only_review_branch();
-    let value = format!("1:{}", repo.rev_parse("HEAD"));
+    let endpoint = repo.rev_parse("HEAD");
+    let value = format!("1:{endpoint}:{endpoint}");
     repo.git(&[
         "config",
         "--local",
@@ -3817,26 +3807,41 @@ fn test_status_rejects_duplicate_scope_values() {
 }
 
 #[test]
-fn test_status_rejects_unsupported_scope_version() {
+fn test_status_rejects_legacy_scope_shape() {
     let repo = setup_identity_only_review_branch();
-    let value = format!("3:{}", repo.rev_parse("HEAD"));
+    let value = format!("1:{}", repo.rev_parse("HEAD"));
     repo.git(&[
         "config",
         "--local",
         "branch.review-main-develop.cresca-scope",
         &value,
     ]);
-    assert_scope_error_preserves_state(&repo, "range metadata version '3' is unsupported");
+    assert_scope_error_preserves_state(&repo, "range metadata is invalid");
+}
+
+#[test]
+fn test_status_rejects_version_two_scope() {
+    let repo = setup_identity_only_review_branch();
+    let endpoint = repo.rev_parse("HEAD");
+    let value = format!("2:{endpoint}:{endpoint}");
+    repo.git(&[
+        "config",
+        "--local",
+        "branch.review-main-develop.cresca-scope",
+        &value,
+    ]);
+    assert_scope_error_preserves_state(&repo, "range metadata version '2' is unsupported");
 }
 
 #[test]
 fn test_status_rejects_malformed_scope_oid() {
     let repo = setup_identity_only_review_branch();
+    let endpoint = repo.rev_parse("HEAD");
     repo.git(&[
         "config",
         "--local",
         "branch.review-main-develop.cresca-scope",
-        "1:not-an-oid",
+        &format!("1:{endpoint}:not-an-oid"),
     ]);
     assert_scope_error_preserves_state(&repo, "range metadata is invalid");
 }
@@ -3845,7 +3850,7 @@ fn test_status_rejects_malformed_scope_oid() {
 fn test_status_rejects_abbreviated_scope_oid() {
     let repo = setup_identity_only_review_branch();
     let head = repo.rev_parse("HEAD");
-    let value = format!("1:{}", &head[..8]);
+    let value = format!("1:{}:{head}", &head[..8]);
     repo.git(&[
         "config",
         "--local",
@@ -3859,7 +3864,7 @@ fn test_status_rejects_abbreviated_scope_oid() {
 fn test_status_rejects_unavailable_scope_commit() {
     let repo = setup_identity_only_review_branch();
     let oid = "0000000000000000000000000000000000000000";
-    let value = format!("1:{oid}");
+    let value = format!("1:{}:{oid}", repo.rev_parse("HEAD"));
     repo.git(&[
         "config",
         "--local",
@@ -3873,7 +3878,7 @@ fn test_status_rejects_unavailable_scope_commit() {
 }
 
 #[test]
-fn test_status_reports_missing_version_two_base_oid() {
+fn test_status_reports_missing_scope_base_oid() {
     let repo = setup_identity_only_review_branch();
     let missing_base = "0000000000000000000000000000000000000000";
     let endpoint = repo.rev_parse("HEAD");
@@ -3881,7 +3886,7 @@ fn test_status_reports_missing_version_two_base_oid() {
         "config",
         "--local",
         "branch.review-main-develop.cresca-scope",
-        &format!("2:{missing_base}:{endpoint}"),
+        &format!("1:{missing_base}:{endpoint}"),
     ]);
     assert_scope_error_preserves_state(
         &repo,

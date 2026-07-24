@@ -13,7 +13,7 @@ pub struct GitCommandError {
 }
 
 pub const REVIEW_METADATA_VERSION: &str = "1";
-pub const REVIEW_SCOPE_VERSION: &str = "2";
+pub const REVIEW_SCOPE_VERSION: &str = "1";
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct ReviewMetadata {
@@ -23,7 +23,7 @@ pub struct ReviewMetadata {
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct ReviewScope {
-    pub base_oid: Option<String>,
+    pub base_oid: String,
     pub end_oid: String,
 }
 
@@ -272,11 +272,10 @@ pub fn write_review_scope(
     verbose: bool,
 ) -> Result<(), GitCommandError> {
     let key = review_config_key(branch, "scope");
-    let base_oid = scope
-        .base_oid
-        .as_deref()
-        .expect("successful review scopes must include an explicit base");
-    let value = format!("{}:{}:{}", REVIEW_SCOPE_VERSION, base_oid, scope.end_oid);
+    let value = format!(
+        "{}:{}:{}",
+        REVIEW_SCOPE_VERSION, scope.base_oid, scope.end_oid
+    );
     run_git_command(
         "record review range",
         &["config", "--local", "--replace-all", &key, &value],
@@ -294,31 +293,21 @@ pub fn read_review_scope(branch: &str, verbose: bool) -> Result<ReviewScope, Rev
         _ => return Err(ReviewScopeError::Duplicate),
     };
     let mut fields = value.split(':');
-    let Some(version) = fields.next() else {
+    let (Some(version), Some(base_oid), Some(end_oid), None) =
+        (fields.next(), fields.next(), fields.next(), fields.next())
+    else {
         return Err(ReviewScopeError::Invalid);
     };
-    let (base_oid, end_oid) = match version {
-        "1" => (None, fields.next()),
-        REVIEW_SCOPE_VERSION => (fields.next(), fields.next()),
-        _ => return Err(ReviewScopeError::UnsupportedVersion(version.to_string())),
-    };
-    if fields.next().is_some() {
-        return Err(ReviewScopeError::Invalid);
+    if version != REVIEW_SCOPE_VERSION {
+        return Err(ReviewScopeError::UnsupportedVersion(version.to_string()));
     }
-    let Some(end_oid) = end_oid else {
-        return Err(ReviewScopeError::Invalid);
-    };
     let valid_oid = |oid: &str| {
         !oid.is_empty() && oid.len() == 40 && oid.bytes().all(|byte| byte.is_ascii_hexdigit())
     };
-    if !valid_oid(end_oid) || base_oid.is_some_and(|oid| !valid_oid(oid)) {
+    if !valid_oid(base_oid) || !valid_oid(end_oid) {
         return Err(ReviewScopeError::Invalid);
     }
-    let mut revisions = String::new();
-    if let Some(base_oid) = base_oid {
-        revisions.push_str(&format!("{base_oid}^{{commit}}\n"));
-    }
-    revisions.push_str(&format!("{end_oid}^{{commit}}\n"));
+    let revisions = format!("{base_oid}^{{commit}}\n{end_oid}^{{commit}}\n");
     let output = run_git_command_with_input(
         "validate review range endpoint",
         &["cat-file", "--batch-check=%(objectname)"],
@@ -331,7 +320,7 @@ pub fn read_review_scope(branch: &str, verbose: bool) -> Result<ReviewScope, Rev
         .lines()
         .map(str::to_owned)
         .collect();
-    let expected: Vec<_> = base_oid.into_iter().chain([end_oid]).collect();
+    let expected = [base_oid, end_oid];
     if let Some((_, missing_oid)) = results
         .iter()
         .zip(&expected)
@@ -345,7 +334,7 @@ pub fn read_review_scope(branch: &str, verbose: bool) -> Result<ReviewScope, Rev
         return Err(ReviewScopeError::Invalid);
     }
     Ok(ReviewScope {
-        base_oid: base_oid.map(str::to_string),
+        base_oid: base_oid.to_string(),
         end_oid: end_oid.to_string(),
     })
 }
