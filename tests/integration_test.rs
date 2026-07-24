@@ -30,6 +30,21 @@ fn real_git_path() -> String {
         .to_string()
 }
 
+fn set_gitlink(repo: &TempGitRepo, path: &str, oid: &str) {
+    repo.git(&["update-index", "--add", "--cacheinfo", "160000", oid, path]);
+}
+
+fn remove_index_entry(repo: &TempGitRepo, path: &str) {
+    repo.git(&["update-index", "--force-remove", path]);
+}
+
+fn materialize_uninitialized_gitlinks(repo: &TempGitRepo, paths: &[&str]) {
+    for path in paths {
+        std::fs::create_dir_all(repo.path().join(path))
+            .expect("uninitialized Gitlink directory should be creatable");
+    }
+}
+
 fn run_cresca_with_git_wrapper(
     repo: &TempGitRepo,
     wrapper: &tempfile::TempDir,
@@ -1917,6 +1932,17 @@ fn test_rereview_reconstructs_approved_tree_after_target_update_and_source_rebas
     );
     assert_eq!(repo.rev_parse("HEAD^"), old_review_head);
     assert_eq!(
+        repo.git_stdout(&["rev-list", "--parents", "-n", "1", "HEAD"])
+            .split_whitespace()
+            .count(),
+        2,
+        "a reconstructed review commit must have exactly one parent"
+    );
+    assert_eq!(
+        repo.git_stdout(&["show", "-s", "--format=%B", "HEAD"]),
+        "Reconstruct approved changes"
+    );
+    assert_eq!(
         repo.rev_parse("HEAD^{tree}"),
         repo.rev_parse(&format!("{endpoint}^{{tree}}"))
     );
@@ -2418,6 +2444,198 @@ fn test_rereview_downgrades_target_side_ambiguous_identical_rename() {
         "unrelated approved content"
     );
     assert_eq!(repo.worktree_diff(), repo.diff("HEAD", &endpoint));
+}
+
+#[test]
+fn test_rereview_does_not_transfer_approval_through_ambiguous_identical_gitlink_rename() {
+    let repo = TempGitRepo::new();
+    let original_gitlink = repo.rev_parse("HEAD");
+    repo.git(&[
+        "commit",
+        "--allow-empty",
+        "-m",
+        "Create alternate Gitlink object",
+    ]);
+    let alternate_gitlink = repo.rev_parse("HEAD");
+    set_gitlink(&repo, "review-left", &original_gitlink);
+    set_gitlink(&repo, "review-right", &original_gitlink);
+    repo.commit("Add identical review-side Gitlink candidates");
+    let old_base = repo.rev_parse("HEAD");
+    repo.git(&["push", "origin", "main"]);
+
+    repo.create_branch("develop");
+    remove_index_entry(&repo, "review-left");
+    remove_index_entry(&repo, "review-right");
+    set_gitlink(&repo, "review-renamed", &original_gitlink);
+    repo.write_file("unrelated-approved.txt", "unrelated approved content\n");
+    repo.git(&["add", "unrelated-approved.txt"]);
+    repo.commit("Approve ambiguous review-side Gitlink rename");
+    repo.git(&["push", "-u", "origin", "develop"]);
+    repo.switch_branch("main");
+    materialize_uninitialized_gitlinks(&repo, &["review-left", "review-right"]);
+    let first_review = repo.run_cresca(&["review", "main", "develop"]);
+    assert!(
+        first_review.status.success(),
+        "repository status after initial review failure: {}\nstdout: {}\nstderr: {}",
+        repo.git_stdout(&["status", "--porcelain"]),
+        String::from_utf8_lossy(&first_review.stdout),
+        String::from_utf8_lossy(&first_review.stderr)
+    );
+    remove_index_entry(&repo, "review-left");
+    remove_index_entry(&repo, "review-right");
+    set_gitlink(&repo, "review-renamed", &original_gitlink);
+    repo.git(&["add", "unrelated-approved.txt"]);
+    assert!(repo.run_cresca(&["approve"]).status.success());
+
+    repo.switch_branch("main");
+    set_gitlink(&repo, "review-left", &alternate_gitlink);
+    set_gitlink(&repo, "review-right", &old_base);
+    repo.commit("Change review-side target Gitlinks");
+    repo.git(&["push", "origin", "main"]);
+    let new_base = repo.rev_parse("HEAD");
+
+    repo.git(&["checkout", "-b", "expected-review-gitlink", &new_base]);
+    repo.write_file("unrelated-approved.txt", "unrelated approved content\n");
+    repo.git(&["add", "unrelated-approved.txt"]);
+    repo.commit("Build expected review-side Gitlink tree");
+    let expected_tree = repo.rev_parse("HEAD^{tree}");
+
+    repo.git(&["checkout", "-B", "develop", &new_base]);
+    remove_index_entry(&repo, "review-left");
+    remove_index_entry(&repo, "review-right");
+    set_gitlink(&repo, "review-renamed", &original_gitlink);
+    repo.write_file("unrelated-approved.txt", "unrelated approved content\n");
+    repo.write_file("later.txt", "unreviewed endpoint content\n");
+    repo.git(&["add", "unrelated-approved.txt", "later.txt"]);
+    repo.commit("Reapply review-side Gitlink rename");
+    let endpoint = repo.rev_parse("HEAD");
+    repo.git(&["push", "--force", "origin", "develop"]);
+    repo.switch_branch("review-main-develop");
+    materialize_uninitialized_gitlinks(&repo, &["review-renamed"]);
+
+    let output = repo.run_cresca(&["review", "main", "develop"]);
+    assert!(
+        output.status.success(),
+        "repository status after rereview failure: {}\nstdout: {}\nstderr: {}",
+        repo.git_stdout(&["status", "--porcelain"]),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(repo.rev_parse("HEAD^{tree}"), expected_tree);
+    assert_eq!(
+        repo.git_stdout(&["ls-tree", "HEAD", "review-left"]),
+        format!("160000 commit {alternate_gitlink}\treview-left")
+    );
+    assert_eq!(
+        repo.git_stdout(&["ls-tree", "HEAD", "review-right"]),
+        format!("160000 commit {old_base}\treview-right")
+    );
+    assert!(repo
+        .git_stdout(&["ls-tree", "HEAD", "review-renamed"])
+        .is_empty());
+    assert_eq!(
+        repo.git_stdout(&["show", "HEAD:unrelated-approved.txt"]),
+        "unrelated approved content"
+    );
+    assert!(repo.cached_diff().is_empty());
+    assert_eq!(
+        repo.git_stdout(&["status", "--porcelain"]),
+        "?? later.txt",
+        "scratch-index reconstruction must not leak into the real index or worktree"
+    );
+    assert_eq!(repo.rev_parse("origin/develop"), endpoint);
+}
+
+#[test]
+fn test_rereview_preserves_target_through_ambiguous_identical_gitlink_rename() {
+    let repo = TempGitRepo::new();
+    let original_gitlink = repo.rev_parse("HEAD");
+    repo.git(&[
+        "commit",
+        "--allow-empty",
+        "-m",
+        "Create modified Gitlink object",
+    ]);
+    let approved_gitlink = repo.rev_parse("HEAD");
+    set_gitlink(&repo, "target-left", &original_gitlink);
+    set_gitlink(&repo, "target-right", &original_gitlink);
+    repo.commit("Add identical target-side Gitlink candidates");
+    repo.git(&["push", "origin", "main"]);
+
+    repo.create_branch("develop");
+    set_gitlink(&repo, "target-left", &approved_gitlink);
+    repo.write_file("unrelated-approved.txt", "unrelated approved content\n");
+    repo.git(&["add", "unrelated-approved.txt"]);
+    repo.commit("Approve target-side Gitlink candidate");
+    repo.git(&["push", "-u", "origin", "develop"]);
+    repo.switch_branch("main");
+    materialize_uninitialized_gitlinks(&repo, &["target-left", "target-right"]);
+    let first_review = repo.run_cresca(&["review", "main", "develop"]);
+    assert!(
+        first_review.status.success(),
+        "repository status after initial review failure: {}\nstdout: {}\nstderr: {}",
+        repo.git_stdout(&["status", "--porcelain"]),
+        String::from_utf8_lossy(&first_review.stdout),
+        String::from_utf8_lossy(&first_review.stderr)
+    );
+    set_gitlink(&repo, "target-left", &approved_gitlink);
+    repo.git(&["add", "unrelated-approved.txt"]);
+    assert!(repo.run_cresca(&["approve"]).status.success());
+
+    repo.switch_branch("main");
+    remove_index_entry(&repo, "target-left");
+    remove_index_entry(&repo, "target-right");
+    set_gitlink(&repo, "target-renamed", &original_gitlink);
+    repo.commit("Ambiguously rename identical target Gitlinks");
+    repo.git(&["push", "origin", "main"]);
+    let new_base = repo.rev_parse("HEAD");
+
+    repo.git(&["checkout", "-b", "expected-target-gitlink", &new_base]);
+    repo.write_file("unrelated-approved.txt", "unrelated approved content\n");
+    repo.git(&["add", "unrelated-approved.txt"]);
+    repo.commit("Build expected target-side Gitlink tree");
+    let expected_tree = repo.rev_parse("HEAD^{tree}");
+
+    repo.git(&["checkout", "-B", "develop", &new_base]);
+    set_gitlink(&repo, "target-renamed", &approved_gitlink);
+    repo.write_file("unrelated-approved.txt", "unrelated approved content\n");
+    repo.write_file("later.txt", "unreviewed endpoint content\n");
+    repo.git(&["add", "unrelated-approved.txt", "later.txt"]);
+    repo.commit("Reapply target-side Gitlink modification");
+    let endpoint = repo.rev_parse("HEAD");
+    repo.git(&["push", "--force", "origin", "develop"]);
+    repo.switch_branch("review-main-develop");
+    materialize_uninitialized_gitlinks(&repo, &["target-left", "target-right"]);
+
+    let output = repo.run_cresca(&["review", "main", "develop"]);
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(repo.rev_parse("HEAD^{tree}"), expected_tree);
+    assert_eq!(
+        repo.git_stdout(&["ls-tree", "HEAD", "target-renamed"]),
+        format!("160000 commit {original_gitlink}\ttarget-renamed")
+    );
+    assert!(repo
+        .git_stdout(&["ls-tree", "HEAD", "target-left"])
+        .is_empty());
+    assert!(repo
+        .git_stdout(&["ls-tree", "HEAD", "target-right"])
+        .is_empty());
+    assert_eq!(
+        repo.git_stdout(&["show", "HEAD:unrelated-approved.txt"]),
+        "unrelated approved content"
+    );
+    assert!(repo.cached_diff().is_empty());
+    assert_eq!(
+        repo.git_stdout(&["status", "--porcelain"]),
+        "?? later.txt",
+        "scratch-index reconstruction must not leak into the real index or worktree"
+    );
+    assert_eq!(repo.rev_parse("origin/develop"), endpoint);
 }
 
 #[test]
@@ -3774,7 +3992,18 @@ fn assert_scope_error_preserves_state(repo: &TempGitRepo, expected_error: &str) 
         stderr.contains(expected_error),
         "unexpected diagnostic: {stderr}"
     );
-    assert!(stderr.contains("cresca review main develop"));
+    assert!(
+        stderr.contains("review branch must be recreated"),
+        "unexpected remediation: {stderr}"
+    );
+    assert!(
+        stderr.contains("Switch away from it, delete it, then run `cresca review main develop`"),
+        "invalid scope remediation must explain how to recreate the branch: {stderr}"
+    );
+    assert!(
+        !stderr.contains("Rerun"),
+        "invalid scope must not advertise a rereview command that cannot succeed: {stderr}"
+    );
     assert_eq!(repo.snapshot(), before);
 }
 

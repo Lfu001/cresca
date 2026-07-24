@@ -159,7 +159,8 @@ fn read_tree_entries(
         let mode = fields.next().unwrap_or_default();
         let kind = fields.next().unwrap_or_default();
         let oid = fields.next().unwrap_or_default();
-        if kind != "blob" || mode.is_empty() || oid.is_empty() {
+        let is_supported_leaf = kind == "blob" || (kind == "commit" && mode == "160000");
+        if !is_supported_leaf || mode.is_empty() || oid.is_empty() {
             continue;
         }
         entries.insert(

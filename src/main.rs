@@ -214,7 +214,7 @@ fn exit_invalid_review_scope(error: ReviewScopeError, metadata: &ReviewMetadata)
         }
     };
     eprintln!(
-        "{}: Cannot show current review range because {}. Rerun `cresca review {} {}` to record the range.",
+        "{}: Cannot show current review range because {}. This review branch must be recreated. Switch away from it, delete it, then run `cresca review {} {}`.",
         "error".red().bold(),
         reason,
         metadata.target,
