@@ -7,8 +7,8 @@ use clap::{builder::Styles, ArgAction, Args, Parser, Subcommand};
 use colored::Colorize;
 use commands::{approve_changes, get_review_status, prepare_review_branch};
 use git::{
-    current_branch_name, current_review_metadata, read_review_scope,
-    resolve_remote_tracking_branch, ReviewMetadata, ReviewMetadataError, ReviewScopeError,
+    current_branch_name, current_review_metadata, read_review_scope, ReviewMetadata,
+    ReviewMetadataError, ReviewScopeError,
 };
 use std::process::exit;
 
@@ -65,14 +65,7 @@ enum Commands {
     /// Prepare a review branch.
     Review(ReviewArgs),
     /// Show remaining diff statistics.
-    Status(StatusArgs),
-}
-
-#[derive(Args)]
-struct StatusArgs {
-    /// Show unapproved changes across the full pull request.
-    #[arg(long)]
-    all: bool,
+    Status,
 }
 
 #[derive(Args)]
@@ -115,47 +108,33 @@ fn run() -> Result<(), CliError> {
             };
         }
         Commands::Review(args) => {
-            let has_unreviewed_changes = prepare_review_branch(
+            let preparation = prepare_review_branch(
                 &args.to,
                 &args.from,
                 args.skip_to.as_deref(),
                 args.stop_at.as_deref(),
                 cli.verbose,
             )?;
-            if !has_unreviewed_changes {
+            if !preparation.has_unreviewed_changes {
                 println!("Review branch prepared successfully. However, it seems like there are no unreviewed changes.");
             } else {
                 println!("Review branch prepared successfully. Stage the changes you have reviewed and run `{}` to approve them.", "cresca approve".green());
             }
         }
-        Commands::Status(args) => {
+        Commands::Status => {
             let metadata = match current_review_metadata(cli.verbose) {
                 Ok(metadata) => metadata,
                 Err(ReviewMetadataError::Git(error)) => return Err(error.into()),
                 Err(error) => exit_invalid_review_branch(error),
             };
-            let (heading, compare_ref, display_label) = if args.all {
-                let resolved = resolve_remote_tracking_branch(&metadata.source, cli.verbose)?;
-                (
-                    "full pull request",
-                    resolved.tracking_ref,
-                    format!("to {}", metadata.source),
-                )
-            } else {
-                let branch = current_branch_name(cli.verbose)?;
-                let scope = match read_review_scope(&branch, cli.verbose) {
-                    Ok(scope) => scope,
-                    Err(ReviewScopeError::Git(error)) => return Err(error.into()),
-                    Err(error) => exit_invalid_review_scope(error, &metadata),
-                };
-                (
-                    "current range",
-                    scope.end_oid,
-                    "in current review range".to_string(),
-                )
+            let branch = current_branch_name(cli.verbose)?;
+            let scope = match read_review_scope(&branch, cli.verbose) {
+                Ok(scope) => scope,
+                Err(ReviewScopeError::Git(error)) => return Err(error.into()),
+                Err(error) => exit_invalid_review_scope(error, &metadata),
             };
-            let status = get_review_status(&compare_ref, &display_label, cli.verbose)?;
-            println!("📋 Review status ({}):", heading);
+            let status = get_review_status(&scope.end_oid, "in current review range", cli.verbose)?;
+            println!("📋 Review status (current range):");
             println!(
                 "  Remaining diff {}: {} file(s), {} insertion(s), {} deletion(s)",
                 status.display_label,
@@ -227,7 +206,7 @@ fn exit_invalid_review_scope(error: ReviewScopeError, metadata: &ReviewMetadata)
         }
         ReviewScopeError::Invalid => "range metadata is invalid".to_string(),
         ReviewScopeError::UnavailableCommit(oid) => {
-            format!("saved range endpoint '{oid}' is unavailable")
+            format!("saved review object '{oid}' is unavailable")
         }
         ReviewScopeError::Git(error) => {
             render_git_error(&error);
@@ -235,7 +214,7 @@ fn exit_invalid_review_scope(error: ReviewScopeError, metadata: &ReviewMetadata)
         }
     };
     eprintln!(
-        "{}: Cannot show current review range because {}. Rerun `cresca review {} {}` to record the range. `cresca status --all` is still available.",
+        "{}: Cannot show current review range because {}. This review branch must be recreated. Switch away from it, delete it, then run `cresca review {} {}`.",
         "error".red().bold(),
         reason,
         metadata.target,

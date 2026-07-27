@@ -30,6 +30,21 @@ fn real_git_path() -> String {
         .to_string()
 }
 
+fn set_gitlink(repo: &TempGitRepo, path: &str, oid: &str) {
+    repo.git(&["update-index", "--add", "--cacheinfo", "160000", oid, path]);
+}
+
+fn remove_index_entry(repo: &TempGitRepo, path: &str) {
+    repo.git(&["update-index", "--force-remove", path]);
+}
+
+fn materialize_uninitialized_gitlinks(repo: &TempGitRepo, paths: &[&str]) {
+    for path in paths {
+        std::fs::create_dir_all(repo.path().join(path))
+            .expect("uninitialized Gitlink directory should be creatable");
+    }
+}
+
 fn run_cresca_with_git_wrapper(
     repo: &TempGitRepo,
     wrapper: &tempfile::TempDir,
@@ -384,7 +399,7 @@ fn test_partial_reconcile_failure_still_restores_independent_paths() {
 }
 
 #[test]
-fn test_successful_review_publishes_fetched_source_for_status_all() {
+fn test_successful_review_publishes_fetched_source_tracking_ref() {
     let (repo, _) = setup_linear_range();
     let stale_source = repo.rev_parse("refs/remotes/origin/develop");
     repo.switch_branch("develop");
@@ -408,8 +423,6 @@ fn test_successful_review_publishes_fetched_source_for_status_all() {
         advanced_source,
         "successful review must publish the source fetched during preflight"
     );
-    let all = run_status_stdout(&repo, &["status", "--all"]);
-    assert!(all.contains("    - advanced-source.txt\n"), "{all}");
 }
 
 #[test]
@@ -509,7 +522,8 @@ fn test_fatal_upstream_probe_is_rendered_without_mutation() {
 #[test]
 fn test_fatal_scope_object_probe_is_rendered_without_mutation() {
     let repo = setup_identity_only_review_branch();
-    let scope = format!("1:{}", repo.rev_parse("HEAD"));
+    let endpoint = repo.rev_parse("HEAD");
+    let scope = format!("1:{endpoint}:{endpoint}");
     repo.git(&[
         "config",
         "--local",
@@ -806,6 +820,49 @@ fn test_review_ref_update_failure_rolls_back_exact_repository_state() {
     assert_eq!(repo.snapshot(), before);
     assert!(!repo.ref_exists("refs/heads/review-main-develop"));
     assert!(!repo.path().join("generated-by-failed-review").exists());
+}
+
+#[test]
+fn test_rereview_merge_tree_failure_preserves_previous_review_exactly() {
+    let repo = TempGitRepo::new();
+    repo.create_branch("develop");
+    repo.write_file("approved.txt", "approved\n");
+    repo.git(&["add", "approved.txt"]);
+    repo.commit("Add approved content");
+    repo.git(&["push", "-u", "origin", "develop"]);
+    repo.switch_branch("main");
+    assert!(repo
+        .run_cresca(&["review", "main", "develop"])
+        .status
+        .success());
+    repo.git(&["add", "approved.txt"]);
+    assert!(repo.run_cresca(&["approve"]).status.success());
+
+    repo.switch_branch("main");
+    repo.write_file("target.txt", "target baseline\n");
+    repo.git(&["add", "target.txt"]);
+    repo.commit("Advance target");
+    repo.git(&["push", "origin", "main"]);
+    repo.git(&["checkout", "-B", "develop", "main"]);
+    repo.write_file("approved.txt", "approved\n");
+    repo.git(&["add", "approved.txt"]);
+    repo.commit("Rebase approved content");
+    repo.git(&["push", "--force", "origin", "develop"]);
+    repo.switch_branch("review-main-develop");
+    let before = repo.snapshot();
+    let wrapper = install_git_wrapper(
+        &repo,
+        "#!/bin/sh\ncase \" $* \" in\n  *' merge-tree '*' -Xours '*)\n    printf 'injected merge-tree stdout\\n'\n    printf 'injected merge-tree failure\\n' >&2\n    exit 63\n    ;;\nesac\nexec \"$CRESCA_REAL_GIT\" \"$@\"\n",
+    );
+
+    let output = run_cresca_with_git_wrapper(&repo, &wrapper, &["review", "main", "develop"]);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("reconstruct approved tree"), "{stderr}");
+    assert!(stderr.contains("injected merge-tree stdout"), "{stderr}");
+    assert!(stderr.contains("injected merge-tree failure"), "{stderr}");
+    assert_eq!(repo.snapshot(), before);
+    assert!(repo.run_cresca(&["status"]).status.success());
 }
 
 #[test]
@@ -1115,7 +1172,7 @@ fn test_review_records_source_tip_as_full_scope_end_without_stop_at() {
     );
     assert_eq!(
         repo.review_scope_values("review-main-develop"),
-        vec![format!("1:{}", range.d)]
+        vec![format!("1:{}:{}", range.base, range.d)]
     );
 }
 
@@ -1130,7 +1187,7 @@ fn test_review_records_stop_at_as_full_scope_end() {
     );
     assert_eq!(
         repo.review_scope_values("review-main-develop"),
-        vec![format!("1:{}", range.c)]
+        vec![format!("1:{}:{}", range.base, range.c)]
     );
 }
 
@@ -1153,7 +1210,7 @@ fn test_review_scope_end_is_independent_of_skip_to() {
     );
     assert_eq!(
         repo.review_scope_values("review-main-develop"),
-        vec![format!("1:{}", range.c)]
+        vec![format!("1:{}:{}", range.base, range.c)]
     );
 }
 
@@ -1174,7 +1231,7 @@ fn test_successful_rereview_replaces_scope_end() {
     );
     assert_eq!(
         repo.review_scope_values("review-main-develop"),
-        vec![format!("1:{}", range.d)]
+        vec![format!("1:{}:{}", range.base, range.d)]
     );
 }
 
@@ -1188,12 +1245,47 @@ fn test_failed_rereview_preserves_previous_scope_end() {
     repo.git(&["add", "-A"]);
     assert!(repo.run_cresca(&["approve"]).status.success());
     let before = repo.review_scope_values("review-main-develop");
-    assert_eq!(before, vec![format!("1:{}", range.c)]);
+    assert_eq!(before, vec![format!("1:{}:{}", range.base, range.c)]);
     let output = repo.run_cresca(&["review", "main", "develop", "--stop-at", "does-not-exist"]);
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("does-not-exist") && stderr.contains("is not in the range"));
     assert_eq!(repo.review_scope_values("review-main-develop"), before);
+}
+
+#[test]
+fn test_rereview_rejects_legacy_scope_shape_without_mutation() {
+    let (repo, range) = setup_linear_range();
+    assert!(repo
+        .run_cresca(&["review", "main", "develop", "--stop-at", &range.c[..8]])
+        .status
+        .success());
+    repo.git(&["add", "-A"]);
+    assert!(repo.run_cresca(&["approve"]).status.success());
+    repo.git(&[
+        "config",
+        "--local",
+        "branch.review-main-develop.cresca-scope",
+        &format!("1:{}", range.c),
+    ]);
+
+    let before = repo.snapshot();
+    let output = repo.run_cresca(&["review", "main", "develop"]);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr)
+        .contains("Cannot read existing review range metadata: Invalid"));
+    assert_eq!(repo.snapshot(), before);
+}
+
+#[test]
+fn test_rereview_requires_scope_metadata_without_mutation() {
+    let repo = setup_identity_only_review_branch();
+    let before = repo.snapshot();
+    let output = repo.run_cresca(&["review", "main", "develop"]);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr)
+        .contains("Cannot read existing review range metadata: Missing"));
+    assert_eq!(repo.snapshot(), before);
 }
 
 fn assert_review_matches(
@@ -1346,6 +1438,122 @@ fn test_review_materializes_exact_three_dot_diff() {
     assert!(output.stderr.is_empty());
 }
 
+#[test]
+fn test_review_includes_all_changes_from_source_only_merge() {
+    let repo = TempGitRepo::new();
+    let base = repo.rev_parse("HEAD");
+    repo.create_branch("side");
+    repo.write_file("side.txt", "source-only side change\n");
+    repo.git(&["add", "side.txt"]);
+    repo.commit("Add side change");
+    repo.git(&["checkout", "-b", "develop", &base]);
+    repo.write_file("direct.txt", "direct source change\n");
+    repo.git(&["add", "direct.txt"]);
+    repo.commit("Add direct source change");
+    repo.git(&[
+        "merge",
+        "--no-ff",
+        "side",
+        "-m",
+        "Merge source-only side branch",
+    ]);
+    let endpoint = repo.rev_parse("HEAD");
+    repo.git(&["push", "-u", "origin", "develop"]);
+    repo.switch_branch("main");
+
+    let output = repo.run_cresca(&["review", "main", "develop"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(repo.rev_parse("HEAD"), base);
+    assert_eq!(repo.worktree_diff(), repo.diff(&base, &endpoint));
+    assert_eq!(repo.read_file("direct.txt"), "direct source change\n");
+    assert_eq!(repo.read_file("side.txt"), "source-only side change\n");
+}
+
+#[test]
+fn test_review_excludes_target_only_changes_after_clean_target_merge() {
+    let repo = TempGitRepo::new();
+    repo.create_branch("develop");
+    repo.write_file(
+        "source-before-merge.txt",
+        "source work before target merge\n",
+    );
+    repo.git(&["add", "source-before-merge.txt"]);
+    repo.commit("Add source work before target merge");
+    repo.switch_branch("main");
+    repo.write_file("target-only.txt", "updated target baseline\n");
+    repo.git(&["add", "target-only.txt"]);
+    repo.commit("Advance target independently");
+    repo.git(&["push", "origin", "main"]);
+    let updated_target = repo.rev_parse("HEAD");
+    repo.switch_branch("develop");
+    repo.git(&[
+        "merge",
+        "--no-ff",
+        "main",
+        "-m",
+        "Merge updated target cleanly",
+    ]);
+    repo.write_file("source-after-merge.txt", "source work after target merge\n");
+    repo.git(&["add", "source-after-merge.txt"]);
+    repo.commit("Add source work after target merge");
+    let endpoint = repo.rev_parse("HEAD");
+    repo.git(&["push", "-u", "origin", "develop"]);
+    repo.switch_branch("main");
+
+    let output = repo.run_cresca(&["review", "main", "develop"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(repo.rev_parse("HEAD"), updated_target);
+    assert_eq!(repo.worktree_diff(), repo.diff(&updated_target, &endpoint));
+    let status = repo.git_stdout(&["status", "--porcelain", "--untracked-files=all"]);
+    assert!(status.contains("source-before-merge.txt"), "{status}");
+    assert!(status.contains("source-after-merge.txt"), "{status}");
+    assert!(!status.contains("target-only.txt"), "{status}");
+    assert_eq!(
+        repo.read_file("target-only.txt"),
+        "updated target baseline\n"
+    );
+}
+
+#[test]
+fn test_review_uses_endpoint_tree_when_addition_and_deletion_cancel() {
+    let repo = TempGitRepo::new();
+    let base = repo.rev_parse("HEAD");
+    repo.create_branch("develop");
+    repo.write_file("transient.txt", "temporary source content\n");
+    repo.git(&["add", "transient.txt"]);
+    repo.commit("Add transient source file");
+    repo.git(&["rm", "transient.txt"]);
+    repo.commit("Delete transient source file");
+    repo.write_file("lasting.txt", "lasting endpoint content\n");
+    repo.git(&["add", "lasting.txt"]);
+    repo.commit("Add lasting endpoint file");
+    let endpoint = repo.rev_parse("HEAD");
+    repo.git(&["push", "-u", "origin", "develop"]);
+    repo.switch_branch("main");
+
+    let output = repo.run_cresca(&["review", "main", "develop"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(repo.worktree_diff(), repo.diff(&base, &endpoint));
+    assert!(!repo.path().join("transient.txt").exists());
+    assert_eq!(repo.read_file("lasting.txt"), "lasting endpoint content\n");
+    assert_eq!(
+        repo.git_stdout(&["status", "--porcelain", "--untracked-files=all"]),
+        "?? lasting.txt"
+    );
+}
+
 /// Test that `cresca approve` commits exactly the staged tree and discards everything else.
 #[test]
 fn test_approve_commits_staged() {
@@ -1477,7 +1685,11 @@ fn test_approve_with_no_staged_changes_approves_nothing() {
         String::from_utf8_lossy(&rereview_output.stdout),
         String::from_utf8_lossy(&rereview_output.stderr)
     );
-    assert_eq!(repo.rev_parse("HEAD"), head_before);
+    assert_eq!(repo.rev_parse("HEAD^"), head_before);
+    assert_eq!(
+        repo.rev_parse("HEAD^{tree}"),
+        repo.rev_parse(&format!("{head_before}^{{tree}}"))
+    );
     assert_eq!(repo.worktree_diff(), expected_source_diff);
 }
 
@@ -1568,6 +1780,64 @@ fn test_review_with_uncommitted_changes() {
     );
 }
 
+fn setup_multiple_merge_bases() -> TempGitRepo {
+    let repo = TempGitRepo::new();
+    let root = repo.rev_parse("HEAD");
+    repo.create_branch("left-base");
+    repo.write_file("left.txt", "left base\n");
+    repo.git(&["add", "left.txt"]);
+    repo.commit("Create left merge base");
+    let left = repo.rev_parse("HEAD");
+    repo.git(&["checkout", "-b", "right-base", &root]);
+    repo.write_file("right.txt", "right base\n");
+    repo.git(&["add", "right.txt"]);
+    repo.commit("Create right merge base");
+    let right = repo.rev_parse("HEAD");
+    let left_tree = repo.rev_parse(&format!("{left}^{{tree}}"));
+    let right_tree = repo.rev_parse(&format!("{right}^{{tree}}"));
+    let target = repo.git_stdout(&[
+        "commit-tree",
+        &left_tree,
+        "-p",
+        &left,
+        "-p",
+        &right,
+        "-m",
+        "target merge",
+    ]);
+    let source = repo.git_stdout(&[
+        "commit-tree",
+        &right_tree,
+        "-p",
+        &right,
+        "-p",
+        &left,
+        "-m",
+        "source merge",
+    ]);
+    repo.git(&["update-ref", "refs/heads/main", &target]);
+    repo.git(&["update-ref", "refs/heads/develop", &source]);
+    repo.git(&["push", "--force", "origin", "main", "develop"]);
+    repo.git(&["checkout", "--force", "main"]);
+    repo
+}
+
+#[test]
+fn test_review_fails_closed_for_multiple_merge_bases_without_mutation() {
+    let repo = setup_multiple_merge_bases();
+    let before = repo.snapshot();
+
+    let output = repo.run_cresca(&["review", "main", "develop"]);
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("Multiple merge bases"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(repo.snapshot(), before);
+    assert!(!repo.ref_exists("refs/heads/review-main-develop"));
+}
+
 /// Test that running review twice updates the review branch correctly.
 #[test]
 fn test_review_updates_existing_branch() {
@@ -1612,6 +1882,983 @@ fn test_review_updates_existing_branch() {
         status_str.contains("file2.txt"),
         "file2.txt should appear as new unreviewed change"
     );
+}
+
+#[test]
+fn test_rereview_reconstructs_approved_tree_after_target_update_and_source_rebase() {
+    let repo = TempGitRepo::new();
+
+    repo.create_branch("develop");
+    repo.write_file("approved.txt", "approved source content\n");
+    repo.git(&["add", "approved.txt"]);
+    repo.commit("Add source change");
+    repo.git(&["push", "-u", "origin", "develop"]);
+    let old_endpoint = repo.rev_parse("HEAD");
+    repo.switch_branch("main");
+
+    let first = repo.run_cresca(&["review", "main", "develop"]);
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    repo.git(&["add", "approved.txt"]);
+    assert!(repo.run_cresca(&["approve"]).status.success());
+    let old_review_head = repo.rev_parse("HEAD");
+
+    repo.switch_branch("main");
+    repo.write_file("target-only.txt", "new target baseline\n");
+    repo.git(&["add", "target-only.txt"]);
+    repo.commit("Advance target");
+    repo.git(&["push", "origin", "main"]);
+    let new_base = repo.rev_parse("HEAD");
+
+    repo.switch_branch("develop");
+    repo.git(&["rebase", "main"]);
+    repo.git(&["push", "--force", "origin", "develop"]);
+    let endpoint = repo.rev_parse("HEAD");
+    assert_ne!(
+        endpoint, old_endpoint,
+        "rebase must change source commit identity"
+    );
+    repo.switch_branch("review-main-develop");
+
+    let rereview = repo.run_cresca(&["review", "main", "develop"]);
+    assert!(
+        rereview.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&rereview.stdout),
+        String::from_utf8_lossy(&rereview.stderr)
+    );
+    assert_eq!(repo.rev_parse("HEAD^"), old_review_head);
+    assert_eq!(
+        repo.git_stdout(&["rev-list", "--parents", "-n", "1", "HEAD"])
+            .split_whitespace()
+            .count(),
+        2,
+        "a reconstructed review commit must have exactly one parent"
+    );
+    assert_eq!(
+        repo.git_stdout(&["show", "-s", "--format=%B", "HEAD"]),
+        "Reconstruct approved changes"
+    );
+    assert_eq!(
+        repo.rev_parse("HEAD^{tree}"),
+        repo.rev_parse(&format!("{endpoint}^{{tree}}"))
+    );
+    assert!(repo.cached_diff().is_empty());
+    assert!(repo.worktree_diff().is_empty());
+    assert_eq!(
+        repo.review_scope_values("review-main-develop"),
+        vec![format!("1:{new_base}:{endpoint}")]
+    );
+}
+
+#[test]
+fn test_rereview_preserves_approved_modification_deletion_and_exposes_revert() {
+    let repo = TempGitRepo::new();
+    repo.write_file("modified.txt", "base modification value\n");
+    repo.write_file("deleted.txt", "base deletion value\n");
+    repo.write_file("reverted.txt", "base revert value\n");
+    repo.git(&["add", "."]);
+    repo.commit("Add approval mutation fixtures");
+    repo.git(&["push", "origin", "main"]);
+    repo.create_branch("develop");
+    repo.write_file("modified.txt", "approved modification\n");
+    repo.git(&["rm", "deleted.txt"]);
+    repo.write_file("reverted.txt", "approved intermediate value\n");
+    repo.git(&["add", "."]);
+    repo.commit("Create approved mutations");
+    repo.git(&["push", "-u", "origin", "develop"]);
+    repo.switch_branch("main");
+    assert!(repo
+        .run_cresca(&["review", "main", "develop"])
+        .status
+        .success());
+    repo.git(&["add", "-A"]);
+    assert!(repo.run_cresca(&["approve"]).status.success());
+
+    repo.switch_branch("develop");
+    repo.write_file("modified.txt", "later modification\n");
+    repo.write_file("deleted.txt", "later recreation\n");
+    repo.write_file("reverted.txt", "base revert value\n");
+    repo.git(&["add", "."]);
+    repo.commit("Advance, recreate, and revert source changes");
+    repo.git(&["push", "origin", "develop"]);
+    repo.switch_branch("review-main-develop");
+
+    let output = repo.run_cresca(&["review", "main", "develop"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        repo.git_stdout(&["show", "HEAD:modified.txt"]),
+        "approved modification"
+    );
+    assert!(!repo
+        .git_maybe(&["cat-file", "-e", "HEAD:deleted.txt"])
+        .status
+        .success());
+    assert_eq!(
+        repo.git_stdout(&["show", "HEAD:reverted.txt"]),
+        "approved intermediate value"
+    );
+    assert_eq!(repo.read_file("modified.txt"), "later modification\n");
+    assert_eq!(repo.read_file("deleted.txt"), "later recreation\n");
+    assert_eq!(repo.read_file("reverted.txt"), "base revert value\n");
+    let status: BTreeSet<_> = repo
+        .git_stdout(&["status", "--porcelain", "--untracked-files=all"])
+        .lines()
+        .map(str::to_string)
+        .collect();
+    assert_eq!(
+        status,
+        BTreeSet::from([
+            "M modified.txt".to_string(),
+            " M reverted.txt".to_string(),
+            "?? deleted.txt".to_string(),
+        ])
+    );
+}
+
+#[test]
+fn test_rereview_downgrades_only_conflicting_text_hunks_to_new_base() {
+    let repo = TempGitRepo::new();
+    repo.write_file(
+        "lines.txt",
+        "base conflict\nkeep 1\nkeep 2\nkeep 3\nkeep 4\nbase approved\nbase untouched\n",
+    );
+    repo.git(&["add", "lines.txt"]);
+    repo.commit("Add line reconstruction fixture");
+    repo.git(&["push", "origin", "main"]);
+
+    repo.create_branch("develop");
+    repo.write_file(
+        "lines.txt",
+        "old source conflict\nkeep 1\nkeep 2\nkeep 3\nkeep 4\napproved line\nbase untouched\n",
+    );
+    repo.git(&["add", "lines.txt"]);
+    repo.commit("Change source lines");
+    repo.git(&["push", "-u", "origin", "develop"]);
+    repo.switch_branch("main");
+    assert!(repo
+        .run_cresca(&["review", "main", "develop"])
+        .status
+        .success());
+    repo.git(&["add", "lines.txt"]);
+    assert!(repo.run_cresca(&["approve"]).status.success());
+
+    repo.switch_branch("main");
+    repo.write_file(
+        "lines.txt",
+        "target conflict\nkeep 1\nkeep 2\nkeep 3\nkeep 4\nbase approved\nbase untouched\n",
+    );
+    repo.git(&["add", "lines.txt"]);
+    repo.commit("Change target conflict line");
+    repo.git(&["push", "origin", "main"]);
+    repo.git(&["checkout", "-B", "develop", "main"]);
+    repo.write_file(
+        "lines.txt",
+        "new source conflict\nkeep 1\nkeep 2\nkeep 3\nkeep 4\napproved line\nbase untouched\n",
+    );
+    repo.git(&["add", "lines.txt"]);
+    repo.commit("Reapply source on new target");
+    repo.git(&["push", "--force", "origin", "develop"]);
+    repo.switch_branch("review-main-develop");
+
+    let output = repo.run_cresca(&["review", "main", "develop"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        repo.git_stdout(&["show", "HEAD:lines.txt"]),
+        "target conflict\nkeep 1\nkeep 2\nkeep 3\nkeep 4\napproved line\nbase untouched"
+    );
+    assert_eq!(
+        repo.read_file("lines.txt"),
+        "new source conflict\nkeep 1\nkeep 2\nkeep 3\nkeep 4\napproved line\nbase untouched\n"
+    );
+    assert!(repo
+        .git_stdout(&["diff", "--name-only"])
+        .contains("lines.txt"));
+}
+
+#[test]
+fn test_rereview_downgrades_binary_conflict_to_new_base_entry() {
+    let repo = TempGitRepo::new();
+    std::fs::write(repo.path().join("binary.bin"), b"base\0value")
+        .expect("binary base should be writable");
+    repo.git(&["add", "binary.bin"]);
+    repo.commit("Add binary fixture");
+    repo.git(&["push", "origin", "main"]);
+
+    repo.create_branch("develop");
+    std::fs::write(repo.path().join("binary.bin"), b"old-source\0value")
+        .expect("binary source should be writable");
+    repo.git(&["add", "binary.bin"]);
+    repo.commit("Change source binary");
+    repo.git(&["push", "-u", "origin", "develop"]);
+    repo.switch_branch("main");
+    assert!(repo
+        .run_cresca(&["review", "main", "develop"])
+        .status
+        .success());
+    repo.git(&["add", "binary.bin"]);
+    assert!(repo.run_cresca(&["approve"]).status.success());
+
+    repo.switch_branch("main");
+    std::fs::write(repo.path().join("binary.bin"), b"target\0value")
+        .expect("binary target should be writable");
+    repo.git(&["add", "binary.bin"]);
+    repo.commit("Change target binary");
+    repo.git(&["push", "origin", "main"]);
+    repo.git(&["checkout", "-B", "develop", "main"]);
+    std::fs::write(repo.path().join("binary.bin"), b"new-source\0value")
+        .expect("binary endpoint should be writable");
+    repo.git(&["add", "binary.bin"]);
+    repo.commit("Reapply binary source");
+    repo.git(&["push", "--force", "origin", "develop"]);
+    repo.switch_branch("review-main-develop");
+
+    let output = repo.run_cresca(&["review", "main", "develop"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        repo.git(&["show", "HEAD:binary.bin"]).stdout,
+        b"target\0value"
+    );
+    assert_eq!(
+        std::fs::read(repo.path().join("binary.bin")).expect("binary worktree should be readable"),
+        b"new-source\0value"
+    );
+}
+
+#[test]
+fn test_rereview_handles_mode_symlink_modify_delete_and_rename_delete_safely() {
+    let repo = TempGitRepo::new();
+    repo.write_file("mode.sh", "base script\n");
+    repo.write_file("modify-delete.txt", "base file\n");
+    repo.write_file("rename-old.txt", "rename content\n");
+    std::os::unix::fs::symlink("base-target", repo.path().join("link"))
+        .expect("base symlink should be created");
+    repo.git(&["add", "."]);
+    repo.commit("Add tree safety fixtures");
+    repo.git(&["push", "origin", "main"]);
+
+    repo.create_branch("develop");
+    let mut mode = std::fs::metadata(repo.path().join("mode.sh"))
+        .expect("mode fixture should exist")
+        .permissions();
+    mode.set_mode(0o755);
+    std::fs::set_permissions(repo.path().join("mode.sh"), mode)
+        .expect("mode fixture should become executable");
+    repo.write_file("modify-delete.txt", "approved modification\n");
+    repo.git(&["mv", "rename-old.txt", "rename-approved.txt"]);
+    std::fs::remove_file(repo.path().join("link")).expect("old symlink should be removable");
+    std::os::unix::fs::symlink("approved-target", repo.path().join("link"))
+        .expect("approved symlink should be created");
+    repo.git(&["add", "."]);
+    repo.commit("Approve tree-kind changes");
+    repo.git(&["push", "-u", "origin", "develop"]);
+    repo.switch_branch("main");
+    assert!(repo
+        .run_cresca(&["review", "main", "develop"])
+        .status
+        .success());
+    repo.git(&["add", "-A"]);
+    assert!(repo.run_cresca(&["approve"]).status.success());
+
+    repo.switch_branch("main");
+    repo.write_file("mode.sh", "target script\n");
+    repo.git(&["rm", "modify-delete.txt", "rename-old.txt"]);
+    std::fs::remove_file(repo.path().join("link")).expect("base symlink should be removable");
+    std::os::unix::fs::symlink("target-link", repo.path().join("link"))
+        .expect("target symlink should be created");
+    repo.git(&["add", "."]);
+    repo.commit("Advance target tree kinds");
+    repo.git(&["push", "origin", "main"]);
+    repo.git(&["checkout", "-B", "develop", "main"]);
+    let mut mode = std::fs::metadata(repo.path().join("mode.sh"))
+        .expect("rebased mode fixture should exist")
+        .permissions();
+    mode.set_mode(0o755);
+    std::fs::set_permissions(repo.path().join("mode.sh"), mode)
+        .expect("rebased mode fixture should become executable");
+    repo.write_file("modify-delete.txt", "new source recreation\n");
+    repo.write_file("rename-approved.txt", "rename content\n");
+    std::fs::remove_file(repo.path().join("link")).expect("target symlink should be removable");
+    std::os::unix::fs::symlink("new-source-link", repo.path().join("link"))
+        .expect("new source symlink should be created");
+    repo.git(&["add", "."]);
+    repo.commit("Reapply tree-kind source changes");
+    repo.git(&["push", "--force", "origin", "develop"]);
+    repo.switch_branch("review-main-develop");
+
+    let output = repo.run_cresca(&["review", "main", "develop"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(repo.git_stdout(&["show", "HEAD:mode.sh"]), "target script");
+    assert!(repo
+        .git_stdout(&["ls-tree", "HEAD", "mode.sh"])
+        .starts_with("100755 "));
+    assert_eq!(repo.git_stdout(&["show", "HEAD:link"]), "target-link");
+    assert!(repo
+        .git_maybe(&["cat-file", "-e", "HEAD:modify-delete.txt"])
+        .status
+        .code()
+        .is_some_and(|code| code != 0));
+    assert!(repo
+        .git_maybe(&["cat-file", "-e", "HEAD:rename-approved.txt"])
+        .status
+        .code()
+        .is_some_and(|code| code != 0));
+    assert_eq!(
+        std::fs::read_link(repo.path().join("link")).unwrap(),
+        PathBuf::from("new-source-link")
+    );
+    assert!(repo.path().join("modify-delete.txt").exists());
+    assert!(repo.path().join("rename-approved.txt").exists());
+}
+
+#[test]
+fn test_rereview_does_not_transfer_approval_through_ambiguous_identical_rename() {
+    let repo = TempGitRepo::new();
+    repo.write_file("left.txt", "identical base content\n");
+    repo.write_file("right.txt", "identical base content\n");
+    repo.git(&["add", "."]);
+    repo.commit("Add identical rename candidates");
+    repo.git(&["push", "origin", "main"]);
+    repo.create_branch("develop");
+    repo.git(&["rm", "left.txt", "right.txt"]);
+    repo.write_file("renamed-identical.txt", "identical base content\n");
+    repo.write_file("approved-addition.txt", "unambiguous approved addition\n");
+    repo.git(&["add", "."]);
+    repo.commit("Create ambiguous identical rename approval");
+    repo.git(&["push", "-u", "origin", "develop"]);
+    repo.switch_branch("main");
+    assert!(repo
+        .run_cresca(&["review", "main", "develop"])
+        .status
+        .success());
+    repo.git(&["add", "-A"]);
+    assert!(repo.run_cresca(&["approve"]).status.success());
+
+    repo.switch_branch("main");
+    repo.write_file("left.txt", "new target left content\n");
+    repo.write_file("right.txt", "new target right content\n");
+    repo.git(&["add", "."]);
+    repo.commit("Change both ambiguous target candidates");
+    repo.git(&["push", "origin", "main"]);
+    let new_base = repo.rev_parse("HEAD");
+    repo.git(&["checkout", "-B", "develop", "main"]);
+    repo.git(&["rm", "left.txt", "right.txt"]);
+    repo.write_file("renamed-identical.txt", "identical base content\n");
+    repo.write_file("approved-addition.txt", "unambiguous approved addition\n");
+    repo.git(&["add", "."]);
+    repo.commit("Reapply ambiguous rename after base movement");
+    let endpoint = repo.rev_parse("HEAD");
+    repo.git(&["push", "--force", "origin", "develop"]);
+    repo.switch_branch("review-main-develop");
+
+    let output = repo.run_cresca(&["review", "main", "develop"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        repo.git_stdout(&["show", "HEAD:left.txt"]),
+        "new target left content"
+    );
+    assert_eq!(
+        repo.git_stdout(&["show", "HEAD:right.txt"]),
+        "new target right content"
+    );
+    assert!(!repo
+        .git_maybe(&["cat-file", "-e", "HEAD:renamed-identical.txt"])
+        .status
+        .success());
+    assert_eq!(
+        repo.git_stdout(&["show", "HEAD:approved-addition.txt"]),
+        "unambiguous approved addition"
+    );
+    assert_eq!(repo.worktree_diff(), repo.diff("HEAD", &endpoint));
+    assert_ne!(
+        repo.rev_parse("HEAD^{tree}"),
+        repo.rev_parse(&format!("{new_base}^{{tree}}"))
+    );
+}
+
+#[test]
+fn test_rereview_downgrades_ambiguous_identical_rename_across_executable_mode() {
+    let repo = TempGitRepo::new();
+    repo.write_file("left-mode.txt", "identical mixed-mode content\n");
+    repo.write_file("right-mode.txt", "identical mixed-mode content\n");
+    repo.git(&["add", "."]);
+    repo.commit("Add mixed-mode rename candidates");
+    repo.git(&["push", "origin", "main"]);
+    repo.create_branch("develop");
+    repo.git(&["rm", "left-mode.txt", "right-mode.txt"]);
+    repo.write_file("renamed-executable.txt", "identical mixed-mode content\n");
+    let mut permissions = std::fs::metadata(repo.path().join("renamed-executable.txt"))
+        .expect("mixed-mode destination should exist")
+        .permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(repo.path().join("renamed-executable.txt"), permissions)
+        .expect("mixed-mode destination should become executable");
+    repo.write_file("unrelated-approved.txt", "unrelated approved content\n");
+    repo.git(&["add", "."]);
+    repo.commit("Approve ambiguous executable rename");
+    repo.git(&["push", "-u", "origin", "develop"]);
+    repo.switch_branch("main");
+    assert!(repo
+        .run_cresca(&["review", "main", "develop"])
+        .status
+        .success());
+    repo.git(&["add", "-A"]);
+    assert!(repo.run_cresca(&["approve"]).status.success());
+
+    repo.switch_branch("main");
+    repo.write_file("left-mode.txt", "new target left mode content\n");
+    repo.write_file("right-mode.txt", "new target right mode content\n");
+    repo.git(&["add", "."]);
+    repo.commit("Change mixed-mode target candidates");
+    repo.git(&["push", "origin", "main"]);
+    repo.git(&["checkout", "-B", "develop", "main"]);
+    repo.git(&["rm", "left-mode.txt", "right-mode.txt"]);
+    repo.write_file("renamed-executable.txt", "identical mixed-mode content\n");
+    let mut permissions = std::fs::metadata(repo.path().join("renamed-executable.txt"))
+        .expect("rebased mixed-mode destination should exist")
+        .permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(repo.path().join("renamed-executable.txt"), permissions)
+        .expect("rebased mixed-mode destination should become executable");
+    repo.write_file("unrelated-approved.txt", "unrelated approved content\n");
+    repo.git(&["add", "."]);
+    repo.commit("Reapply executable rename after base movement");
+    let endpoint = repo.rev_parse("HEAD");
+    repo.git(&["push", "--force", "origin", "develop"]);
+    repo.switch_branch("review-main-develop");
+
+    let output = repo.run_cresca(&["review", "main", "develop"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        repo.git_stdout(&["show", "HEAD:left-mode.txt"]),
+        "new target left mode content"
+    );
+    assert_eq!(
+        repo.git_stdout(&["show", "HEAD:right-mode.txt"]),
+        "new target right mode content"
+    );
+    assert!(!repo
+        .git_maybe(&["cat-file", "-e", "HEAD:renamed-executable.txt"])
+        .status
+        .success());
+    assert_eq!(
+        repo.git_stdout(&["show", "HEAD:unrelated-approved.txt"]),
+        "unrelated approved content"
+    );
+    assert_eq!(repo.worktree_diff(), repo.diff("HEAD", &endpoint));
+}
+
+#[test]
+fn test_rereview_downgrades_target_side_ambiguous_identical_rename() {
+    let repo = TempGitRepo::new();
+    repo.write_file("target-left.txt", "identical target rename content\n");
+    repo.write_file("target-right.txt", "identical target rename content\n");
+    repo.git(&["add", "."]);
+    repo.commit("Add target-side rename candidates");
+    repo.git(&["push", "origin", "main"]);
+
+    repo.create_branch("develop");
+    repo.write_file("target-left.txt", "approved candidate modification\n");
+    repo.write_file("unrelated-approved.txt", "unrelated approved content\n");
+    repo.git(&["add", "."]);
+    repo.commit("Approve one candidate and an unrelated addition");
+    repo.git(&["push", "-u", "origin", "develop"]);
+    repo.switch_branch("main");
+    assert!(repo
+        .run_cresca(&["review", "main", "develop"])
+        .status
+        .success());
+    repo.git(&["add", "target-left.txt", "unrelated-approved.txt"]);
+    assert!(repo.run_cresca(&["approve"]).status.success());
+
+    repo.switch_branch("main");
+    repo.git(&["rm", "target-left.txt", "target-right.txt"]);
+    repo.write_file("target-renamed.txt", "identical target rename content\n");
+    let mut permissions = std::fs::metadata(repo.path().join("target-renamed.txt"))
+        .expect("target rename destination should exist")
+        .permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(repo.path().join("target-renamed.txt"), permissions)
+        .expect("target rename destination should become executable");
+    repo.git(&["add", "."]);
+    repo.commit("Ambiguously rename identical candidates on target");
+    repo.git(&["push", "origin", "main"]);
+    let new_base = repo.rev_parse("HEAD");
+
+    repo.git(&["checkout", "-b", "expected-target-ambiguity", &new_base]);
+    repo.write_file("unrelated-approved.txt", "unrelated approved content\n");
+    repo.git(&["add", "unrelated-approved.txt"]);
+    repo.commit("Build expected target ambiguity tree");
+    let expected_tree = repo.rev_parse("HEAD^{tree}");
+
+    repo.git(&["checkout", "-B", "develop", &new_base]);
+    repo.write_file("target-renamed.txt", "approved candidate modification\n");
+    repo.write_file("unrelated-approved.txt", "unrelated approved content\n");
+    repo.write_file("later.txt", "unreviewed endpoint content\n");
+    repo.git(&["add", "."]);
+    repo.commit("Reapply source after target-side ambiguous rename");
+    let endpoint = repo.rev_parse("HEAD");
+    repo.git(&["push", "--force", "origin", "develop"]);
+    repo.switch_branch("review-main-develop");
+
+    let output = repo.run_cresca(&["review", "main", "develop"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(repo.rev_parse("HEAD^{tree}"), expected_tree);
+    assert_eq!(
+        repo.git_stdout(&["show", "HEAD:target-renamed.txt"]),
+        "identical target rename content"
+    );
+    assert_eq!(
+        repo.git_stdout(&["show", "HEAD:unrelated-approved.txt"]),
+        "unrelated approved content"
+    );
+    assert_eq!(repo.worktree_diff(), repo.diff("HEAD", &endpoint));
+}
+
+#[test]
+fn test_rereview_does_not_transfer_approval_through_ambiguous_identical_gitlink_rename() {
+    let repo = TempGitRepo::new();
+    let original_gitlink = repo.rev_parse("HEAD");
+    repo.git(&[
+        "commit",
+        "--allow-empty",
+        "-m",
+        "Create alternate Gitlink object",
+    ]);
+    let alternate_gitlink = repo.rev_parse("HEAD");
+    set_gitlink(&repo, "review-left", &original_gitlink);
+    set_gitlink(&repo, "review-right", &original_gitlink);
+    repo.commit("Add identical review-side Gitlink candidates");
+    let old_base = repo.rev_parse("HEAD");
+    repo.git(&["push", "origin", "main"]);
+
+    repo.create_branch("develop");
+    remove_index_entry(&repo, "review-left");
+    remove_index_entry(&repo, "review-right");
+    set_gitlink(&repo, "review-renamed", &original_gitlink);
+    repo.write_file("unrelated-approved.txt", "unrelated approved content\n");
+    repo.git(&["add", "unrelated-approved.txt"]);
+    repo.commit("Approve ambiguous review-side Gitlink rename");
+    repo.git(&["push", "-u", "origin", "develop"]);
+    repo.switch_branch("main");
+    materialize_uninitialized_gitlinks(&repo, &["review-left", "review-right"]);
+    let first_review = repo.run_cresca(&["review", "main", "develop"]);
+    assert!(
+        first_review.status.success(),
+        "repository status after initial review failure: {}\nstdout: {}\nstderr: {}",
+        repo.git_stdout(&["status", "--porcelain"]),
+        String::from_utf8_lossy(&first_review.stdout),
+        String::from_utf8_lossy(&first_review.stderr)
+    );
+    remove_index_entry(&repo, "review-left");
+    remove_index_entry(&repo, "review-right");
+    set_gitlink(&repo, "review-renamed", &original_gitlink);
+    repo.git(&["add", "unrelated-approved.txt"]);
+    assert!(repo.run_cresca(&["approve"]).status.success());
+
+    repo.switch_branch("main");
+    set_gitlink(&repo, "review-left", &alternate_gitlink);
+    set_gitlink(&repo, "review-right", &old_base);
+    repo.commit("Change review-side target Gitlinks");
+    repo.git(&["push", "origin", "main"]);
+    let new_base = repo.rev_parse("HEAD");
+
+    repo.git(&["checkout", "-b", "expected-review-gitlink", &new_base]);
+    repo.write_file("unrelated-approved.txt", "unrelated approved content\n");
+    repo.git(&["add", "unrelated-approved.txt"]);
+    repo.commit("Build expected review-side Gitlink tree");
+    let expected_tree = repo.rev_parse("HEAD^{tree}");
+
+    repo.git(&["checkout", "-B", "develop", &new_base]);
+    remove_index_entry(&repo, "review-left");
+    remove_index_entry(&repo, "review-right");
+    set_gitlink(&repo, "review-renamed", &original_gitlink);
+    repo.write_file("unrelated-approved.txt", "unrelated approved content\n");
+    repo.write_file("later.txt", "unreviewed endpoint content\n");
+    repo.git(&["add", "unrelated-approved.txt", "later.txt"]);
+    repo.commit("Reapply review-side Gitlink rename");
+    let endpoint = repo.rev_parse("HEAD");
+    repo.git(&["push", "--force", "origin", "develop"]);
+    repo.switch_branch("review-main-develop");
+    materialize_uninitialized_gitlinks(&repo, &["review-renamed"]);
+
+    let output = repo.run_cresca(&["review", "main", "develop"]);
+    assert!(
+        output.status.success(),
+        "repository status after rereview failure: {}\nstdout: {}\nstderr: {}",
+        repo.git_stdout(&["status", "--porcelain"]),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(repo.rev_parse("HEAD^{tree}"), expected_tree);
+    assert_eq!(
+        repo.git_stdout(&["ls-tree", "HEAD", "review-left"]),
+        format!("160000 commit {alternate_gitlink}\treview-left")
+    );
+    assert_eq!(
+        repo.git_stdout(&["ls-tree", "HEAD", "review-right"]),
+        format!("160000 commit {old_base}\treview-right")
+    );
+    assert!(repo
+        .git_stdout(&["ls-tree", "HEAD", "review-renamed"])
+        .is_empty());
+    assert_eq!(
+        repo.git_stdout(&["show", "HEAD:unrelated-approved.txt"]),
+        "unrelated approved content"
+    );
+    assert!(repo.cached_diff().is_empty());
+    assert_eq!(
+        repo.git_stdout(&["status", "--porcelain"]),
+        "?? later.txt",
+        "scratch-index reconstruction must not leak into the real index or worktree"
+    );
+    assert_eq!(repo.rev_parse("origin/develop"), endpoint);
+}
+
+#[test]
+fn test_rereview_preserves_target_through_ambiguous_identical_gitlink_rename() {
+    let repo = TempGitRepo::new();
+    let original_gitlink = repo.rev_parse("HEAD");
+    repo.git(&[
+        "commit",
+        "--allow-empty",
+        "-m",
+        "Create modified Gitlink object",
+    ]);
+    let approved_gitlink = repo.rev_parse("HEAD");
+    set_gitlink(&repo, "target-left", &original_gitlink);
+    set_gitlink(&repo, "target-right", &original_gitlink);
+    repo.commit("Add identical target-side Gitlink candidates");
+    repo.git(&["push", "origin", "main"]);
+
+    repo.create_branch("develop");
+    set_gitlink(&repo, "target-left", &approved_gitlink);
+    repo.write_file("unrelated-approved.txt", "unrelated approved content\n");
+    repo.git(&["add", "unrelated-approved.txt"]);
+    repo.commit("Approve target-side Gitlink candidate");
+    repo.git(&["push", "-u", "origin", "develop"]);
+    repo.switch_branch("main");
+    materialize_uninitialized_gitlinks(&repo, &["target-left", "target-right"]);
+    let first_review = repo.run_cresca(&["review", "main", "develop"]);
+    assert!(
+        first_review.status.success(),
+        "repository status after initial review failure: {}\nstdout: {}\nstderr: {}",
+        repo.git_stdout(&["status", "--porcelain"]),
+        String::from_utf8_lossy(&first_review.stdout),
+        String::from_utf8_lossy(&first_review.stderr)
+    );
+    set_gitlink(&repo, "target-left", &approved_gitlink);
+    repo.git(&["add", "unrelated-approved.txt"]);
+    assert!(repo.run_cresca(&["approve"]).status.success());
+
+    repo.switch_branch("main");
+    remove_index_entry(&repo, "target-left");
+    remove_index_entry(&repo, "target-right");
+    set_gitlink(&repo, "target-renamed", &original_gitlink);
+    repo.commit("Ambiguously rename identical target Gitlinks");
+    repo.git(&["push", "origin", "main"]);
+    let new_base = repo.rev_parse("HEAD");
+
+    repo.git(&["checkout", "-b", "expected-target-gitlink", &new_base]);
+    repo.write_file("unrelated-approved.txt", "unrelated approved content\n");
+    repo.git(&["add", "unrelated-approved.txt"]);
+    repo.commit("Build expected target-side Gitlink tree");
+    let expected_tree = repo.rev_parse("HEAD^{tree}");
+
+    repo.git(&["checkout", "-B", "develop", &new_base]);
+    set_gitlink(&repo, "target-renamed", &approved_gitlink);
+    repo.write_file("unrelated-approved.txt", "unrelated approved content\n");
+    repo.write_file("later.txt", "unreviewed endpoint content\n");
+    repo.git(&["add", "unrelated-approved.txt", "later.txt"]);
+    repo.commit("Reapply target-side Gitlink modification");
+    let endpoint = repo.rev_parse("HEAD");
+    repo.git(&["push", "--force", "origin", "develop"]);
+    repo.switch_branch("review-main-develop");
+    materialize_uninitialized_gitlinks(&repo, &["target-left", "target-right"]);
+
+    let output = repo.run_cresca(&["review", "main", "develop"]);
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(repo.rev_parse("HEAD^{tree}"), expected_tree);
+    assert_eq!(
+        repo.git_stdout(&["ls-tree", "HEAD", "target-renamed"]),
+        format!("160000 commit {original_gitlink}\ttarget-renamed")
+    );
+    assert!(repo
+        .git_stdout(&["ls-tree", "HEAD", "target-left"])
+        .is_empty());
+    assert!(repo
+        .git_stdout(&["ls-tree", "HEAD", "target-right"])
+        .is_empty());
+    assert_eq!(
+        repo.git_stdout(&["show", "HEAD:unrelated-approved.txt"]),
+        "unrelated approved content"
+    );
+    assert!(repo.cached_diff().is_empty());
+    assert_eq!(
+        repo.git_stdout(&["status", "--porcelain"]),
+        "?? later.txt",
+        "scratch-index reconstruction must not leak into the real index or worktree"
+    );
+    assert_eq!(repo.rev_parse("origin/develop"), endpoint);
+}
+
+#[test]
+fn test_rereview_treats_repository_conflict_paths_as_literal_pathspecs() {
+    let repo = TempGitRepo::new();
+    let path_pairs = [
+        ("wild*.bin", "wild-neighbor.bin"),
+        ("question?.bin", "questionX.bin"),
+        ("bracket[ab].bin", "bracketa.bin"),
+        (":(glob)magic*.bin", "magic-neighbor.bin"),
+    ];
+    for (unsafe_path, neighbor) in path_pairs {
+        std::fs::write(repo.path().join(unsafe_path), b"base unsafe\0content")
+            .expect("unsafe base path should be writable");
+        std::fs::write(repo.path().join(neighbor), b"base neighbor\0content")
+            .expect("neighbor base path should be writable");
+    }
+    repo.git(&["add", "-A"]);
+    repo.commit("Add literal conflict path fixtures");
+    repo.git(&["push", "origin", "main"]);
+
+    repo.create_branch("develop");
+    for (unsafe_path, neighbor) in path_pairs {
+        std::fs::write(repo.path().join(unsafe_path), b"approved unsafe\0content")
+            .expect("unsafe approved path should be writable");
+        std::fs::write(repo.path().join(neighbor), b"approved neighbor\0content")
+            .expect("neighbor approved path should be writable");
+    }
+    repo.write_file("unrelated-approved.txt", "unrelated approved content\n");
+    repo.git(&["add", "-A"]);
+    repo.commit("Approve literal conflict paths and neighbors");
+    repo.git(&["push", "-u", "origin", "develop"]);
+    repo.switch_branch("main");
+    assert!(repo
+        .run_cresca(&["review", "main", "develop"])
+        .status
+        .success());
+    repo.git(&["add", "-A"]);
+    assert!(repo.run_cresca(&["approve"]).status.success());
+
+    repo.switch_branch("main");
+    for (unsafe_path, _) in path_pairs {
+        std::fs::write(repo.path().join(unsafe_path), b"target unsafe\0content")
+            .expect("unsafe target path should be writable");
+    }
+    repo.git(&["add", "-A"]);
+    repo.commit("Conflict on literal pathspec names");
+    repo.git(&["push", "origin", "main"]);
+    let new_base = repo.rev_parse("HEAD");
+
+    repo.git(&["checkout", "-b", "expected-literal-conflicts", &new_base]);
+    for (_, neighbor) in path_pairs {
+        std::fs::write(repo.path().join(neighbor), b"approved neighbor\0content")
+            .expect("expected neighbor path should be writable");
+    }
+    repo.write_file("unrelated-approved.txt", "unrelated approved content\n");
+    repo.git(&["add", "-A"]);
+    repo.commit("Build expected literal conflict tree");
+    let expected_tree = repo.rev_parse("HEAD^{tree}");
+
+    repo.git(&["checkout", "-B", "develop", &new_base]);
+    for (unsafe_path, neighbor) in path_pairs {
+        std::fs::write(repo.path().join(unsafe_path), b"approved unsafe\0content")
+            .expect("rebased unsafe path should be writable");
+        std::fs::write(repo.path().join(neighbor), b"approved neighbor\0content")
+            .expect("rebased neighbor path should be writable");
+    }
+    repo.write_file("unrelated-approved.txt", "unrelated approved content\n");
+    repo.write_file("later.txt", "unreviewed endpoint content\n");
+    repo.git(&["add", "-A"]);
+    repo.commit("Reapply literal conflict source changes");
+    let endpoint = repo.rev_parse("HEAD");
+    repo.git(&["push", "--force", "origin", "develop"]);
+    repo.switch_branch("review-main-develop");
+
+    let output = repo.run_cresca(&["review", "main", "develop"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(repo.rev_parse("HEAD^{tree}"), expected_tree);
+    for (unsafe_path, neighbor) in path_pairs {
+        assert_eq!(
+            repo.git(&["show", &format!("HEAD:{unsafe_path}")]).stdout,
+            b"target unsafe\0content"
+        );
+        assert_eq!(
+            repo.git(&["show", &format!("HEAD:{neighbor}")]).stdout,
+            b"approved neighbor\0content"
+        );
+    }
+    assert_eq!(repo.worktree_diff(), repo.diff("HEAD", &endpoint));
+}
+
+#[test]
+fn test_rereview_treats_repository_ambiguity_paths_as_literal_pathspecs() {
+    let repo = TempGitRepo::new();
+    let path_groups = [
+        (
+            "star*.txt",
+            "star-source.txt",
+            "star-renamed.txt",
+            "star-neighbor.txt",
+            "star group content\n",
+        ),
+        (
+            "question?.txt",
+            "questionA.txt",
+            "questionB.txt",
+            "questionN.txt",
+            "question group content\n",
+        ),
+        (
+            "bracket[ab].txt",
+            "bracketa.txt",
+            "bracket-renamed.txt",
+            "bracketb.txt",
+            "bracket group content\n",
+        ),
+        (
+            ":(glob)colon*.txt",
+            "colon-source.txt",
+            "colon-renamed.txt",
+            "colon-neighbor.txt",
+            "colon group content\n",
+        ),
+    ];
+    for (unsafe_path, second_candidate, _, neighbor, content) in path_groups {
+        repo.write_file(unsafe_path, content);
+        repo.write_file(second_candidate, content);
+        repo.write_file(neighbor, "base neighbor content\n");
+    }
+    repo.git(&["add", "-A"]);
+    repo.commit("Add literal ambiguity path fixtures");
+    repo.git(&["push", "origin", "main"]);
+
+    repo.create_branch("develop");
+    for (unsafe_path, second_candidate, destination, neighbor, content) in path_groups {
+        repo.git(&[
+            "--literal-pathspecs",
+            "rm",
+            "--",
+            unsafe_path,
+            second_candidate,
+        ]);
+        repo.write_file(destination, content);
+        repo.write_file(neighbor, "approved neighbor content\n");
+    }
+    repo.write_file("unrelated-approved.txt", "unrelated approved content\n");
+    repo.git(&["add", "-A"]);
+    repo.commit("Approve literal ambiguity paths and neighbors");
+    repo.git(&["push", "-u", "origin", "develop"]);
+    repo.switch_branch("main");
+    assert!(repo
+        .run_cresca(&["review", "main", "develop"])
+        .status
+        .success());
+    repo.git(&["add", "-A"]);
+    assert!(repo.run_cresca(&["approve"]).status.success());
+
+    repo.switch_branch("main");
+    repo.write_file("target-only.txt", "new target baseline\n");
+    repo.git(&["add", "target-only.txt"]);
+    repo.commit("Advance target for literal ambiguity reconstruction");
+    repo.git(&["push", "origin", "main"]);
+    let new_base = repo.rev_parse("HEAD");
+
+    repo.git(&["checkout", "-b", "expected-literal-ambiguity", &new_base]);
+    for (_, _, _, neighbor, _) in path_groups {
+        repo.write_file(neighbor, "approved neighbor content\n");
+    }
+    repo.write_file("unrelated-approved.txt", "unrelated approved content\n");
+    repo.git(&["add", "-A"]);
+    repo.commit("Build expected literal ambiguity tree");
+    let expected_tree = repo.rev_parse("HEAD^{tree}");
+
+    repo.git(&["checkout", "-B", "develop", &new_base]);
+    for (unsafe_path, second_candidate, destination, neighbor, content) in path_groups {
+        repo.git(&[
+            "--literal-pathspecs",
+            "rm",
+            "--",
+            unsafe_path,
+            second_candidate,
+        ]);
+        repo.write_file(destination, content);
+        repo.write_file(neighbor, "approved neighbor content\n");
+    }
+    repo.write_file("unrelated-approved.txt", "unrelated approved content\n");
+    repo.write_file("later.txt", "unreviewed endpoint content\n");
+    repo.git(&["add", "-A"]);
+    repo.commit("Reapply literal ambiguity source changes");
+    let endpoint = repo.rev_parse("HEAD");
+    repo.git(&["push", "--force", "origin", "develop"]);
+    repo.switch_branch("review-main-develop");
+
+    let output = repo.run_cresca(&["review", "main", "develop"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(repo.rev_parse("HEAD^{tree}"), expected_tree);
+    for (unsafe_path, second_candidate, destination, neighbor, content) in path_groups {
+        assert_eq!(
+            repo.git_stdout(&["show", &format!("HEAD:{unsafe_path}")]),
+            content.trim_end()
+        );
+        assert_eq!(
+            repo.git_stdout(&["show", &format!("HEAD:{second_candidate}")]),
+            content.trim_end()
+        );
+        assert!(!repo
+            .git_maybe(&["cat-file", "-e", &format!("HEAD:{destination}")])
+            .status
+            .success());
+        assert_eq!(
+            repo.git_stdout(&["show", &format!("HEAD:{neighbor}")]),
+            "approved neighbor content"
+        );
+    }
+    assert_eq!(repo.worktree_diff(), repo.diff("HEAD", &endpoint));
 }
 
 /// Test that `cresca review --skip-to` auto-approves earlier commits.
@@ -2623,14 +3870,7 @@ fn test_review_leaves_legacy_branch_untouched_and_creates_metadata_backed_branch
 
     assert!(repo.run_cresca(&["approve"]).status.success());
     repo.switch_branch("main");
-    let heads_before = repo
-        .git(&[
-            "for-each-ref",
-            "--sort=refname",
-            "--format=%(refname) %(objectname)",
-            "refs/heads/",
-        ])
-        .stdout;
+    let previous_review = repo.rev_parse(&format!("refs/heads/{metadata_branch}"));
 
     let second = repo.run_cresca(&["review", "main", "develop"]);
     assert!(
@@ -2640,16 +3880,8 @@ fn test_review_leaves_legacy_branch_untouched_and_creates_metadata_backed_branch
         String::from_utf8_lossy(&second.stderr)
     );
     assert_eq!(repo.current_branch(), metadata_branch);
-    assert_eq!(
-        repo.git(&[
-            "for-each-ref",
-            "--sort=refname",
-            "--format=%(refname) %(objectname)",
-            "refs/heads/",
-        ])
-        .stdout,
-        heads_before
-    );
+    assert_eq!(repo.rev_parse("HEAD^"), previous_review);
+    assert_eq!(repo.rev_parse("refs/heads/review-main-develop"), legacy_oid);
 }
 
 #[test]
@@ -2750,7 +3982,7 @@ fn test_status_uses_metadata_for_hyphenated_target_and_slash_source() {
     assert!(output.stderr.is_empty());
 }
 
-fn assert_scope_error_and_all_available(repo: &TempGitRepo, expected_error: &str) {
+fn assert_scope_error_preserves_state(repo: &TempGitRepo, expected_error: &str) {
     let before = repo.snapshot();
     let output = repo.run_cresca(&["status"]);
     assert!(!output.status.success());
@@ -2760,101 +3992,134 @@ fn assert_scope_error_and_all_available(repo: &TempGitRepo, expected_error: &str
         stderr.contains(expected_error),
         "unexpected diagnostic: {stderr}"
     );
-    assert!(stderr.contains("cresca review main develop"));
-    assert!(stderr.contains("cresca status --all"));
-    assert_eq!(repo.snapshot(), before);
-
-    let all = repo.run_cresca(&["status", "--all"]);
     assert!(
-        all.status.success(),
-        "stdout: {}\nstderr: {}",
-        String::from_utf8_lossy(&all.stdout),
-        String::from_utf8_lossy(&all.stderr)
+        stderr.contains("review branch must be recreated"),
+        "unexpected remediation: {stderr}"
     );
-    assert!(String::from_utf8_lossy(&all.stdout).contains("    - develop.txt\n"));
-    assert!(all.stderr.is_empty());
+    assert!(
+        stderr.contains("Switch away from it, delete it, then run `cresca review main develop`"),
+        "invalid scope remediation must explain how to recreate the branch: {stderr}"
+    );
+    assert!(
+        !stderr.contains("Rerun"),
+        "invalid scope must not advertise a rereview command that cannot succeed: {stderr}"
+    );
+    assert_eq!(repo.snapshot(), before);
 }
 
 #[test]
-fn test_status_requires_scope_metadata_but_all_works_for_pr12_identity() {
+fn test_status_requires_scope_metadata_for_pr12_identity() {
     let repo = setup_identity_only_review_branch();
-    assert_scope_error_and_all_available(&repo, "range metadata is missing");
+    assert_scope_error_preserves_state(&repo, "range metadata is missing");
 }
 
 #[test]
-fn test_status_rejects_duplicate_scope_values_but_all_still_works() {
+fn test_status_rejects_duplicate_scope_values() {
+    let repo = setup_identity_only_review_branch();
+    let endpoint = repo.rev_parse("HEAD");
+    let value = format!("1:{endpoint}:{endpoint}");
+    repo.git(&[
+        "config",
+        "--local",
+        "--add",
+        "branch.review-main-develop.cresca-scope",
+        &value,
+    ]);
+    repo.git(&[
+        "config",
+        "--local",
+        "--add",
+        "branch.review-main-develop.cresca-scope",
+        &value,
+    ]);
+    assert_scope_error_preserves_state(&repo, "range metadata has duplicate values");
+}
+
+#[test]
+fn test_status_rejects_legacy_scope_shape() {
     let repo = setup_identity_only_review_branch();
     let value = format!("1:{}", repo.rev_parse("HEAD"));
     repo.git(&[
         "config",
         "--local",
-        "--add",
         "branch.review-main-develop.cresca-scope",
         &value,
     ]);
-    repo.git(&[
-        "config",
-        "--local",
-        "--add",
-        "branch.review-main-develop.cresca-scope",
-        &value,
-    ]);
-    assert_scope_error_and_all_available(&repo, "range metadata has duplicate values");
+    assert_scope_error_preserves_state(&repo, "range metadata is invalid");
 }
 
 #[test]
-fn test_status_rejects_unsupported_scope_version_but_all_still_works() {
+fn test_status_rejects_version_two_scope() {
     let repo = setup_identity_only_review_branch();
-    let value = format!("2:{}", repo.rev_parse("HEAD"));
+    let endpoint = repo.rev_parse("HEAD");
+    let value = format!("2:{endpoint}:{endpoint}");
     repo.git(&[
         "config",
         "--local",
         "branch.review-main-develop.cresca-scope",
         &value,
     ]);
-    assert_scope_error_and_all_available(&repo, "range metadata version '2' is unsupported");
+    assert_scope_error_preserves_state(&repo, "range metadata version '2' is unsupported");
 }
 
 #[test]
-fn test_status_rejects_malformed_scope_oid_but_all_still_works() {
+fn test_status_rejects_malformed_scope_oid() {
     let repo = setup_identity_only_review_branch();
+    let endpoint = repo.rev_parse("HEAD");
     repo.git(&[
         "config",
         "--local",
         "branch.review-main-develop.cresca-scope",
-        "1:not-an-oid",
+        &format!("1:{endpoint}:not-an-oid"),
     ]);
-    assert_scope_error_and_all_available(&repo, "range metadata is invalid");
+    assert_scope_error_preserves_state(&repo, "range metadata is invalid");
 }
 
 #[test]
 fn test_status_rejects_abbreviated_scope_oid() {
     let repo = setup_identity_only_review_branch();
     let head = repo.rev_parse("HEAD");
-    let value = format!("1:{}", &head[..8]);
+    let value = format!("1:{}:{head}", &head[..8]);
     repo.git(&[
         "config",
         "--local",
         "branch.review-main-develop.cresca-scope",
         &value,
     ]);
-    assert_scope_error_and_all_available(&repo, "range metadata is invalid");
+    assert_scope_error_preserves_state(&repo, "range metadata is invalid");
 }
 
 #[test]
-fn test_status_rejects_unavailable_scope_commit_but_all_still_works() {
+fn test_status_rejects_unavailable_scope_commit() {
     let repo = setup_identity_only_review_branch();
     let oid = "0000000000000000000000000000000000000000";
-    let value = format!("1:{oid}");
+    let value = format!("1:{}:{oid}", repo.rev_parse("HEAD"));
     repo.git(&[
         "config",
         "--local",
         "branch.review-main-develop.cresca-scope",
         &value,
     ]);
-    assert_scope_error_and_all_available(
+    assert_scope_error_preserves_state(
         &repo,
-        &format!("saved range endpoint '{oid}' is unavailable"),
+        &format!("saved review object '{oid}' is unavailable"),
+    );
+}
+
+#[test]
+fn test_status_reports_missing_scope_base_oid() {
+    let repo = setup_identity_only_review_branch();
+    let missing_base = "0000000000000000000000000000000000000000";
+    let endpoint = repo.rev_parse("HEAD");
+    repo.git(&[
+        "config",
+        "--local",
+        "branch.review-main-develop.cresca-scope",
+        &format!("1:{missing_base}:{endpoint}"),
+    ]);
+    assert_scope_error_preserves_state(
+        &repo,
+        &format!("saved review object '{missing_base}' is unavailable"),
     );
 }
 
@@ -2880,19 +4145,10 @@ fn test_status_keeps_unbounded_review_tip_fixed_until_next_review() {
             "  Remaining diff in current review range: 0 file(s), +0 insertion(s), -0 deletion(s)\n",
         )
     );
-    assert_eq!(
-        run_status_stdout(&repo, &["status", "--all"]),
-        concat!(
-            "📋 Review status (full pull request):\n",
-            "  Remaining diff to develop: 1 file(s), +1 insertion(s), -0 deletion(s)\n",
-            "  Files remaining:\n",
-            "    - e.txt\n",
-        )
-    );
 }
 
 #[test]
-fn test_status_default_excludes_commits_after_stop_at_while_all_includes_them() {
+fn test_status_default_excludes_commits_after_stop_at() {
     let (repo, range) = setup_linear_range();
     assert!(repo
         .run_cresca(&["review", "main", "develop", "--stop-at", &range.c[..8],])
@@ -2905,12 +4161,6 @@ fn test_status_default_excludes_commits_after_stop_at_while_all_includes_them() 
     assert!(current.contains("    - removed-at-c.txt\n"));
     assert!(current.contains("    - shared.txt\n"));
     assert!(!current.contains("    - d.txt\n"));
-    let all = run_status_stdout(&repo, &["status", "--all"]);
-    assert!(all.contains("📋 Review status (full pull request):"));
-    assert!(all.contains("4 file(s), +3 insertion(s), -2 deletion(s)"));
-    for file in ["a.txt", "d.txt", "removed-at-c.txt", "shared.txt"] {
-        assert!(all.contains(&format!("    - {file}\n")));
-    }
 }
 
 #[test]
@@ -2935,15 +4185,10 @@ fn test_status_after_skip_stop_and_partial_approve_excludes_auto_approved_change
     assert!(current.contains("    - removed-at-c.txt\n"));
     assert!(!current.contains("a.txt"));
     assert!(!current.contains("d.txt"));
-    let all = run_status_stdout(&repo, &["status", "--all"]);
-    assert!(all.contains("2 file(s), +1 insertion(s), -1 deletion(s)"));
-    assert!(all.contains("    - d.txt\n"));
-    assert!(all.contains("    - removed-at-c.txt\n"));
-    assert!(!all.contains("a.txt"));
 }
 
 #[test]
-fn test_status_current_range_can_be_complete_while_full_pull_request_remains() {
+fn test_status_current_range_can_be_complete() {
     let (repo, range) = setup_linear_range();
     assert!(repo
         .run_cresca(&["review", "main", "develop", "--stop-at", &range.c[..8],])
@@ -2958,27 +4203,17 @@ fn test_status_current_range_can_be_complete_while_full_pull_request_remains() {
             "  Remaining diff in current review range: 0 file(s), +0 insertion(s), -0 deletion(s)\n",
         )
     );
-    assert_eq!(
-        run_status_stdout(&repo, &["status", "--all"]),
-        concat!(
-            "📋 Review status (full pull request):\n",
-            "  Remaining diff to develop: 1 file(s), +1 insertion(s), -0 deletion(s)\n",
-            "  Files remaining:\n",
-            "    - d.txt\n",
-        )
-    );
 }
 
 #[test]
-fn test_status_help_describes_all_scope() {
+fn test_status_rejects_all_option() {
     let repo = TempGitRepo::new();
-    let output = repo.run_cresca(&["status", "--help"]);
-    assert!(output.status.success());
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("Usage: cresca status [OPTIONS]"));
-    assert!(stdout.contains("--all"));
-    assert!(stdout.contains("full pull request"));
-    assert!(output.stderr.is_empty());
+    let before = repo.snapshot();
+    let output = repo.run_cresca(&["status", "--all"]);
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("unexpected argument '--all'"));
+    assert_eq!(repo.snapshot(), before);
 }
 
 #[test]

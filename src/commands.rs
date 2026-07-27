@@ -1,21 +1,26 @@
 use crate::git::{
-    is_clean, resolve_remote_tracking_branch, run_git_command, select_review_branch,
-    write_review_metadata, write_review_scope, ReviewBranchSelection, ReviewBranchSelectionError,
-    ReviewMetadata, ReviewScope,
+    is_clean, read_review_scope, resolve_remote_tracking_branch, run_git_command,
+    select_review_branch, write_review_metadata, write_review_scope, ReviewBranchSelection,
+    ReviewBranchSelectionError, ReviewMetadata, ReviewScope, ReviewScopeError,
 };
-use crate::review::{ReviewError, ReviewTransaction};
+use crate::review::{
+    find_unique_merge_base, reconstruct_approval_tree, ReviewError, ReviewPreparation,
+    ReviewTransaction,
+};
 use std::ops::Not;
 
 struct ReviewPlan {
     metadata: ReviewMetadata,
-    merge_base: String,
+    new_base: String,
     auto_approve_parent: Option<String>,
     selection: ReviewBranchSelection,
+    old_review: Option<String>,
+    old_base: Option<String>,
     scope: ReviewScope,
     tracking_updates: Vec<(String, String)>,
 }
 
-/// Prepare the review branch using Squash Merge approach.
+/// Prepare a review branch with explicit approval-tree reconstruction.
 ///
 /// # Arguments
 ///
@@ -30,7 +35,7 @@ pub fn prepare_review_branch(
     skip_to: Option<&str>,
     stop_at: Option<&str>,
     verbose: bool,
-) -> Result<bool, ReviewError> {
+) -> Result<ReviewPreparation, ReviewError> {
     let root = ReviewTransaction::repository_root(verbose)?;
     std::env::set_current_dir(&root).map_err(|error| {
         ReviewError::Message(format!(
@@ -64,34 +69,40 @@ fn prepare_review_plan(
     let resolved_to = resolve_remote_tracking_branch(to_branch, verbose)?;
     let resolved_from = resolve_remote_tracking_branch(from_branch, verbose)?;
 
-    let tracking_to = fetch_remote_commit(
-        "target",
-        &resolved_to.remote,
-        &resolved_to.remote_branch,
-        verbose,
-    )?;
     let tracking_from = fetch_remote_commit(
         "source",
         &resolved_from.remote,
         &resolved_from.remote_branch,
         verbose,
     )?;
-
-    // Get merge-base
-    let merge_base_output = run_git_command(
-        "get merge base",
-        &["merge-base", &tracking_to, &tracking_from],
-        &[],
+    let scope_end_revision = stop_at.unwrap_or(&tracking_from);
+    let scope_end_commit = format!("{scope_end_revision}^{{commit}}");
+    let scope_end_output = run_git_command(
+        "resolve review range endpoint",
+        &["rev-parse", "--verify", &scope_end_commit],
+        &[128],
         verbose,
     )?;
-    let merge_base = String::from_utf8_lossy(&merge_base_output.stdout)
+    if !scope_end_output.status.success() {
+        return Err(ReviewError::Message(format!(
+            "Commit {} is not in the range {}..{}",
+            scope_end_revision, to_branch, from_branch
+        )));
+    }
+    let endpoint = String::from_utf8_lossy(&scope_end_output.stdout)
         .trim()
         .to_string();
+    let tracking_to = fetch_remote_commit(
+        "target",
+        &resolved_to.remote,
+        &resolved_to.remote_branch,
+        verbose,
+    )?;
+    let new_base = find_unique_merge_base(&tracking_to, &endpoint, verbose)?;
 
-    // Get valid commit range (merge_base..tracking_from)
     let valid_commits = run_git_command(
         "get valid commit range",
-        &["rev-list", &format!("{}..{}", merge_base, tracking_from)],
+        &["rev-list", &format!("{}..{}", new_base, tracking_from)],
         &[],
         verbose,
     )?;
@@ -148,25 +159,16 @@ fn prepare_review_plan(
         }
     }
 
-    let scope_end_revision = stop_at.unwrap_or(&tracking_from);
-    let scope_end_commit = format!("{scope_end_revision}^{{commit}}");
-    let scope_end_output = run_git_command(
-        "resolve review range endpoint",
-        &["rev-parse", "--verify", &scope_end_commit],
-        &[],
-        verbose,
-    )?;
     let scope = ReviewScope {
-        end_oid: String::from_utf8_lossy(&scope_end_output.stdout)
-            .trim()
-            .to_string(),
+        base_oid: new_base.clone(),
+        end_oid: endpoint,
     };
 
     let auto_approve_parent = if let Some(hash) = skip_to {
         let parent = format!("{}^", hash);
         let has_earlier = run_git_command(
             "check earlier commits",
-            &["rev-list", &format!("{}..{}", merge_base, parent)],
+            &["rev-list", &format!("{}..{}", new_base, parent)],
             &[],
             verbose,
         )?;
@@ -179,6 +181,34 @@ fn prepare_review_plan(
         ReviewBranchSelectionError::Git(error) => ReviewError::Git(error),
         ReviewBranchSelectionError::Conflict(message) => ReviewError::Message(message),
     })?;
+    let (old_review, old_base) = match &selection {
+        ReviewBranchSelection::New(_) => (None, None),
+        ReviewBranchSelection::Existing(branch) => {
+            let old_review = String::from_utf8_lossy(
+                &run_git_command(
+                    "resolve previous review head",
+                    &[
+                        "rev-parse",
+                        "--verify",
+                        &format!("refs/heads/{branch}^{{commit}}"),
+                    ],
+                    &[],
+                    verbose,
+                )?
+                .stdout,
+            )
+            .trim()
+            .to_string();
+            let saved = read_review_scope(branch, verbose).map_err(|error| match error {
+                ReviewScopeError::Git(error) => ReviewError::Git(error),
+                error => ReviewError::Message(format!(
+                    "Cannot read existing review range metadata: {error:?}"
+                )),
+            })?;
+            let old_base = saved.base_oid;
+            (Some(old_review), Some(old_base))
+        }
+    };
     let tracking_updates = vec![
         (
             format!("refs/remotes/{}", resolved_to.tracking_ref),
@@ -192,9 +222,11 @@ fn prepare_review_plan(
 
     Ok(ReviewPlan {
         metadata,
-        merge_base,
+        new_base,
         auto_approve_parent,
         selection,
+        old_review,
+        old_base,
         scope,
         tracking_updates,
     })
@@ -247,12 +279,54 @@ fn fetch_remote_commit(
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
-fn apply_review_plan(plan: ReviewPlan, verbose: bool) -> Result<bool, ReviewError> {
+fn merge_auto_approved_tree(
+    base: &str,
+    approved_tree: &str,
+    auto_approve_parent: &str,
+    verbose: bool,
+) -> Result<String, ReviewError> {
+    let output = run_git_command(
+        "compose explicitly auto-approved tree",
+        &[
+            "merge-tree",
+            "--write-tree",
+            &format!("--merge-base={base}"),
+            "-Xtheirs",
+            "-Xfind-renames=100%",
+            "--no-messages",
+            approved_tree,
+            auto_approve_parent,
+        ],
+        &[],
+        verbose,
+    )?;
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+fn create_commit_from_tree(
+    description: &str,
+    tree: &str,
+    parent: &str,
+    message: &str,
+    verbose: bool,
+) -> Result<String, ReviewError> {
+    let output = run_git_command(
+        description,
+        &["commit-tree", tree, "-p", parent, "-m", message],
+        &[],
+        verbose,
+    )?;
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+fn apply_review_plan(plan: ReviewPlan, verbose: bool) -> Result<ReviewPreparation, ReviewError> {
     let ReviewPlan {
         metadata,
-        merge_base,
+        new_base,
         auto_approve_parent,
         selection,
+        old_review,
+        old_base,
         scope,
         tracking_updates,
     } = plan;
@@ -273,7 +347,7 @@ fn apply_review_plan(plan: ReviewPlan, verbose: bool) -> Result<bool, ReviewErro
         ReviewBranchSelection::New(name) => {
             run_git_command(
                 "create review branch from merge-base",
-                &["checkout", "-b", &name, &merge_base],
+                &["checkout", "-b", &name, &new_base],
                 &[],
                 verbose,
             )?;
@@ -281,61 +355,72 @@ fn apply_review_plan(plan: ReviewPlan, verbose: bool) -> Result<bool, ReviewErro
         }
     };
 
-    if let Some(parent) = auto_approve_parent {
-        // Auto-approve commits before skip_to by squash merging them
+    let (mut approved_tree, parent) = if is_new {
+        (format!("{new_base}^{{tree}}"), new_base.clone())
+    } else {
+        let old_review = old_review
+            .as_deref()
+            .expect("existing review must have a head");
+        let old_base = old_base
+            .as_deref()
+            .expect("existing review must have a base");
+        (
+            reconstruct_approval_tree(old_base, &new_base, old_review, verbose)?.tree_oid,
+            old_review.to_string(),
+        )
+    };
+    if let Some(auto_parent) = auto_approve_parent.as_deref() {
+        approved_tree = merge_auto_approved_tree(&new_base, &approved_tree, auto_parent, verbose)?;
+    }
+
+    let new_review = if !is_new || auto_approve_parent.is_some() {
+        let message = if is_new {
+            "Auto-approve earlier commits"
+        } else {
+            "Reconstruct approved changes"
+        };
+        let description = if is_new {
+            "commit auto-approved changes"
+        } else {
+            "commit reconstructed approved tree"
+        };
+        let commit =
+            create_commit_from_tree(description, &approved_tree, &parent, message, verbose)?;
         run_git_command(
-            "auto-approve earlier commits",
+            "update review ref to reconstructed approval",
             &[
-                "-c",
-                "rerere.enabled=false",
-                "merge",
-                "--squash",
-                "--ff",
-                "--quiet",
-                "--no-stat",
-                "-X",
-                "theirs",
+                "update-ref",
+                &format!("refs/heads/{review_branch}"),
+                &commit,
                 &parent,
             ],
             &[],
             verbose,
         )?;
-        run_git_command(
-            "commit auto-approved changes",
-            &["commit", "--quiet", "-m", "Auto-approve earlier commits"],
-            &[],
-            verbose,
-        )?;
-    }
+        commit
+    } else {
+        new_base.clone()
+    };
 
-    let target_commit = scope.end_oid.clone();
-
-    // Squash merge remaining changes
     run_git_command(
-        "squash merge remaining changes",
-        &[
-            "-c",
-            "rerere.enabled=false",
-            "merge",
-            "--squash",
-            "--ff",
-            "--quiet",
-            "--no-stat",
-            "-X",
-            "theirs",
-            &target_commit,
-        ],
+        "materialize review endpoint tree",
+        &["read-tree", "--reset", "-u", &scope.end_oid],
         &[],
         verbose,
     )?;
-
-    // Unstage changes for review
-    run_git_command("unstage changes for review", &["reset"], &[], verbose)?;
+    run_git_command(
+        "unstage changes for review",
+        &["reset", "--mixed", &new_review],
+        &[],
+        verbose,
+    )?;
     if is_new {
         write_review_metadata(&review_branch, &metadata, verbose)?;
     }
     write_review_scope(&review_branch, &scope, verbose)?;
-    Ok(!is_clean(verbose)?)
+    Ok(ReviewPreparation {
+        has_unreviewed_changes: !is_clean(verbose)?,
+    })
 }
 
 /// Commit reviewed changes and discard unreviewed ones
@@ -401,10 +486,19 @@ pub fn get_review_status(
     display_label: &str,
     verbose: bool,
 ) -> Result<ReviewStatus, crate::git::GitCommandError> {
+    calculate_review_status_between("HEAD", compare_ref, display_label, verbose)
+}
+
+fn calculate_review_status_between(
+    review_ref: &str,
+    compare_ref: &str,
+    display_label: &str,
+    verbose: bool,
+) -> Result<ReviewStatus, crate::git::GitCommandError> {
     // Get diff stats summary (use HEAD..branch for direct comparison, not HEAD...branch)
     let stat_output = run_git_command(
         "get diff stats",
-        &["diff", "--stat", "HEAD", compare_ref],
+        &["diff", "--stat", review_ref, compare_ref],
         &[],
         verbose,
     )?;
@@ -437,7 +531,7 @@ pub fn get_review_status(
     // Get list of changed files
     let files_output = run_git_command(
         "get changed files",
-        &["diff", "--name-only", "HEAD", compare_ref],
+        &["diff", "--name-only", review_ref, compare_ref],
         &[],
         verbose,
     )?;

@@ -1,10 +1,21 @@
-use crate::git::{run_git_command, GitCommandError};
+use crate::git::{run_git_command, run_git_command_with_env, GitCommandError};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{self, Read};
 use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use tempfile::TempDir;
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct ReviewPreparation {
+    pub has_unreviewed_changes: bool,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct ReconstructionOutcome {
+    pub tree_oid: String,
+    pub downgraded_paths: Vec<String>,
+}
 
 #[derive(Debug)]
 pub enum ReviewError {
@@ -20,6 +31,348 @@ impl From<GitCommandError> for ReviewError {
     fn from(error: GitCommandError) -> Self {
         Self::Git(error)
     }
+}
+
+pub fn find_unique_merge_base(
+    left: &str,
+    right: &str,
+    verbose: bool,
+) -> Result<String, ReviewError> {
+    let output = run_git_command(
+        "get unique merge base",
+        &["merge-base", "--all", left, right],
+        &[1],
+        verbose,
+    )?;
+    let bases: Vec<_> = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter(|line| !line.is_empty())
+        .map(str::to_owned)
+        .collect();
+    match bases.as_slice() {
+        [base] => Ok(base.clone()),
+        [] => Err(ReviewError::Message(format!(
+            "No unique safe merge base exists between `{left}` and `{right}`."
+        ))),
+        _ => Err(ReviewError::Message(format!(
+            "Multiple merge bases exist between `{left}` and `{right}`; refusing to guess approval history."
+        ))),
+    }
+}
+
+fn parse_merge_tree_output(stdout: &[u8]) -> Result<(Option<String>, Vec<String>), ReviewError> {
+    let mut fields = stdout.split(|byte| *byte == 0);
+    let tree = fields
+        .next()
+        .map(|field| {
+            std::str::from_utf8(field).map_err(|_| {
+                ReviewError::Message("Git returned a non-UTF-8 tree object ID.".to_string())
+            })
+        })
+        .transpose()?
+        .map(str::trim)
+        .filter(|field| !field.is_empty())
+        .map(str::to_owned);
+    let mut paths = Vec::new();
+    for field in fields {
+        if field.is_empty() {
+            break;
+        }
+        let path = std::str::from_utf8(field).map_err(|_| {
+            ReviewError::Message(
+                "Git reported a non-UTF-8 conflict path; refusing the reconstructed tree."
+                    .to_string(),
+            )
+        })?;
+        paths.push(path.to_string());
+    }
+    Ok((tree, paths))
+}
+
+fn run_reconstruction_git_command(
+    description: &str,
+    args: &[&str],
+    allowed_exit_codes: &[i32],
+    verbose: bool,
+) -> Result<std::process::Output, GitCommandError> {
+    run_git_command(description, args, allowed_exit_codes, verbose)
+}
+
+fn read_tree_entry(
+    revision: &str,
+    path: &str,
+    verbose: bool,
+) -> Result<Option<(String, String)>, ReviewError> {
+    let output = run_reconstruction_git_command(
+        "inspect reconstruction tree entry",
+        &["--literal-pathspecs", "ls-tree", "-z", revision, "--", path],
+        &[],
+        verbose,
+    )?;
+    if output.stdout.is_empty() {
+        return Ok(None);
+    }
+    let record = output
+        .stdout
+        .split(|byte| *byte == 0)
+        .next()
+        .unwrap_or_default();
+    let header = record
+        .split(|byte| *byte == b'\t')
+        .next()
+        .ok_or_else(|| ReviewError::Message("Git returned an invalid tree entry".to_string()))?;
+    let header = String::from_utf8_lossy(header);
+    let mut fields = header.split_whitespace();
+    let mode = fields.next().unwrap_or_default().to_string();
+    let kind = fields.next().unwrap_or_default();
+    let oid = fields.next().unwrap_or_default().to_string();
+    if kind != "blob" || mode.is_empty() || oid.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some((mode, oid)))
+}
+
+fn read_tree_entries(
+    revision: &str,
+    verbose: bool,
+) -> Result<BTreeMap<Vec<u8>, (String, String)>, ReviewError> {
+    let output = run_reconstruction_git_command(
+        "inspect reconstruction tree",
+        &["ls-tree", "-rz", revision],
+        &[],
+        verbose,
+    )?;
+    let mut entries = BTreeMap::new();
+    for record in output.stdout.split(|byte| *byte == 0) {
+        if record.is_empty() {
+            continue;
+        }
+        let Some(tab) = record.iter().position(|byte| *byte == b'\t') else {
+            return Err(ReviewError::Message(
+                "Git returned an invalid recursive tree entry.".to_string(),
+            ));
+        };
+        let header = std::str::from_utf8(&record[..tab]).map_err(|_| {
+            ReviewError::Message("Git returned a non-UTF-8 tree entry header.".to_string())
+        })?;
+        let mut fields = header.split_whitespace();
+        let mode = fields.next().unwrap_or_default();
+        let kind = fields.next().unwrap_or_default();
+        let oid = fields.next().unwrap_or_default();
+        let is_supported_leaf = kind == "blob" || (kind == "commit" && mode == "160000");
+        if !is_supported_leaf || mode.is_empty() || oid.is_empty() {
+            continue;
+        }
+        entries.insert(
+            record[tab + 1..].to_vec(),
+            (mode.to_string(), oid.to_string()),
+        );
+    }
+    Ok(entries)
+}
+
+fn find_ambiguous_exact_rename_paths(
+    old_base: &str,
+    old_review: &str,
+    verbose: bool,
+) -> Result<Vec<String>, ReviewError> {
+    let correspondence_key = |entry: &(String, String)| {
+        let compatible_type = if entry.0 == "100644" || entry.0 == "100755" {
+            "regular".to_string()
+        } else {
+            entry.0.clone()
+        };
+        (compatible_type, entry.1.clone())
+    };
+    let base = read_tree_entries(old_base, verbose)?;
+    let review = read_tree_entries(old_review, verbose)?;
+    let mut removed: BTreeMap<(String, String), Vec<&[u8]>> = BTreeMap::new();
+    let mut added: BTreeMap<(String, String), Vec<&[u8]>> = BTreeMap::new();
+    for (path, entry) in &base {
+        if !review.contains_key(path) {
+            removed
+                .entry(correspondence_key(entry))
+                .or_default()
+                .push(path);
+        }
+    }
+    for (path, entry) in &review {
+        if !base.contains_key(path) {
+            added
+                .entry(correspondence_key(entry))
+                .or_default()
+                .push(path);
+        }
+    }
+
+    let mut ambiguous = BTreeSet::new();
+    for (entry, removed_paths) in removed {
+        let Some(added_paths) = added.get(&entry) else {
+            continue;
+        };
+        if removed_paths.len() * added_paths.len() <= 1 {
+            continue;
+        }
+        ambiguous.extend(removed_paths);
+        ambiguous.extend(added_paths.iter().copied());
+    }
+    ambiguous
+        .into_iter()
+        .map(|path| {
+            std::str::from_utf8(path).map(str::to_string).map_err(|_| {
+                ReviewError::Message(
+                    "Git found ambiguous exact renames with a non-UTF-8 path; refusing the reconstructed tree."
+                        .to_string(),
+                )
+            })
+        })
+        .collect()
+}
+
+fn is_binary_blob(oid: &str, verbose: bool) -> Result<bool, ReviewError> {
+    let output = run_reconstruction_git_command(
+        "inspect conflicting blob",
+        &["cat-file", "blob", oid],
+        &[],
+        verbose,
+    )?;
+    Ok(output.stdout.contains(&0))
+}
+
+fn text_conflict_can_keep_hunks(
+    old_base: &str,
+    new_base: &str,
+    old_review: &str,
+    path: &str,
+    verbose: bool,
+) -> Result<bool, ReviewError> {
+    let Some(old) = read_tree_entry(old_base, path, verbose)? else {
+        return Ok(false);
+    };
+    let Some(new) = read_tree_entry(new_base, path, verbose)? else {
+        return Ok(false);
+    };
+    let Some(review) = read_tree_entry(old_review, path, verbose)? else {
+        return Ok(false);
+    };
+    let regular = |mode: &str| mode == "100644" || mode == "100755";
+    if old.0 != new.0 || old.0 != review.0 || !regular(&old.0) {
+        return Ok(false);
+    }
+    Ok(!is_binary_blob(&old.1, verbose)?
+        && !is_binary_blob(&new.1, verbose)?
+        && !is_binary_blob(&review.1, verbose)?)
+}
+
+pub fn reconstruct_approval_tree(
+    old_base: &str,
+    new_base: &str,
+    old_review: &str,
+    verbose: bool,
+) -> Result<ReconstructionOutcome, ReviewError> {
+    let diagnostic = run_reconstruction_git_command(
+        "identify approval reconstruction conflicts",
+        &[
+            "merge-tree",
+            "--write-tree",
+            &format!("--merge-base={old_base}"),
+            "-Xfind-renames=100%",
+            "--messages",
+            "--name-only",
+            "-z",
+            new_base,
+            old_review,
+        ],
+        &[1],
+        verbose,
+    )?;
+    let (_, conflict_paths) = parse_merge_tree_output(&diagnostic.stdout)?;
+    if diagnostic.status.code() == Some(1) && conflict_paths.is_empty() {
+        return Err(ReviewError::Message(
+            "Approval reconstruction conflicted but Git did not identify any paths; refusing the reconstructed tree."
+                .to_string(),
+        ));
+    }
+
+    let merged = run_reconstruction_git_command(
+        "reconstruct approved tree",
+        &[
+            "merge-tree",
+            "--write-tree",
+            &format!("--merge-base={old_base}"),
+            "-Xours",
+            "-Xfind-renames=100%",
+            "--no-messages",
+            new_base,
+            old_review,
+        ],
+        &[1],
+        verbose,
+    )?;
+    let tree_oid = String::from_utf8_lossy(&merged.stdout)
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    if tree_oid.is_empty() {
+        return Err(ReviewError::Message(
+            "Git did not return a reconstructed approval tree.".to_string(),
+        ));
+    }
+
+    let mut downgraded = find_ambiguous_exact_rename_paths(old_base, new_base, verbose)?;
+    downgraded.extend(find_ambiguous_exact_rename_paths(
+        old_base, old_review, verbose,
+    )?);
+    for path in &conflict_paths {
+        if merged.status.code() == Some(1)
+            || !text_conflict_can_keep_hunks(old_base, new_base, old_review, path, verbose)?
+        {
+            downgraded.push(path.clone());
+        }
+    }
+    downgraded.sort();
+    downgraded.dedup();
+    if downgraded.is_empty() {
+        return Ok(ReconstructionOutcome {
+            tree_oid,
+            downgraded_paths: downgraded,
+        });
+    }
+
+    let scratch = TempDir::new().map_err(|error| {
+        ReviewError::Message(format!("failed to create scratch index: {error}"))
+    })?;
+    let index = scratch.path().join("index");
+    let scratch_env = [("GIT_INDEX_FILE", index.as_os_str())];
+    run_git_command_with_env(
+        "load reconstructed tree into scratch index",
+        &["read-tree", &tree_oid],
+        &scratch_env,
+        &[],
+        verbose,
+    )?;
+    for path in &downgraded {
+        run_git_command_with_env(
+            "downgrade conflicted path to new base",
+            &["--literal-pathspecs", "reset", new_base, "--", path],
+            &scratch_env,
+            &[],
+            verbose,
+        )?;
+    }
+    let output = run_git_command_with_env(
+        "write reconstructed scratch index",
+        &["write-tree"],
+        &scratch_env,
+        &[],
+        verbose,
+    )?;
+    Ok(ReconstructionOutcome {
+        tree_oid: String::from_utf8_lossy(&output.stdout).trim().to_string(),
+        downgraded_paths: downgraded,
+    })
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -957,5 +1310,21 @@ fn files_equal(left: &Path, right: &Path) -> io::Result<bool> {
         if left_count == 0 {
             return Ok(true);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_merge_tree_output;
+
+    #[test]
+    fn merge_tree_output_rejects_non_utf8_conflict_paths() {
+        let mut output = b"0123456789012345678901234567890123456789\0".to_vec();
+        output.extend_from_slice(b"unsafe-\xff.bin\0\0");
+
+        let error = parse_merge_tree_output(&output)
+            .expect_err("non-UTF-8 conflict paths must fail closed before tree adoption");
+
+        assert!(format!("{error:?}").contains("non-UTF-8 conflict path"));
     }
 }
