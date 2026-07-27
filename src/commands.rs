@@ -1,7 +1,8 @@
 use crate::git::{
     is_clean, read_review_scope, resolve_remote_tracking_branch, run_git_command,
-    select_review_branch, write_review_metadata, write_review_scope, ReviewBranchSelection,
-    ReviewBranchSelectionError, ReviewMetadata, ReviewScope, ReviewScopeError,
+    run_git_command_machine_output, select_review_branch, write_review_metadata,
+    write_review_scope, ReviewBranchSelection, ReviewBranchSelectionError, ReviewMetadata,
+    ReviewScope, ReviewScopeError,
 };
 use crate::review::{
     find_unique_merge_base, reconstruct_approval_tree, ReviewError, ReviewPreparation,
@@ -472,7 +473,8 @@ pub struct ReviewStatus {
 }
 
 fn display_diff_path(path: &[u8]) -> String {
-    let is_unambiguous = std::str::from_utf8(path).is_ok()
+    let is_unambiguous = std::str::from_utf8(path)
+        .is_ok_and(|text| !text.chars().any(is_unsafe_display_character))
         && !path
             .iter()
             .any(|byte| byte.is_ascii_control() || matches!(*byte, b'\\' | b'"'))
@@ -498,7 +500,23 @@ fn display_diff_path(path: &[u8]) -> String {
     rendered
 }
 
-fn parse_name_status(output: &[u8]) -> Vec<String> {
+fn is_unsafe_display_character(character: char) -> bool {
+    character.is_control()
+        || matches!(
+            character,
+            '\u{00AD}'
+                | '\u{061C}'
+                | '\u{200B}'..='\u{200F}'
+                | '\u{2028}'..='\u{202E}'
+                | '\u{2060}'..='\u{206F}'
+                | '\u{FEFF}'
+                | '\u{FFF9}'..='\u{FFFB}'
+                | '\u{E0001}'
+                | '\u{E0020}'..='\u{E007F}'
+        )
+}
+
+fn parse_name_status(output: &[u8]) -> Result<Vec<String>, String> {
     let mut fields = output.split(|byte| *byte == 0).peekable();
     let mut files = Vec::new();
 
@@ -508,12 +526,18 @@ fn parse_name_status(output: &[u8]) -> Vec<String> {
         }
         let status = String::from_utf8_lossy(status);
         let Some(first_path) = fields.next() else {
-            break;
+            return Err("missing path after status record".to_string());
         };
+        if first_path.is_empty() {
+            return Err("empty path after status record".to_string());
+        }
         if status.starts_with('R') || status.starts_with('C') {
             let Some(second_path) = fields.next() else {
-                break;
+                return Err("missing destination path after rename or copy record".to_string());
             };
+            if second_path.is_empty() {
+                return Err("missing destination path after rename or copy record".to_string());
+            }
             files.push(format!(
                 "{status} {} -> {}",
                 display_diff_path(first_path),
@@ -524,10 +548,10 @@ fn parse_name_status(output: &[u8]) -> Vec<String> {
         }
     }
 
-    files
+    Ok(files)
 }
 
-fn parse_numstat_totals(output: &[u8]) -> (usize, usize) {
+fn parse_numstat_totals(output: &[u8]) -> Result<(usize, usize), String> {
     let mut fields = output.split(|byte| *byte == 0).peekable();
     let mut insertions = 0;
     let mut deletions = 0;
@@ -537,27 +561,37 @@ fn parse_numstat_totals(output: &[u8]) -> (usize, usize) {
             continue;
         }
         let mut stats = record.splitn(3, |byte| *byte == b'\t');
-        let added = stats.next().unwrap_or_default();
-        let deleted = stats.next().unwrap_or_default();
-        let path = stats.next().unwrap_or_default();
-        insertions += std::str::from_utf8(added)
-            .ok()
-            .and_then(|count| count.parse::<usize>().ok())
-            .unwrap_or(0);
-        deletions += std::str::from_utf8(deleted)
-            .ok()
-            .and_then(|count| count.parse::<usize>().ok())
-            .unwrap_or(0);
+        let added = stats.next().ok_or("missing insertion count")?;
+        let deleted = stats.next().ok_or("missing deletion count")?;
+        let path = stats.next().ok_or("missing numstat path field")?;
+        let parse_count = |count: &[u8], label: &str| {
+            if count == b"-" {
+                return Ok(0);
+            }
+            std::str::from_utf8(count)
+                .map_err(|_| format!("non-UTF-8 {label} count"))?
+                .parse::<usize>()
+                .map_err(|_| format!("invalid {label} count"))
+        };
+        insertions += parse_count(added, "insertion")?;
+        deletions += parse_count(deleted, "deletion")?;
 
         // In -z numstat output, renamed and copied paths are emitted as an empty path field
         // followed by their old and new paths. Their counts belong to the record above.
         if path.is_empty() {
-            let _ = fields.next();
-            let _ = fields.next();
+            let old_path = fields
+                .next()
+                .ok_or("missing old path after renamed numstat record")?;
+            let new_path = fields
+                .next()
+                .ok_or("missing new path after renamed numstat record")?;
+            if old_path.is_empty() || new_path.is_empty() {
+                return Err("missing new path after renamed numstat record".to_string());
+            }
         }
     }
 
-    (insertions, deletions)
+    Ok((insertions, deletions))
 }
 
 /// Get review status (remaining diff stats)
@@ -575,7 +609,7 @@ pub fn get_review_status(
     compare_ref: &str,
     display_label: &str,
     verbose: bool,
-) -> Result<ReviewStatus, crate::git::GitCommandError> {
+) -> Result<ReviewStatus, ReviewError> {
     calculate_review_status_between("HEAD", compare_ref, display_label, verbose)
 }
 
@@ -584,10 +618,10 @@ fn calculate_review_status_between(
     compare_ref: &str,
     display_label: &str,
     verbose: bool,
-) -> Result<ReviewStatus, crate::git::GitCommandError> {
+) -> Result<ReviewStatus, ReviewError> {
     // Use NUL-delimited machine-readable output. Human-oriented --stat text is localized and
     // cannot distinguish renames or tree entry kinds reliably.
-    let name_status_output = run_git_command(
+    let name_status_output = run_git_command_machine_output(
         "get changed file statuses",
         &[
             "diff",
@@ -600,8 +634,10 @@ fn calculate_review_status_between(
         &[],
         verbose,
     )?;
-    let files = parse_name_status(&name_status_output.stdout);
-    let numstat_output = run_git_command(
+    let files = parse_name_status(&name_status_output.stdout).map_err(|error| {
+        ReviewError::Message(format!("Git returned invalid name-status output: {error}"))
+    })?;
+    let numstat_output = run_git_command_machine_output(
         "get changed line counts",
         &[
             "diff",
@@ -614,7 +650,10 @@ fn calculate_review_status_between(
         &[],
         verbose,
     )?;
-    let (insertions, deletions) = parse_numstat_totals(&numstat_output.stdout);
+    let (insertions, deletions) =
+        parse_numstat_totals(&numstat_output.stdout).map_err(|error| {
+            ReviewError::Message(format!("Git returned invalid numstat output: {error}"))
+        })?;
 
     Ok(ReviewStatus {
         display_label: display_label.to_string(),
@@ -627,7 +666,7 @@ fn calculate_review_status_between(
 
 #[cfg(test)]
 mod tests {
-    use super::parse_name_status;
+    use super::{display_diff_path, parse_name_status, parse_numstat_totals};
     use std::io::Write;
     use std::path::Path;
     use std::process::{Command, Stdio};
@@ -701,8 +740,40 @@ mod tests {
         );
 
         assert_eq!(
-            parse_name_status(&output),
+            parse_name_status(&output).expect("Git output should parse"),
             vec!["R100 \"invalid-\\xFF-old.txt\" -> \"invalid-\\xFF-new.txt\""],
+        );
+    }
+
+    #[test]
+    fn parse_name_status_rejects_incomplete_rename_record() {
+        assert_eq!(
+            parse_name_status(b"R100\0old-name.txt\0").unwrap_err(),
+            "missing destination path after rename or copy record"
+        );
+    }
+
+    #[test]
+    fn parse_numstat_rejects_invalid_counts_and_incomplete_renames() {
+        assert_eq!(
+            parse_numstat_totals(b"not-a-number\t0\tfile.txt\0").unwrap_err(),
+            "invalid insertion count"
+        );
+        assert_eq!(
+            parse_numstat_totals(b"1\t0\t\0old-name.txt\0").unwrap_err(),
+            "missing new path after renamed numstat record"
+        );
+    }
+
+    #[test]
+    fn display_diff_path_escapes_unicode_control_and_bidi_characters() {
+        assert_eq!(
+            display_diff_path("c1-\u{009B}-path".as_bytes()),
+            "\"c1-\\xC2\\x9B-path\""
+        );
+        assert_eq!(
+            display_diff_path("bidi-\u{202E}-path".as_bytes()),
+            "\"bidi-\\xE2\\x80\\xAE-path\""
         );
     }
 }

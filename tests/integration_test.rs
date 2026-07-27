@@ -3111,6 +3111,40 @@ fn test_status_escapes_newline_rename_paths() {
 }
 
 #[test]
+fn test_verbose_status_does_not_emit_raw_machine_paths() {
+    let repo = TempGitRepo::new();
+    let newline_old = repo.path().join("verbose\nold.txt");
+    let newline_new = repo.path().join("verbose\nnew.txt");
+    let escape_old = repo.path().join("escape\u{001b}old.txt");
+    let escape_new = repo.path().join("escape\u{001b}new.txt");
+    std::fs::write(&newline_old, "newline fixture\n").unwrap();
+    std::fs::write(&escape_old, "escape fixture\n").unwrap();
+    repo.git(&["add", "-A"]);
+    repo.commit("Add verbose unsafe path fixtures");
+    repo.git(&["push", "origin", "main"]);
+    repo.create_branch("develop");
+    std::fs::rename(&newline_old, &newline_new).unwrap();
+    std::fs::rename(&escape_old, &escape_new).unwrap();
+    repo.git(&["add", "-A"]);
+    repo.commit("Rename verbose unsafe path fixtures");
+    repo.git(&["push", "-u", "origin", "develop"]);
+    repo.switch_branch("main");
+    assert!(repo
+        .run_cresca(&["review", "main", "develop"])
+        .status
+        .success());
+
+    let output = repo.run_cresca(&["--verbose", "status"]);
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("R100 \"verbose\\nold.txt\" -> \"verbose\\nnew.txt\""));
+    assert!(stdout.contains("R100 \"escape\\x1Bold.txt\" -> \"escape\\x1Bnew.txt\""));
+    assert!(!stdout.as_bytes().contains(&0), "{stdout:?}");
+    assert!(!stdout.contains('\u{001b}'), "{stdout:?}");
+    assert!(!stdout.contains("verbose\nold.txt"), "{stdout:?}");
+}
+
+#[test]
 fn test_status_displays_edited_rename_and_preserves_endpoint_hunks_without_index_mutation() {
     let repo = TempGitRepo::new();
     let original = (0..100)
@@ -3123,10 +3157,8 @@ fn test_status_displays_edited_rename_and_preserves_endpoint_hunks_without_index
 
     repo.create_branch("develop");
     repo.git(&["mv", "before.txt", "after.txt"]);
-    repo.write_file(
-        "after.txt",
-        &original.replace("line 050\n", "line changed\n"),
-    );
+    let edited = original.replace("line 050\n", "line changed\n");
+    repo.write_file("after.txt", &edited);
     repo.git(&["add", "after.txt"]);
     repo.commit("Rename and edit fixture");
     repo.git(&["push", "-u", "origin", "develop"]);
@@ -3149,6 +3181,10 @@ fn test_status_displays_edited_rename_and_preserves_endpoint_hunks_without_index
     );
     assert!(repo.path().join("after.txt").exists());
     assert!(!repo.path().join("before.txt").exists());
+    assert_eq!(
+        std::fs::read(repo.path().join("after.txt")).expect("destination should be readable"),
+        edited.as_bytes()
+    );
 
     let endpoint_diff = repo.git_stdout(&["diff", "--find-renames=50%", "HEAD", "origin/develop"]);
     assert!(
@@ -3167,11 +3203,17 @@ fn test_status_displays_edited_rename_and_preserves_endpoint_hunks_without_index
         String::from_utf8_lossy(&output.stderr)
     );
     let stdout = String::from_utf8(output.stdout).expect("status stdout should be UTF-8");
-    assert!(stdout.contains("1 file(s), +1 insertion(s), -1 deletion(s)"));
-    assert!(
-        stdout.contains("    - R098 before.txt -> after.txt\n"),
-        "{stdout}"
+    assert_eq!(
+        stdout,
+        concat!(
+            "📋 Review status (current range):\n",
+            "  Remaining diff in current review range: 1 file(s), +1 insertion(s), -1 deletion(s)\n",
+            "  Files remaining:\n",
+            "    - R098 before.txt -> after.txt\n",
+        )
     );
+    assert!(!stdout.contains("@@"));
+    assert!(!stdout.contains("line changed"));
 }
 
 #[test]
@@ -3320,6 +3362,75 @@ fn test_status_keeps_partial_code_movement_as_ordinary_changes() {
     assert!(stdout.contains("    - within.txt\n"));
     assert!(!stdout.contains("R050 source.txt -> destination.txt"));
     assert!(!stdout.contains("R099 within.txt -> within.txt"));
+}
+
+#[test]
+fn test_rereview_keeps_approved_partial_movements_unapproved_after_branch_updates() {
+    let repo = TempGitRepo::new();
+    repo.write_file("within.txt", "move-within\nkeep-within\n");
+    repo.write_file("source.txt", "move-cross-a\nmove-cross-b\nkeep-cross\n");
+    repo.git(&["add", "within.txt", "source.txt"]);
+    repo.commit("Add partial movement approval fixtures");
+    repo.git(&["push", "origin", "main"]);
+
+    repo.create_branch("develop");
+    repo.write_file("within.txt", "keep-within\nmove-within\n");
+    repo.write_file("source.txt", "keep-cross\n");
+    repo.write_file("destination.txt", "move-cross-a\nmove-cross-b\n");
+    repo.git(&["add", "-A"]);
+    repo.commit("Move approved code within and between files");
+    repo.git(&["push", "-u", "origin", "develop"]);
+
+    repo.switch_branch("main");
+    assert!(repo
+        .run_cresca(&["review", "main", "develop"])
+        .status
+        .success());
+    repo.git(&["add", "-A"]);
+    assert!(repo.run_cresca(&["approve"]).status.success());
+
+    repo.switch_branch("main");
+    repo.git(&["rm", "within.txt", "source.txt"]);
+    repo.write_file("destination.txt", "target destination\n");
+    repo.git(&["add", "-A"]);
+    repo.commit("Advance target across movement paths");
+    repo.git(&["push", "origin", "main"]);
+    let target = repo.rev_parse("HEAD");
+
+    repo.git(&["checkout", "-B", "develop", &target]);
+    repo.write_file("within.txt", "keep-within\nmove-within\n");
+    repo.write_file("source.txt", "keep-cross\n");
+    repo.write_file("destination.txt", "move-cross-a\nmove-cross-b\n");
+    repo.write_file("later.txt", "unreviewed endpoint content\n");
+    repo.git(&["add", "-A"]);
+    repo.commit("Reapply partial movements after target update");
+    let endpoint = repo.rev_parse("HEAD");
+    repo.git(&["push", "--force", "origin", "develop"]);
+
+    repo.switch_branch("review-main-develop");
+    assert!(repo
+        .run_cresca(&["review", "main", "develop"])
+        .status
+        .success());
+    assert!(!repo
+        .git_maybe(&["cat-file", "-e", "HEAD:within.txt"])
+        .status
+        .success());
+    assert!(!repo
+        .git_maybe(&["cat-file", "-e", "HEAD:source.txt"])
+        .status
+        .success());
+    assert_eq!(
+        repo.git_stdout(&["show", "HEAD:destination.txt"]),
+        "target destination"
+    );
+    assert_eq!(repo.read_file("within.txt"), "keep-within\nmove-within\n");
+    assert_eq!(repo.read_file("source.txt"), "keep-cross\n");
+    assert_eq!(
+        repo.read_file("destination.txt"),
+        "move-cross-a\nmove-cross-b\n"
+    );
+    assert_eq!(repo.worktree_diff(), repo.diff("HEAD", &endpoint));
 }
 
 /// Test that `cresca status` fails on a non-review branch.
