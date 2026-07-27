@@ -470,6 +470,72 @@ pub struct ReviewStatus {
     pub files: Vec<String>,
 }
 
+fn display_diff_path(path: &[u8]) -> String {
+    String::from_utf8_lossy(path).into_owned()
+}
+
+fn parse_name_status(output: &[u8]) -> Vec<String> {
+    let mut fields = output.split(|byte| *byte == 0).peekable();
+    let mut files = Vec::new();
+
+    while let Some(status) = fields.next() {
+        if status.is_empty() {
+            continue;
+        }
+        let status = String::from_utf8_lossy(status);
+        let Some(first_path) = fields.next() else {
+            break;
+        };
+        if status.starts_with('R') || status.starts_with('C') {
+            let Some(second_path) = fields.next() else {
+                break;
+            };
+            files.push(format!(
+                "{status} {} -> {}",
+                display_diff_path(first_path),
+                display_diff_path(second_path)
+            ));
+        } else {
+            files.push(display_diff_path(first_path));
+        }
+    }
+
+    files
+}
+
+fn parse_numstat_totals(output: &[u8]) -> (usize, usize) {
+    let mut fields = output.split(|byte| *byte == 0).peekable();
+    let mut insertions = 0;
+    let mut deletions = 0;
+
+    while let Some(record) = fields.next() {
+        if record.is_empty() {
+            continue;
+        }
+        let mut stats = record.splitn(3, |byte| *byte == b'\t');
+        let added = stats.next().unwrap_or_default();
+        let deleted = stats.next().unwrap_or_default();
+        let path = stats.next().unwrap_or_default();
+        insertions += std::str::from_utf8(added)
+            .ok()
+            .and_then(|count| count.parse::<usize>().ok())
+            .unwrap_or(0);
+        deletions += std::str::from_utf8(deleted)
+            .ok()
+            .and_then(|count| count.parse::<usize>().ok())
+            .unwrap_or(0);
+
+        // In -z numstat output, renamed and copied paths are emitted as an empty path field
+        // followed by their old and new paths. Their counts belong to the record above.
+        if path.is_empty() {
+            let _ = fields.next();
+            let _ = fields.next();
+        }
+    }
+
+    (insertions, deletions)
+}
+
 /// Get review status (remaining diff stats)
 ///
 /// # Arguments
@@ -495,55 +561,40 @@ fn calculate_review_status_between(
     display_label: &str,
     verbose: bool,
 ) -> Result<ReviewStatus, crate::git::GitCommandError> {
-    // Get diff stats summary (use HEAD..branch for direct comparison, not HEAD...branch)
-    let stat_output = run_git_command(
-        "get diff stats",
-        &["diff", "--stat", review_ref, compare_ref],
+    // Use NUL-delimited machine-readable output. Human-oriented --stat text is localized and
+    // cannot distinguish renames or tree entry kinds reliably.
+    let name_status_output = run_git_command(
+        "get changed file statuses",
+        &[
+            "diff",
+            "--name-status",
+            "-z",
+            "--find-renames=50%",
+            review_ref,
+            compare_ref,
+        ],
         &[],
         verbose,
     )?;
-    let stat_str = String::from_utf8_lossy(&stat_output.stdout);
-
-    // Parse stats from last line (e.g., " 4 files changed, 7 insertions(+), 2 deletions(-)")
-    let mut file_count = 0;
-    let mut insertions = 0;
-    let mut deletions = 0;
-
-    if let Some(last_line) = stat_str.lines().last() {
-        for part in last_line.split(',') {
-            let part = part.trim();
-            if part.contains("file") {
-                if let Some(num) = part.split_whitespace().next() {
-                    file_count = num.parse().unwrap_or(0);
-                }
-            } else if part.contains("insertion") {
-                if let Some(num) = part.split_whitespace().next() {
-                    insertions = num.parse().unwrap_or(0);
-                }
-            } else if part.contains("deletion") {
-                if let Some(num) = part.split_whitespace().next() {
-                    deletions = num.parse().unwrap_or(0);
-                }
-            }
-        }
-    }
-
-    // Get list of changed files
-    let files_output = run_git_command(
-        "get changed files",
-        &["diff", "--name-only", review_ref, compare_ref],
+    let files = parse_name_status(&name_status_output.stdout);
+    let numstat_output = run_git_command(
+        "get changed line counts",
+        &[
+            "diff",
+            "--numstat",
+            "-z",
+            "--find-renames=50%",
+            review_ref,
+            compare_ref,
+        ],
         &[],
         verbose,
     )?;
-    let files: Vec<String> = String::from_utf8_lossy(&files_output.stdout)
-        .lines()
-        .filter(|s| !s.is_empty())
-        .map(|s| s.to_string())
-        .collect();
+    let (insertions, deletions) = parse_numstat_totals(&numstat_output.stdout);
 
     Ok(ReviewStatus {
         display_label: display_label.to_string(),
-        file_count,
+        file_count: files.len(),
         insertions,
         deletions,
         files,
