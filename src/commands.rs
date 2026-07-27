@@ -7,6 +7,7 @@ use crate::review::{
     find_unique_merge_base, reconstruct_approval_tree, ReviewError, ReviewPreparation,
     ReviewTransaction,
 };
+use std::fmt::Write as _;
 use std::ops::Not;
 
 struct ReviewPlan {
@@ -471,7 +472,30 @@ pub struct ReviewStatus {
 }
 
 fn display_diff_path(path: &[u8]) -> String {
-    String::from_utf8_lossy(path).into_owned()
+    let is_unambiguous = std::str::from_utf8(path).is_ok()
+        && !path
+            .iter()
+            .any(|byte| byte.is_ascii_control() || matches!(*byte, b'\\' | b'"'))
+        && !path.windows(b" -> ".len()).any(|window| window == b" -> ");
+    if is_unambiguous {
+        return String::from_utf8(path.to_vec()).expect("validated UTF-8 path should decode");
+    }
+
+    let mut rendered = String::from("\"");
+    for &byte in path {
+        match byte {
+            b'\\' => rendered.push_str("\\\\"),
+            b'"' => rendered.push_str("\\\""),
+            b'\n' => rendered.push_str("\\n"),
+            b'\r' => rendered.push_str("\\r"),
+            b'\t' => rendered.push_str("\\t"),
+            byte if byte.is_ascii_graphic() || byte == b' ' => rendered.push(byte as char),
+            byte => write!(&mut rendered, "\\x{byte:02X}")
+                .expect("writing an escaped path to a String should not fail"),
+        }
+    }
+    rendered.push('"');
+    rendered
 }
 
 fn parse_name_status(output: &[u8]) -> Vec<String> {
@@ -599,4 +623,86 @@ fn calculate_review_status_between(
         deletions,
         files,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_name_status;
+    use std::io::Write;
+    use std::path::Path;
+    use std::process::{Command, Stdio};
+
+    fn git_stdout(repository: &Path, args: &[&str], input: &[u8]) -> Vec<u8> {
+        let mut child = Command::new("git")
+            .args(args)
+            .current_dir(repository)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("Git should start");
+        child
+            .stdin
+            .as_mut()
+            .expect("Git stdin should be available")
+            .write_all(input)
+            .expect("Git stdin should accept fixture data");
+        let output = child.wait_with_output().expect("Git should finish");
+        assert!(
+            output.status.success(),
+            "git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output.stdout
+    }
+
+    fn git_object_name(repository: &Path, args: &[&str], input: &[u8]) -> String {
+        String::from_utf8(git_stdout(repository, args, input))
+            .expect("Git object name should be UTF-8")
+            .trim()
+            .to_string()
+    }
+
+    #[test]
+    fn parse_name_status_escapes_non_utf8_rename_paths_from_git_tree_records() {
+        let repository = tempfile::tempdir().expect("temporary repository should be created");
+        let root = repository.path();
+        git_stdout(root, &["init", "-q"], b"");
+        git_stdout(root, &["config", "user.name", "Test User"], b"");
+        git_stdout(root, &["config", "user.email", "test@example.com"], b"");
+
+        let blob = git_object_name(root, &["hash-object", "-w", "--stdin"], b"fixture\n");
+        let tree_for = |name: &[u8]| {
+            let mut record = format!("100644 blob {blob}\t").into_bytes();
+            record.extend_from_slice(name);
+            record.push(0);
+            git_object_name(root, &["mktree", "-z"], &record)
+        };
+        let old_tree = tree_for(b"invalid-\xff-old.txt");
+        let new_tree = tree_for(b"invalid-\xff-new.txt");
+        let base = git_object_name(root, &["commit-tree", &old_tree, "-m", "base"], b"");
+        let endpoint = git_object_name(
+            root,
+            &["commit-tree", &new_tree, "-p", &base, "-m", "rename"],
+            b"",
+        );
+        let output = git_stdout(
+            root,
+            &[
+                "diff",
+                "--name-status",
+                "-z",
+                "--find-renames=50%",
+                &base,
+                &endpoint,
+            ],
+            b"",
+        );
+
+        assert_eq!(
+            parse_name_status(&output),
+            vec!["R100 \"invalid-\\xFF-old.txt\" -> \"invalid-\\xFF-new.txt\""],
+        );
+    }
 }

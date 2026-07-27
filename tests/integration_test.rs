@@ -3075,7 +3075,43 @@ fn test_status_displays_pure_rename_as_single_entry() {
 }
 
 #[test]
-fn test_status_displays_edited_rename_and_preserves_git_hunks() {
+fn test_status_escapes_newline_rename_paths() {
+    let repo = TempGitRepo::new();
+    let newline_old = repo.path().join("newline\nold.txt");
+    let newline_new = repo.path().join("newline\nnew.txt");
+    std::fs::write(&newline_old, "newline path fixture\n")
+        .expect("newline fixture should be writable");
+    repo.git(&["add", "-A"]);
+    repo.commit("Add unsafe rename path fixtures");
+    repo.git(&["push", "origin", "main"]);
+
+    repo.create_branch("develop");
+    std::fs::rename(&newline_old, &newline_new).expect("newline fixture should be renameable");
+    repo.git(&["add", "-A"]);
+    repo.commit("Rename unsafe path fixtures");
+    repo.git(&["push", "-u", "origin", "develop"]);
+
+    repo.switch_branch("main");
+    assert!(repo
+        .run_cresca(&["review", "main", "develop"])
+        .status
+        .success());
+
+    let output = repo.run_cresca(&["status"]);
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8(output.stdout).expect("status stdout should be UTF-8"),
+        concat!(
+            "📋 Review status (current range):\n",
+            "  Remaining diff in current review range: 1 file(s), +0 insertion(s), -0 deletion(s)\n",
+            "  Files remaining:\n",
+            "    - R100 \"newline\\nold.txt\" -> \"newline\\nnew.txt\"\n",
+        )
+    );
+}
+
+#[test]
+fn test_status_displays_edited_rename_and_preserves_endpoint_hunks_without_index_mutation() {
     let repo = TempGitRepo::new();
     let original = (0..100)
         .map(|line| format!("line {line:03}\n"))
@@ -3101,18 +3137,27 @@ fn test_status_displays_edited_rename_and_preserves_git_hunks() {
         .status
         .success());
 
-    assert_eq!(repo.worktree_diff(), repo.diff("HEAD", "origin/develop"));
-    repo.git(&["add", "-N", "after.txt"]);
-    let materialized_diff = repo.git_stdout(&["diff", "--find-renames=50%", "HEAD"]);
+    assert!(repo.cached_diff().is_empty());
+    let worktree_status = repo.git_stdout(&["status", "--porcelain"]);
     assert!(
-        materialized_diff.contains("rename from before.txt"),
-        "{materialized_diff}"
+        worktree_status.contains("D before.txt"),
+        "{worktree_status}"
     );
-    assert!(materialized_diff.contains("rename to after.txt"));
-    assert!(materialized_diff.contains("-line 050"));
-    assert!(materialized_diff.contains("+line changed"));
+    assert!(
+        worktree_status.contains("?? after.txt"),
+        "{worktree_status}"
+    );
     assert!(repo.path().join("after.txt").exists());
     assert!(!repo.path().join("before.txt").exists());
+
+    let endpoint_diff = repo.git_stdout(&["diff", "--find-renames=50%", "HEAD", "origin/develop"]);
+    assert!(
+        endpoint_diff.contains("rename from before.txt"),
+        "{endpoint_diff}"
+    );
+    assert!(endpoint_diff.contains("rename to after.txt"));
+    assert!(endpoint_diff.contains("-line 050"));
+    assert!(endpoint_diff.contains("+line changed"));
 
     let output = repo.run_cresca(&["status"]);
     assert!(

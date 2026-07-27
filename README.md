@@ -72,7 +72,7 @@ Use `git log --oneline main..develop` to see available commits.
 cresca status
 ```
 
-Renames appear as `R100 old-path -> new-path`; a renamed file with edits still has its ordinary edit hunks when you inspect the prepared diff with Git or your editor.
+Renames appear as `R100 old-path -> new-path`, and the summary includes edits made alongside a rename. To inspect those ordinary edit hunks, compare the review commit with the source branch in Git or your editor.
 
 If Cresca cannot determine a single safe base for the review, it stops with an error instead of guessing which approvals to retain. Resolve the branch history and start the review again once a safe base is available.
 
