@@ -370,6 +370,30 @@ pub fn run_git_command(
         args,
         allowed_exit_codes,
         verbose,
+        true,
+        command.output(),
+    )
+}
+
+/// Run a command that returns machine-readable stdout. Verbose mode still logs the command, but
+/// never writes raw machine records to the terminal.
+pub fn run_git_command_machine_output(
+    description: &str,
+    args: &[&str],
+    allowed_exit_codes: &[i32],
+    verbose: bool,
+) -> Result<Output, GitCommandError> {
+    if verbose {
+        println!("[git {}]", args.join(" ").yellow());
+    }
+    let mut command = Command::new("git");
+    command.args(args);
+    evaluate_git_output(
+        description,
+        args,
+        allowed_exit_codes,
+        verbose,
+        false,
         command.output(),
     )
 }
@@ -394,6 +418,7 @@ pub fn run_git_command_with_env(
         args,
         allowed_exit_codes,
         verbose,
+        true,
         command.output(),
     )
 }
@@ -428,7 +453,7 @@ pub fn run_git_command_with_input(
         }
         Err(error) => Err(error),
     };
-    evaluate_git_output(description, args, allowed_exit_codes, verbose, output)
+    evaluate_git_output(description, args, allowed_exit_codes, verbose, true, output)
 }
 
 fn evaluate_git_output(
@@ -436,11 +461,16 @@ fn evaluate_git_output(
     args: &[&str],
     allowed_exit_codes: &[i32],
     verbose: bool,
+    print_success_stdout: bool,
     output: std::io::Result<Output>,
 ) -> Result<Output, GitCommandError> {
     match output {
         Ok(output) => {
-            if output.status.success() && !output.stdout.is_empty() && verbose {
+            if output.status.success()
+                && !output.stdout.is_empty()
+                && verbose
+                && print_success_stdout
+            {
                 println!("{}", String::from_utf8_lossy(&output.stdout));
             }
             let allowed = output

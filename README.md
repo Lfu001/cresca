@@ -28,7 +28,7 @@ Also You need to have `git` installed.
     cresca approve
     ```
 
-4. If the assignee pushes new changes after the PR is reviewed, go back to step 1. Only the new changes will be shown in the review branch.
+4. If either branch changes after the PR is reviewed, go back to step 1. Cresca safely retains approvals it can reconstruct and leaves uncertain changes unreviewed.
 
 5. After the PR is merged, you can just delete the review branch.
 
@@ -71,6 +71,10 @@ Use `git log --oneline main..develop` to see available commits.
 ```sh
 cresca status
 ```
+
+Renames appear as `R<score> old-path -> new-path`; a pure rename is `R100`. The summary includes edits made alongside a rename. To inspect those ordinary edit hunks, compare the review commit with the source branch in Git or your editor.
+
+If Cresca cannot determine a single safe base for the review, it stops with an error instead of guessing which approvals to retain. Resolve the branch history and start the review again once a safe base is available.
 
 ## License
 
