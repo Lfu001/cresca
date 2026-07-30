@@ -1,0 +1,22 @@
+[workspace]
+changelog_update = true
+dependencies_update = false
+features_always_increment_minor = true
+git_release_enable = true
+git_release_name = "v{{ version }}"
+git_release_type = "prod"
+git_tag_enable = true
+git_tag_name = "v{{ version }}"
+pr_branch_prefix = "release-plz-"
+pr_draft = false
+publish = true
+publish_no_verify = false
+publish_timeout = "10m"
+release_always = false
+release_commits = '(?m)^(?:(?:feat|fix)(?:\([^)]+\))?!?:|[a-z][a-z0-9-]*(?:\([^)]+\))?!:|BREAKING[ -]CHANGE:)'
+semver_check = false
+
+[changelog]
+protect_breaking_commits = true
+sort_commits = "oldest"
+tag_pattern = "^v[0-9].*"
