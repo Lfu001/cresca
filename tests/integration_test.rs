@@ -1693,6 +1693,37 @@ fn test_approve_with_no_staged_changes_approves_nothing() {
     assert_eq!(repo.worktree_diff(), expected_source_diff);
 }
 
+#[test]
+fn test_approve_deletion_when_commit_tree_becomes_empty() {
+    let repo = TempGitRepo::new();
+
+    repo.create_branch("develop");
+    repo.git(&["rm", "README.md"]);
+    repo.commit("Delete the only tracked file");
+    repo.git(&["push", "-u", "origin", "develop"]);
+
+    repo.switch_branch("main");
+    assert!(repo
+        .run_cresca(&["review", "main", "develop"])
+        .status
+        .success());
+    repo.git(&["add", "-A"]);
+    let output = repo.run_cresca(&["approve"]);
+
+    assert!(
+        output.status.success(),
+        "empty-tree approval failed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        repo.rev_parse("HEAD^{tree}"),
+        repo.rev_parse("origin/develop^{tree}")
+    );
+    assert!(repo.git_stdout(&["ls-files"]).is_empty());
+    assert!(repo.worktree_diff().is_empty());
+}
+
 /// Test that `cresca approve` fails on a non-review branch.
 #[test]
 fn test_approve_on_non_review_branch() {
