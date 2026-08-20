@@ -34,6 +34,55 @@ Also You need to have `git` installed.
 
 ## Advanced Usage
 
+### Customizing Review Branch Names
+
+By default, Cresca creates review branches such as `review-main-develop`. To choose names with your own script, create `~/.cresca/config.toml`:
+
+```toml
+[review_branch.naming_hook]
+program = "/Users/me/bin/cresca-review-name"
+args = []
+```
+
+Cresca runs the configured program directly, without a shell. It appends the exact source and target values from `cresca review <target> <source>` after the configured arguments:
+
+```text
+<program> <configured args...> <source> <target>
+```
+
+The hook must exit successfully and print exactly one non-empty UTF-8 line containing a valid Git branch name. For example, this executable shell script removes a `feature/` prefix and produces names such as `login-into-main`:
+
+```sh
+#!/bin/sh
+set -eu
+
+source=${1#feature/}
+target=$2
+printf '%s-into-%s\n' "$source" "$target"
+```
+
+On Windows, register PowerShell explicitly rather than relying on script-file associations:
+
+```toml
+[review_branch.naming_hook]
+program = "pwsh"
+args = [
+  "-NoProfile",
+  "-File",
+  "C:\\Users\\me\\bin\\cresca-review-name.ps1",
+]
+```
+
+```powershell
+param($Source, $Target)
+$Source = $Source -replace '^feature/', ''
+Write-Output "$Source-into-$Target"
+```
+
+When the hook is not configured, the default naming rule remains unchanged. Existing review branches are found by their Cresca metadata and reused without running the hook, even if their names do not start with `review-`.
+
+The hook runs from the repository root and should only compute and print a name. Cresca cannot undo files or other side effects created by user hook code. Hook configuration is user-wide only; Cresca intentionally does not execute hooks from repository-controlled configuration.
+
 ### Reviewing a Specific Range of Commits
 
 When dealing with large PRs, you can limit the review scope using `--skip-to` and `--stop-at` options:
