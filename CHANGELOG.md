@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0](https://github.com/Lfu001/cresca/compare/v0.4.0...v0.5.0) - 2026-08-20
+
+### Added
+
+- *(review)* support custom branch naming hooks ([#27](https://github.com/Lfu001/cresca/pull/27))
+
+### Fixed
+
+- *(review)* support approving empty trees ([#24](https://github.com/Lfu001/cresca/pull/24))
+
+### Other
+
+- *(review)* cover force-pushed rereviews ([#22](https://github.com/Lfu001/cresca/pull/22))
+
 ## [0.4.0](https://github.com/Lfu001/cresca/compare/v0.3.0...v0.4.0) - 2026-07-30
 
 ### Added
