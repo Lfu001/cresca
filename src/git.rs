@@ -57,10 +57,6 @@ pub enum ReviewBranchSelectionError {
     Conflict(String),
 }
 
-fn readable_review_branch(metadata: &ReviewMetadata) -> String {
-    format!("review-{}-{}", metadata.target, metadata.source).replace('/', "_")
-}
-
 fn review_identity_hash(metadata: &ReviewMetadata) -> u64 {
     const OFFSET: u64 = 0xcbf29ce484222325;
     const PRIME: u64 = 0x100000001b3;
@@ -181,16 +177,6 @@ pub fn select_new_review_branch(
         base,
         suffix
     )))
-}
-
-pub fn select_review_branch(
-    metadata: &ReviewMetadata,
-    verbose: bool,
-) -> Result<ReviewBranchSelection, ReviewBranchSelectionError> {
-    if let Some(branch) = find_existing_review_branch(metadata, verbose)? {
-        return Ok(ReviewBranchSelection::Existing(branch));
-    }
-    select_new_review_branch(&readable_review_branch(metadata), metadata, verbose)
 }
 
 fn review_config_key(branch: &str, field: &str) -> String {

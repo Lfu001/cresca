@@ -418,4 +418,15 @@ impl TempGitRepo {
             .output()
             .expect("Failed to execute cresca")
     }
+
+    /// Runs cresca with an isolated user home directory.
+    pub fn run_cresca_with_home(&self, args: &[&str], home: &Path) -> Output {
+        Command::new(Self::cresca_binary())
+            .args(args)
+            .env("HOME", home)
+            .env("NO_COLOR", "1")
+            .current_dir(self.path())
+            .output()
+            .expect("Failed to execute cresca with isolated home")
+    }
 }

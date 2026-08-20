@@ -103,7 +103,7 @@ fn validate_branch_name(name: &str, verbose: bool) -> Result<(), BranchNamingErr
     let output = run_git_command(
         "validate review branch name",
         &["check-ref-format", "--branch", name],
-        &[1],
+        &[1, 128],
         verbose,
     )
     .map_err(|error| {
