@@ -146,7 +146,7 @@ pub fn select_new_review_branch(
 ) -> Result<ReviewBranchSelection, ReviewBranchSelectionError> {
     let base_exists =
         local_branch_exists(base, verbose).map_err(ReviewBranchSelectionError::Git)?;
-    match (base_exists, read_review_metadata(&base, verbose)) {
+    match (base_exists, read_review_metadata(base, verbose)) {
         (false, Err(ReviewMetadataError::Missing)) => {
             return Ok(ReviewBranchSelection::New(base.to_string()))
         }
@@ -156,7 +156,7 @@ pub fn select_new_review_branch(
         _ => {}
     }
 
-    let suffix = suffixed_review_branch(&base, metadata);
+    let suffix = suffixed_review_branch(base, metadata);
     let suffix_exists =
         local_branch_exists(&suffix, verbose).map_err(ReviewBranchSelectionError::Git)?;
     match (suffix_exists, read_review_metadata(&suffix, verbose)) {
