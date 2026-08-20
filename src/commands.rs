@@ -454,7 +454,7 @@ pub fn approve_changes(verbose: bool) -> Result<bool, crate::git::GitCommandErro
 
     run_git_command(
         "discard unreviewed changes",
-        &["restore", "--source=HEAD", "--worktree", "--", "."],
+        &["reset", "--hard", "--quiet", "HEAD"],
         &[],
         verbose,
     )?;
