@@ -1140,25 +1140,29 @@ fn setup_identity_only_review_branch() -> TempGitRepo {
     repo.git(&["push", "-u", "origin", "develop"]);
     repo.switch_branch("main");
     repo.create_branch("review-main-develop");
+    set_review_metadata(&repo, "review-main-develop", "main", "develop");
+    repo
+}
+
+fn set_review_metadata(repo: &TempGitRepo, branch: &str, target: &str, source: &str) {
     repo.git(&[
         "config",
         "--local",
-        "branch.review-main-develop.cresca-version",
+        &format!("branch.{branch}.cresca-version"),
         "1",
     ]);
     repo.git(&[
         "config",
         "--local",
-        "branch.review-main-develop.cresca-target",
-        "main",
+        &format!("branch.{branch}.cresca-target"),
+        target,
     ]);
     repo.git(&[
         "config",
         "--local",
-        "branch.review-main-develop.cresca-source",
-        "develop",
+        &format!("branch.{branch}.cresca-source"),
+        source,
     ]);
-    repo
 }
 
 #[test]
@@ -1736,13 +1740,64 @@ fn test_approve_rejects_unsupported_review_metadata_and_preserves_state() {
 }
 
 #[test]
-fn test_approve_rejects_non_review_name_even_with_valid_metadata() {
-    let repo = TempGitRepo::new();
-    repo.git(&["config", "--local", "branch.main.cresca-version", "1"]);
-    repo.git(&["config", "--local", "branch.main.cresca-target", "main"]);
-    repo.git(&["config", "--local", "branch.main.cresca-source", "develop"]);
-    prepare_staged_unstaged_and_untracked_changes(&repo);
-    assert_invalid_review_command_preserves_state(&repo, &["approve"]);
+fn test_approve_accepts_non_prefixed_metadata_branch() {
+    let (repo, _) = setup_linear_range();
+    assert!(repo
+        .run_cresca(&["review", "main", "develop"])
+        .status
+        .success());
+    repo.git(&["branch", "-m", "team-main-develop"]);
+    repo.git(&["add", "-A"]);
+
+    let output = repo.run_cresca(&["approve"]);
+
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(repo.current_branch(), "team-main-develop");
+}
+
+#[test]
+fn test_review_reuses_unique_metadata_match_regardless_of_name() {
+    let (repo, _) = setup_linear_range();
+    assert!(repo
+        .run_cresca(&["review", "main", "develop"])
+        .status
+        .success());
+    repo.git(&["add", "-A"]);
+    assert!(repo.run_cresca(&["approve"]).status.success());
+    repo.git(&["branch", "-m", "team-main-develop"]);
+
+    let output = repo.run_cresca(&["review", "main", "develop"]);
+
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(repo.current_branch(), "team-main-develop");
+    assert!(!repo.ref_exists("refs/heads/review-main-develop"));
+}
+
+#[test]
+fn test_review_rejects_duplicate_metadata_matches_without_mutation() {
+    let (repo, _) = setup_linear_range();
+    repo.git(&["branch", "custom-one", "main"]);
+    repo.git(&["branch", "custom-two", "main"]);
+    set_review_metadata(&repo, "custom-one", "main", "develop");
+    set_review_metadata(&repo, "custom-two", "main", "develop");
+    let before = repo.snapshot();
+
+    let output = repo.run_cresca(&["review", "main", "develop"]);
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("custom-one") && stderr.contains("custom-two"));
+    assert_eq!(repo.snapshot(), before);
 }
 
 /// Test that `cresca review` fails with uncommitted changes.
@@ -3439,6 +3494,26 @@ fn test_status_on_non_review_branch() {
     let repo = TempGitRepo::new();
     prepare_staged_unstaged_and_untracked_changes(&repo);
     assert_invalid_review_command_preserves_state(&repo, &["status"]);
+}
+
+#[test]
+fn test_status_accepts_non_prefixed_metadata_branch() {
+    let (repo, _) = setup_linear_range();
+    assert!(repo
+        .run_cresca(&["review", "main", "develop"])
+        .status
+        .success());
+    repo.git(&["branch", "-m", "team-main-develop"]);
+
+    let output = repo.run_cresca(&["status"]);
+
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("Review status"));
 }
 
 #[test]
