@@ -30,6 +30,10 @@ fn real_git_path() -> String {
         .to_string()
 }
 
+fn isolated_cresca_home(repo: &TempGitRepo) -> PathBuf {
+    repo.path().join(".cresca-test-home")
+}
+
 fn cresca_home_with_config(config: &str) -> tempfile::TempDir {
     let home = tempfile::TempDir::new().expect("isolated Cresca home should be created");
     let config_dir = home.path().join(".cresca");
@@ -89,6 +93,7 @@ fn run_cresca_with_git_wrapper(
 ) -> std::process::Output {
     std::process::Command::new(TempGitRepo::cresca_binary())
         .args(args)
+        .env("HOME", isolated_cresca_home(repo))
         .env("NO_COLOR", "1")
         .env("PATH", wrapper.path())
         .env("CRESCA_REAL_GIT", real_git_path())
@@ -98,13 +103,14 @@ fn run_cresca_with_git_wrapper(
 }
 
 fn run_cresca_with_git_wrapper_from(
-    _repo: &TempGitRepo,
+    repo: &TempGitRepo,
     wrapper: &tempfile::TempDir,
     current_dir: &Path,
     args: &[&str],
 ) -> std::process::Output {
     std::process::Command::new(TempGitRepo::cresca_binary())
         .args(args)
+        .env("HOME", isolated_cresca_home(repo))
         .env("NO_COLOR", "1")
         .env("PATH", wrapper.path())
         .env("CRESCA_REAL_GIT", real_git_path())
@@ -225,6 +231,7 @@ fn test_tmpdir_inside_worktree_does_not_endanger_transaction_backup() {
 
     let output = std::process::Command::new(TempGitRepo::cresca_binary())
         .args(["review", "main", "develop"])
+        .env("HOME", isolated_cresca_home(&repo))
         .env("NO_COLOR", "1")
         .env("PATH", wrapper.path())
         .env("CRESCA_REAL_GIT", real_git_path())
@@ -796,6 +803,7 @@ fn test_review_preserves_custom_tmpdir_for_git_helpers() {
 
     let output = std::process::Command::new(TempGitRepo::cresca_binary())
         .args(["review", "main", "develop"])
+        .env("HOME", isolated_cresca_home(&repo))
         .env("NO_COLOR", "1")
         .env("PATH", wrapper.path())
         .env("CRESCA_REAL_GIT", real_git_path())
@@ -823,6 +831,7 @@ fn test_git_failure_renders_description_args_status_stdout_and_stderr() {
 
     let output = std::process::Command::new(TempGitRepo::cresca_binary())
         .args(["review", "main", "develop"])
+        .env("HOME", isolated_cresca_home(&repo))
         .env("NO_COLOR", "1")
         .env("PATH", wrapper.path())
         .current_dir(repo.path())
@@ -1084,6 +1093,7 @@ fn test_review_failure_cleans_transaction_scratch_directory() {
 
     let output = std::process::Command::new(TempGitRepo::cresca_binary())
         .args(["review", "main", "develop"])
+        .env("HOME", isolated_cresca_home(&repo))
         .env("NO_COLOR", "1")
         .env("PATH", wrapper.path())
         .env("CRESCA_REAL_GIT", real_git_path())
@@ -3191,6 +3201,7 @@ fn test_failed_review_preparation_does_not_commit_review_metadata() {
 
     let output = std::process::Command::new(TempGitRepo::cresca_binary())
         .args(["review", "main", "develop", "--skip-to", &range.b[..8]])
+        .env("HOME", isolated_cresca_home(&repo))
         .env("NO_COLOR", "1")
         .env("LC_ALL", "C")
         .env("LANG", "C")
@@ -4306,6 +4317,7 @@ fn test_review_fails_closed_when_metadata_config_read_fails() {
 
     let output = std::process::Command::new(TempGitRepo::cresca_binary())
         .args(["review", "main", "develop"])
+        .env("HOME", isolated_cresca_home(&repo))
         .env("NO_COLOR", "1")
         .env("PATH", path)
         .current_dir(repo.path())

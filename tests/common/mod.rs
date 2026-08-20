@@ -411,8 +411,10 @@ impl TempGitRepo {
 
     /// Runs cresca with the given arguments.
     pub fn run_cresca(&self, args: &[&str]) -> Output {
+        let home = TempDir::new().expect("isolated default Cresca home should be created");
         Command::new(Self::cresca_binary())
             .args(args)
+            .env("HOME", home.path())
             .env("NO_COLOR", "1")
             .current_dir(self.path())
             .output()
