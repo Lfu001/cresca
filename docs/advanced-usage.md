@@ -7,8 +7,7 @@ By default, Cresca creates review branches such as `review-main-develop`. To cho
 | Platform | Configuration file |
 |----------|--------------------|
 | Linux and macOS | `$HOME/.cresca/config.toml` |
-| Windows (PowerShell) | `$HOME\.cresca\config.toml` |
-| Windows (Command Prompt) | `%USERPROFILE%\.cresca\config.toml` |
+| Windows | `<user profile>\.cresca\config.toml` (for example, `C:\Users\me\.cresca\config.toml`) |
 
 Configure the program that produces the branch name:
 
