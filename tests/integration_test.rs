@@ -1131,6 +1131,22 @@ fn run_status_stdout(repo: &TempGitRepo, args: &[&str]) -> String {
     String::from_utf8(output.stdout).expect("status stdout should be UTF-8")
 }
 
+fn force_push_develop(repo: &TempGitRepo) {
+    repo.git(&["push", "--force-with-lease", "origin", "develop"]);
+}
+
+fn assert_review_worktree_matches(repo: &TempGitRepo, revision: &str) {
+    assert!(
+        repo.cached_diff().is_empty(),
+        "review must leave the real index empty"
+    );
+    assert_eq!(
+        repo.worktree_diff(),
+        repo.diff("HEAD", revision),
+        "review worktree must exactly materialize {revision}"
+    );
+}
+
 fn setup_identity_only_review_branch() -> TempGitRepo {
     let repo = TempGitRepo::new();
     repo.create_branch("develop");
@@ -1882,6 +1898,277 @@ fn test_review_updates_existing_branch() {
         status_str.contains("file2.txt"),
         "file2.txt should appear as new unreviewed change"
     );
+}
+
+#[test]
+fn test_rereview_materializes_force_pushed_source_tree_exactly() {
+    let repo = TempGitRepo::new();
+
+    repo.write_file("existing.txt", "base version\n");
+    repo.write_file("restored.txt", "restored base version\n");
+    repo.git(&["add", "."]);
+    repo.commit("Add rewrite base files");
+    repo.git(&["push", "origin", "main"]);
+
+    repo.create_branch("develop");
+    repo.write_file("existing.txt", "approved feature version\n");
+    repo.git(&["rm", "restored.txt"]);
+    repo.write_file("story.txt", "alpha\nbeta\ngamma\n");
+    repo.write_file("keep.txt", "keep this addition\n");
+    repo.write_file("removed.txt", "remove this addition\n");
+    repo.write_file("old-name.txt", "renamed content\n");
+    repo.git(&["add", "."]);
+    repo.commit("Add feature snapshot");
+    repo.git(&["push", "-u", "origin", "develop"]);
+
+    repo.switch_branch("main");
+    assert!(repo
+        .run_cresca(&["review", "main", "develop"])
+        .status
+        .success());
+    repo.git(&["add", "-A"]);
+    assert!(repo.run_cresca(&["approve"]).status.success());
+
+    repo.switch_branch("develop");
+    repo.write_file("existing.txt", "base version\n");
+    repo.write_file("restored.txt", "restored base version\n");
+    repo.write_file("story.txt", "alpha\ngamma\n");
+    repo.git(&["rm", "removed.txt", "old-name.txt"]);
+    repo.write_file("new-name.txt", "renamed content\n");
+    repo.git(&["add", "-A"]);
+    repo.git(&["commit", "--amend", "--no-edit"]);
+    force_push_develop(&repo);
+
+    let output = repo.run_cresca(&["review", "main", "develop"]);
+    assert!(
+        output.status.success(),
+        "re-review failed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_review_worktree_matches(&repo, "origin/develop");
+    assert_eq!(repo.read_file("existing.txt"), "base version\n");
+    assert_eq!(repo.read_file("restored.txt"), "restored base version\n");
+    assert_eq!(repo.read_file("story.txt"), "alpha\ngamma\n");
+    assert!(!repo.path().join("removed.txt").exists());
+    assert!(!repo.path().join("old-name.txt").exists());
+    assert_eq!(repo.read_file("new-name.txt"), "renamed content\n");
+
+    repo.git(&["add", "-A"]);
+    assert!(repo.run_cresca(&["approve"]).status.success());
+    assert_eq!(
+        repo.rev_parse("HEAD^{tree}"),
+        repo.rev_parse("origin/develop^{tree}")
+    );
+}
+
+#[test]
+fn test_rereview_after_partial_approval_and_force_push_matches_source() {
+    let repo = TempGitRepo::new();
+
+    repo.create_branch("develop");
+    repo.write_file("approved.txt", "approved content\n");
+    repo.write_file("pending.txt", "pending content\n");
+    repo.git(&["add", "."]);
+    repo.commit("Add partially reviewed snapshot");
+    repo.git(&["push", "-u", "origin", "develop"]);
+
+    repo.switch_branch("main");
+    assert!(repo
+        .run_cresca(&["review", "main", "develop"])
+        .status
+        .success());
+    repo.git(&["add", "approved.txt"]);
+    assert!(repo.run_cresca(&["approve"]).status.success());
+
+    repo.switch_branch("develop");
+    repo.git(&["rm", "approved.txt"]);
+    repo.write_file("pending.txt", "rewritten pending content\n");
+    repo.git(&["add", "-A"]);
+    repo.git(&["commit", "--amend", "--no-edit"]);
+    force_push_develop(&repo);
+
+    let output = repo.run_cresca(&["review", "main", "develop"]);
+    assert!(
+        output.status.success(),
+        "re-review failed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_review_worktree_matches(&repo, "origin/develop");
+    assert_eq!(
+        repo.git_stdout(&["show", "HEAD:approved.txt"]),
+        "approved content"
+    );
+    assert!(!repo.path().join("approved.txt").exists());
+    assert_eq!(repo.read_file("pending.txt"), "rewritten pending content\n");
+}
+
+#[test]
+fn test_rereview_after_stop_at_and_force_push_matches_rewritten_endpoint() {
+    let (repo, range) = setup_linear_range();
+    assert!(repo
+        .run_cresca(&["review", "main", "develop", "--stop-at", &range.c])
+        .status
+        .success());
+    repo.git(&["add", "-A"]);
+    assert!(repo.run_cresca(&["approve"]).status.success());
+
+    repo.switch_branch("develop");
+    repo.git(&["reset", "--hard", &range.c]);
+    repo.git(&["checkout", &range.b, "--", "removed-at-c.txt"]);
+    repo.git(&["add", "-A"]);
+    repo.git(&["commit", "--amend", "--no-edit", "--allow-empty"]);
+    let rewritten_stop = repo.rev_parse("HEAD");
+    repo.write_file("d.txt", "rewritten D\n");
+    repo.git(&["add", "d.txt"]);
+    repo.commit("D: rewrite excluded change");
+    force_push_develop(&repo);
+
+    let output = repo.run_cresca(&["review", "main", "develop", "--stop-at", &rewritten_stop]);
+    assert!(
+        output.status.success(),
+        "bounded re-review failed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_review_worktree_matches(&repo, &rewritten_stop);
+    assert!(!repo
+        .git_maybe(&["cat-file", "-e", "HEAD:removed-at-c.txt"])
+        .status
+        .success());
+    assert_eq!(repo.read_file("removed-at-c.txt"), "present until C\n");
+    assert!(!repo.path().join("d.txt").exists());
+}
+
+#[test]
+fn test_rereview_after_skip_to_partial_approval_and_force_push_matches_source() {
+    let repo = TempGitRepo::new();
+
+    repo.create_branch("develop");
+    repo.write_file("auto.txt", "auto-approved content\n");
+    repo.git(&["add", "auto.txt"]);
+    repo.commit("A: add auto-approved content");
+    repo.write_file("approved.txt", "approved content\n");
+    repo.write_file("pending.txt", "pending content\n");
+    repo.git(&["add", "."]);
+    repo.commit("B: add review content");
+    let skip_to = repo.rev_parse("HEAD");
+    repo.write_file("tail.txt", "tail content\n");
+    repo.git(&["add", "tail.txt"]);
+    repo.commit("C: add tail content");
+    repo.git(&["push", "-u", "origin", "develop"]);
+
+    repo.switch_branch("main");
+    assert!(repo
+        .run_cresca(&["review", "main", "develop", "--skip-to", &skip_to])
+        .status
+        .success());
+    repo.git(&["add", "approved.txt"]);
+    assert!(repo.run_cresca(&["approve"]).status.success());
+
+    repo.switch_branch("develop");
+    repo.git(&["rm", "approved.txt"]);
+    repo.write_file("tail.txt", "rewritten tail content\n");
+    repo.git(&["add", "-A"]);
+    repo.git(&["commit", "--amend", "--no-edit"]);
+    force_push_develop(&repo);
+
+    let output = repo.run_cresca(&["review", "main", "develop", "--skip-to", &skip_to]);
+    assert!(
+        output.status.success(),
+        "skip-to re-review failed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_review_worktree_matches(&repo, "origin/develop");
+    assert!(!repo.path().join("approved.txt").exists());
+    assert_eq!(repo.read_file("auto.txt"), "auto-approved content\n");
+    assert_eq!(repo.read_file("pending.txt"), "pending content\n");
+    assert_eq!(repo.read_file("tail.txt"), "rewritten tail content\n");
+}
+
+#[test]
+fn test_rereview_after_skip_stop_partial_approval_and_force_push_matches_endpoint() {
+    let (repo, range) = setup_linear_range();
+    assert!(repo
+        .run_cresca(&[
+            "review",
+            "main",
+            "develop",
+            "--skip-to",
+            &range.b,
+            "--stop-at",
+            &range.c,
+        ])
+        .status
+        .success());
+    repo.git(&["add", "-u", "--", "removed-at-c.txt"]);
+    assert!(repo.run_cresca(&["approve"]).status.success());
+
+    repo.switch_branch("develop");
+    repo.git(&["reset", "--hard", &range.c]);
+    repo.git(&["checkout", &range.b, "--", "removed-at-c.txt"]);
+    repo.git(&["add", "-A"]);
+    repo.git(&["commit", "--amend", "--no-edit", "--allow-empty"]);
+    let rewritten_stop = repo.rev_parse("HEAD");
+    repo.write_file("d.txt", "rewritten excluded content\n");
+    repo.git(&["add", "d.txt"]);
+    repo.commit("D: rewrite excluded content");
+    force_push_develop(&repo);
+
+    let output = repo.run_cresca(&[
+        "review",
+        "main",
+        "develop",
+        "--skip-to",
+        &range.b,
+        "--stop-at",
+        &rewritten_stop,
+    ]);
+    assert!(
+        output.status.success(),
+        "skip/stop re-review failed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_review_worktree_matches(&repo, &rewritten_stop);
+    assert_eq!(repo.read_file("removed-at-c.txt"), "present until C\n");
+    assert_eq!(repo.read_file("shared.txt"), "shared changed at B\n");
+    assert!(!repo.path().join("d.txt").exists());
+}
+
+#[test]
+fn test_rereview_after_message_only_force_push_has_no_changes() {
+    let repo = TempGitRepo::new();
+
+    repo.create_branch("develop");
+    repo.write_file("feature.txt", "unchanged feature content\n");
+    repo.git(&["add", "."]);
+    repo.commit("Add feature content");
+    repo.git(&["push", "-u", "origin", "develop"]);
+    repo.switch_branch("main");
+    assert!(repo
+        .run_cresca(&["review", "main", "develop"])
+        .status
+        .success());
+    repo.git(&["add", "-A"]);
+    assert!(repo.run_cresca(&["approve"]).status.success());
+
+    repo.switch_branch("develop");
+    repo.git(&["commit", "--amend", "-m", "Rewrite only the commit message"]);
+    force_push_develop(&repo);
+
+    let output = repo.run_cresca(&["review", "main", "develop"]);
+    assert!(
+        output.status.success(),
+        "message-only re-review failed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(repo.cached_diff().is_empty());
+    assert!(repo.worktree_diff().is_empty());
+    assert!(String::from_utf8_lossy(&output.stdout).contains("no unreviewed changes"));
 }
 
 #[test]
