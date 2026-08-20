@@ -1,3 +1,4 @@
+mod branch_naming;
 mod commands;
 mod git;
 mod review;
