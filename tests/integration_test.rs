@@ -30,6 +30,47 @@ fn real_git_path() -> String {
         .to_string()
 }
 
+fn isolated_cresca_home(repo: &TempGitRepo) -> PathBuf {
+    repo.path().join(".cresca-test-home")
+}
+
+fn cresca_home_with_config(config: &str) -> tempfile::TempDir {
+    let home = tempfile::TempDir::new().expect("isolated Cresca home should be created");
+    let config_dir = home.path().join(".cresca");
+    std::fs::create_dir(&config_dir).expect("Cresca config directory should be created");
+    std::fs::write(config_dir.join("config.toml"), config)
+        .expect("Cresca config should be written");
+    home
+}
+
+fn cresca_home_with_naming_hook(script: &[u8], args: &[&str]) -> tempfile::TempDir {
+    let home = tempfile::TempDir::new().expect("isolated Cresca home should be created");
+    let bin_dir = home.path().join("bin");
+    std::fs::create_dir(&bin_dir).expect("hook directory should be created");
+    let hook = bin_dir.join("review-name");
+    std::fs::write(&hook, script).expect("naming hook should be written");
+    let mut permissions = std::fs::metadata(&hook)
+        .expect("naming hook metadata should be readable")
+        .permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&hook, permissions).expect("naming hook should be executable");
+    let rendered_args = args
+        .iter()
+        .map(|argument| format!("{argument:?}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let config = format!(
+        "[review_branch.naming_hook]\nprogram = {:?}\nargs = [{}]\n",
+        hook.to_string_lossy(),
+        rendered_args
+    );
+    let config_dir = home.path().join(".cresca");
+    std::fs::create_dir(&config_dir).expect("Cresca config directory should be created");
+    std::fs::write(config_dir.join("config.toml"), config)
+        .expect("Cresca config should be written");
+    home
+}
+
 fn set_gitlink(repo: &TempGitRepo, path: &str, oid: &str) {
     repo.git(&["update-index", "--add", "--cacheinfo", "160000", oid, path]);
 }
@@ -52,6 +93,7 @@ fn run_cresca_with_git_wrapper(
 ) -> std::process::Output {
     std::process::Command::new(TempGitRepo::cresca_binary())
         .args(args)
+        .env("HOME", isolated_cresca_home(repo))
         .env("NO_COLOR", "1")
         .env("PATH", wrapper.path())
         .env("CRESCA_REAL_GIT", real_git_path())
@@ -61,13 +103,14 @@ fn run_cresca_with_git_wrapper(
 }
 
 fn run_cresca_with_git_wrapper_from(
-    _repo: &TempGitRepo,
+    repo: &TempGitRepo,
     wrapper: &tempfile::TempDir,
     current_dir: &Path,
     args: &[&str],
 ) -> std::process::Output {
     std::process::Command::new(TempGitRepo::cresca_binary())
         .args(args)
+        .env("HOME", isolated_cresca_home(repo))
         .env("NO_COLOR", "1")
         .env("PATH", wrapper.path())
         .env("CRESCA_REAL_GIT", real_git_path())
@@ -188,6 +231,7 @@ fn test_tmpdir_inside_worktree_does_not_endanger_transaction_backup() {
 
     let output = std::process::Command::new(TempGitRepo::cresca_binary())
         .args(["review", "main", "develop"])
+        .env("HOME", isolated_cresca_home(&repo))
         .env("NO_COLOR", "1")
         .env("PATH", wrapper.path())
         .env("CRESCA_REAL_GIT", real_git_path())
@@ -759,6 +803,7 @@ fn test_review_preserves_custom_tmpdir_for_git_helpers() {
 
     let output = std::process::Command::new(TempGitRepo::cresca_binary())
         .args(["review", "main", "develop"])
+        .env("HOME", isolated_cresca_home(&repo))
         .env("NO_COLOR", "1")
         .env("PATH", wrapper.path())
         .env("CRESCA_REAL_GIT", real_git_path())
@@ -786,6 +831,7 @@ fn test_git_failure_renders_description_args_status_stdout_and_stderr() {
 
     let output = std::process::Command::new(TempGitRepo::cresca_binary())
         .args(["review", "main", "develop"])
+        .env("HOME", isolated_cresca_home(&repo))
         .env("NO_COLOR", "1")
         .env("PATH", wrapper.path())
         .current_dir(repo.path())
@@ -1047,6 +1093,7 @@ fn test_review_failure_cleans_transaction_scratch_directory() {
 
     let output = std::process::Command::new(TempGitRepo::cresca_binary())
         .args(["review", "main", "develop"])
+        .env("HOME", isolated_cresca_home(&repo))
         .env("NO_COLOR", "1")
         .env("PATH", wrapper.path())
         .env("CRESCA_REAL_GIT", real_git_path())
@@ -1156,25 +1203,29 @@ fn setup_identity_only_review_branch() -> TempGitRepo {
     repo.git(&["push", "-u", "origin", "develop"]);
     repo.switch_branch("main");
     repo.create_branch("review-main-develop");
+    set_review_metadata(&repo, "review-main-develop", "main", "develop");
+    repo
+}
+
+fn set_review_metadata(repo: &TempGitRepo, branch: &str, target: &str, source: &str) {
     repo.git(&[
         "config",
         "--local",
-        "branch.review-main-develop.cresca-version",
+        &format!("branch.{branch}.cresca-version"),
         "1",
     ]);
     repo.git(&[
         "config",
         "--local",
-        "branch.review-main-develop.cresca-target",
-        "main",
+        &format!("branch.{branch}.cresca-target"),
+        target,
     ]);
     repo.git(&[
         "config",
         "--local",
-        "branch.review-main-develop.cresca-source",
-        "develop",
+        &format!("branch.{branch}.cresca-source"),
+        source,
     ]);
-    repo
 }
 
 #[test]
@@ -1783,13 +1834,246 @@ fn test_approve_rejects_unsupported_review_metadata_and_preserves_state() {
 }
 
 #[test]
-fn test_approve_rejects_non_review_name_even_with_valid_metadata() {
-    let repo = TempGitRepo::new();
-    repo.git(&["config", "--local", "branch.main.cresca-version", "1"]);
-    repo.git(&["config", "--local", "branch.main.cresca-target", "main"]);
-    repo.git(&["config", "--local", "branch.main.cresca-source", "develop"]);
-    prepare_staged_unstaged_and_untracked_changes(&repo);
-    assert_invalid_review_command_preserves_state(&repo, &["approve"]);
+fn test_approve_accepts_non_prefixed_metadata_branch() {
+    let (repo, _) = setup_linear_range();
+    assert!(repo
+        .run_cresca(&["review", "main", "develop"])
+        .status
+        .success());
+    repo.git(&["branch", "-m", "team-main-develop"]);
+    repo.git(&["add", "-A"]);
+
+    let output = repo.run_cresca(&["approve"]);
+
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(repo.current_branch(), "team-main-develop");
+}
+
+#[test]
+fn test_review_reuses_unique_metadata_match_regardless_of_name() {
+    let (repo, _) = setup_linear_range();
+    assert!(repo
+        .run_cresca(&["review", "main", "develop"])
+        .status
+        .success());
+    repo.git(&["add", "-A"]);
+    assert!(repo.run_cresca(&["approve"]).status.success());
+    repo.git(&["branch", "-m", "team-main-develop"]);
+
+    let output = repo.run_cresca(&["review", "main", "develop"]);
+
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(repo.current_branch(), "team-main-develop");
+    assert!(!repo.ref_exists("refs/heads/review-main-develop"));
+}
+
+#[test]
+fn test_review_rejects_duplicate_metadata_matches_without_mutation() {
+    let (repo, _) = setup_linear_range();
+    repo.git(&["branch", "custom-one", "main"]);
+    repo.git(&["branch", "custom-two", "main"]);
+    set_review_metadata(&repo, "custom-one", "main", "develop");
+    set_review_metadata(&repo, "custom-two", "main", "develop");
+    let before = repo.snapshot();
+
+    let output = repo.run_cresca(&["review", "main", "develop"]);
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("custom-one") && stderr.contains("custom-two"));
+    assert_eq!(repo.snapshot(), before);
+}
+
+#[test]
+fn test_review_naming_hook_creates_non_prefixed_branch_and_receives_arguments() {
+    let (repo, _) = setup_linear_range();
+    let home = cresca_home_with_naming_hook(
+        b"#!/bin/sh\n[ \"$1\" = fixed ] || exit 31\nprintf '%s-into-%s\\n' \"$2\" \"$3\"\n",
+        &["fixed"],
+    );
+
+    let output = repo.run_cresca_with_home(&["review", "main", "develop"], home.path());
+
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(repo.current_branch(), "develop-into-main");
+    assert_eq!(
+        repo.review_metadata_values("develop-into-main"),
+        (
+            vec!["1".to_string()],
+            vec!["main".to_string()],
+            vec!["develop".to_string()]
+        )
+    );
+}
+
+fn assert_naming_hook_failure_preserves_state(script: &[u8], expected_stderr: &str) {
+    let (repo, _) = setup_linear_range();
+    let home = cresca_home_with_naming_hook(script, &[]);
+    let before = repo.snapshot();
+
+    let output = repo.run_cresca_with_home(&["review", "main", "develop"], home.path());
+
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains(expected_stderr),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(repo.snapshot(), before);
+}
+
+#[test]
+fn test_review_naming_hook_nonzero_exit_preserves_repository() {
+    assert_naming_hook_failure_preserves_state(
+        b"#!/bin/sh\nprintf 'hook exploded\\n' >&2\nexit 23\n",
+        "hook exploded",
+    );
+}
+
+#[test]
+fn test_review_naming_hook_empty_output_preserves_repository() {
+    assert_naming_hook_failure_preserves_state(b"#!/bin/sh\nexit 0\n", "empty branch name");
+}
+
+#[test]
+fn test_review_naming_hook_multiline_output_preserves_repository() {
+    assert_naming_hook_failure_preserves_state(
+        b"#!/bin/sh\nprintf 'first\\nsecond\\n'\n",
+        "exactly one line",
+    );
+}
+
+#[test]
+fn test_review_naming_hook_non_utf8_output_preserves_repository() {
+    assert_naming_hook_failure_preserves_state(
+        b"#!/bin/sh\nprintf '\\377\\n'\n",
+        "not valid UTF-8",
+    );
+}
+
+#[test]
+fn test_review_naming_hook_invalid_ref_preserves_repository() {
+    assert_naming_hook_failure_preserves_state(
+        b"#!/bin/sh\nprintf 'invalid branch\\n'\n",
+        "not a valid Git branch name",
+    );
+}
+
+#[test]
+fn test_review_naming_hook_launch_failure_preserves_repository() {
+    let (repo, _) = setup_linear_range();
+    let home = cresca_home_with_config(
+        "[review_branch.naming_hook]\nprogram = \"/definitely/missing/cresca-hook\"\n",
+    );
+    let before = repo.snapshot();
+
+    let output = repo.run_cresca_with_home(&["review", "main", "develop"], home.path());
+
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("Failed to run"));
+    assert_eq!(repo.snapshot(), before);
+}
+
+#[test]
+fn test_review_malformed_naming_config_preserves_repository() {
+    let (repo, _) = setup_linear_range();
+    let home = cresca_home_with_config("[review_branch.naming_hook\n");
+    let before = repo.snapshot();
+
+    let output = repo.run_cresca_with_home(&["review", "main", "develop"], home.path());
+
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("Invalid Cresca configuration"));
+    assert_eq!(repo.snapshot(), before);
+}
+
+#[test]
+fn test_review_existing_metadata_match_bypasses_failing_naming_hook() {
+    let (repo, _) = setup_linear_range();
+    assert!(repo
+        .run_cresca(&["review", "main", "develop"])
+        .status
+        .success());
+    repo.git(&["add", "-A"]);
+    assert!(repo.run_cresca(&["approve"]).status.success());
+    repo.git(&["branch", "-m", "team-main-develop"]);
+    let home =
+        cresca_home_with_naming_hook(b"#!/bin/sh\nprintf 'must not run\\n' >&2\nexit 41\n", &[]);
+
+    let output = repo.run_cresca_with_home(&["review", "main", "develop"], home.path());
+
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(repo.current_branch(), "team-main-develop");
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("must not run"));
+}
+
+#[test]
+fn test_review_naming_hook_success_stderr_is_verbose_only() {
+    let (normal_repo, _) = setup_linear_range();
+    let normal_home = cresca_home_with_naming_hook(
+        b"#!/bin/sh\nprintf 'hook note\\n' >&2\nprintf 'normal-custom\\n'\n",
+        &[],
+    );
+    let normal =
+        normal_repo.run_cresca_with_home(&["review", "main", "develop"], normal_home.path());
+    assert!(normal.status.success());
+    assert!(!String::from_utf8_lossy(&normal.stderr).contains("hook note"));
+
+    let (verbose_repo, _) = setup_linear_range();
+    let verbose_home = cresca_home_with_naming_hook(
+        b"#!/bin/sh\nprintf 'hook note\\n' >&2\nprintf 'verbose-custom\\n'\n",
+        &[],
+    );
+    let verbose = verbose_repo.run_cresca_with_home(
+        &["--verbose", "review", "main", "develop"],
+        verbose_home.path(),
+    );
+    assert!(verbose.status.success());
+    assert!(String::from_utf8_lossy(&verbose.stderr).contains("hook note"));
+}
+
+#[test]
+fn test_review_naming_hook_collision_uses_identity_suffix() {
+    let (repo, _) = setup_linear_range();
+    repo.git(&["branch", "shared-review-name", "main"]);
+    set_review_metadata(&repo, "shared-review-name", "other", "identity");
+    let occupied_oid = repo.rev_parse("refs/heads/shared-review-name");
+    let home = cresca_home_with_naming_hook(b"#!/bin/sh\nprintf 'shared-review-name\\n'\n", &[]);
+
+    let output = repo.run_cresca_with_home(&["review", "main", "develop"], home.path());
+
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let branch = repo.current_branch();
+    assert_identity_suffixed_branch(&branch, "shared-review-name");
+    assert_eq!(
+        repo.rev_parse("refs/heads/shared-review-name"),
+        occupied_oid
+    );
 }
 
 /// Test that `cresca review` fails with uncommitted changes.
@@ -3235,6 +3519,7 @@ fn test_failed_review_preparation_does_not_commit_review_metadata() {
 
     let output = std::process::Command::new(TempGitRepo::cresca_binary())
         .args(["review", "main", "develop", "--skip-to", &range.b[..8]])
+        .env("HOME", isolated_cresca_home(&repo))
         .env("NO_COLOR", "1")
         .env("LC_ALL", "C")
         .env("LANG", "C")
@@ -3757,6 +4042,26 @@ fn test_status_on_non_review_branch() {
     let repo = TempGitRepo::new();
     prepare_staged_unstaged_and_untracked_changes(&repo);
     assert_invalid_review_command_preserves_state(&repo, &["status"]);
+}
+
+#[test]
+fn test_status_accepts_non_prefixed_metadata_branch() {
+    let (repo, _) = setup_linear_range();
+    assert!(repo
+        .run_cresca(&["review", "main", "develop"])
+        .status
+        .success());
+    repo.git(&["branch", "-m", "team-main-develop"]);
+
+    let output = repo.run_cresca(&["status"]);
+
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("Review status"));
 }
 
 #[test]
@@ -4330,6 +4635,7 @@ fn test_review_fails_closed_when_metadata_config_read_fails() {
 
     let output = std::process::Command::new(TempGitRepo::cresca_binary())
         .args(["review", "main", "develop"])
+        .env("HOME", isolated_cresca_home(&repo))
         .env("NO_COLOR", "1")
         .env("PATH", path)
         .current_dir(repo.path())

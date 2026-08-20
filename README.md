@@ -12,7 +12,7 @@ cargo install cresca
 
 Also You need to have `git` installed.
 
-## Usage
+## Getting Started
 
 1. Start a review by specifying the branches. Following example will prepare a review branch (typically named `review-main-develop`) for the PR that `develop` is to be merged into `main`.
 
@@ -32,49 +32,9 @@ Also You need to have `git` installed.
 
 5. After the PR is merged, you can just delete the review branch.
 
-## Advanced Usage
+## Documentation
 
-### Reviewing a Specific Range of Commits
-
-When dealing with large PRs, you can limit the review scope using `--skip-to` and `--stop-at` options:
-
-```text
-merge-base ---- A ---- B ---- C ---- D ---- develop
-                       ^             ^
-               --skip-to=B     --stop-at=C
-```
-
-| Option              | Description                                  |
-|---------------------|----------------------------------------------|
-| `--skip-to <hash>`  | Auto-approve commits before this hash        |
-| `--stop-at <hash>`  | Exclude commits after this hash from review  |
-
-**Examples:**
-
-```sh
-# Review only commits B, C (auto-approve A, exclude D)
-cresca review main develop --skip-to=B --stop-at=C
-
-# Review from B to develop (auto-approve A)
-cresca review main develop --skip-to=B
-
-# Review from merge-base to C (exclude D)
-cresca review main develop --stop-at=C
-```
-
-Use `git log --oneline main..develop` to see available commits.
-
-### Checking Review Progress
-
-`status` shows the changes that remain unapproved in the range prepared by the most recent successful `review` command:
-
-```sh
-cresca status
-```
-
-Renames appear as `R<score> old-path -> new-path`; a pure rename is `R100`. The summary includes edits made alongside a rename. To inspect those ordinary edit hunks, compare the review commit with the source branch in Git or your editor.
-
-If Cresca cannot determine a single safe base for the review, it stops with an error instead of guessing which approvals to retain. Resolve the branch history and start the review again once a safe base is available.
+See [Advanced Usage](docs/advanced-usage.md) for review range options, review progress, and custom review branch naming.
 
 ## License
 

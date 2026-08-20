@@ -29,7 +29,6 @@ pub struct ReviewScope {
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum ReviewMetadataError {
-    InvalidBranchName,
     Missing,
     UnsupportedVersion(String),
     Invalid,
@@ -56,10 +55,6 @@ pub enum ReviewBranchSelection {
 pub enum ReviewBranchSelectionError {
     Git(GitCommandError),
     Conflict(String),
-}
-
-fn readable_review_branch(metadata: &ReviewMetadata) -> String {
-    format!("review-{}-{}", metadata.target, metadata.source).replace('/', "_")
 }
 
 fn review_identity_hash(metadata: &ReviewMetadata) -> u64 {
@@ -99,17 +94,61 @@ fn local_branch_exists(branch: &str, verbose: bool) -> Result<bool, GitCommandEr
     .success())
 }
 
-pub fn select_review_branch(
+pub fn find_existing_review_branch(
+    metadata: &ReviewMetadata,
+    verbose: bool,
+) -> Result<Option<String>, ReviewBranchSelectionError> {
+    let output = run_git_command_machine_output(
+        "list local branches for review metadata",
+        &["for-each-ref", "--format=%(refname:short)", "refs/heads"],
+        &[],
+        verbose,
+    )
+    .map_err(ReviewBranchSelectionError::Git)?;
+    let branches = std::str::from_utf8(&output.stdout).map_err(|_| {
+        ReviewBranchSelectionError::Conflict(
+            "Cannot identify review branches because Git returned a non-UTF-8 local branch name."
+                .to_string(),
+        )
+    })?;
+    let mut matches = Vec::new();
+    for branch in branches.lines().filter(|branch| !branch.is_empty()) {
+        match read_review_metadata(branch, verbose) {
+            Ok(existing) if existing == *metadata => matches.push(branch.to_string()),
+            Ok(_) | Err(ReviewMetadataError::Missing) | Err(ReviewMetadataError::Invalid) => {}
+            Err(ReviewMetadataError::UnsupportedVersion(_)) => {}
+            Err(ReviewMetadataError::Git(error)) => {
+                return Err(ReviewBranchSelectionError::Git(error))
+            }
+        }
+    }
+    matches.sort();
+    match matches.as_slice() {
+        [] => Ok(None),
+        [branch] => Ok(Some(branch.clone())),
+        _ => Err(ReviewBranchSelectionError::Conflict(format!(
+            "Found multiple review branches with metadata for target `{}` and source `{}`: {}. Delete or correct the duplicate review metadata before retrying.",
+            metadata.target,
+            metadata.source,
+            matches
+                .iter()
+                .map(|branch| format!("`{branch}`"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ))),
+    }
+}
+
+pub fn select_new_review_branch(
+    base: &str,
     metadata: &ReviewMetadata,
     verbose: bool,
 ) -> Result<ReviewBranchSelection, ReviewBranchSelectionError> {
-    let base = readable_review_branch(metadata);
     let base_exists =
-        local_branch_exists(&base, verbose).map_err(ReviewBranchSelectionError::Git)?;
-    match (base_exists, read_review_metadata(&base, verbose)) {
-        (false, Err(ReviewMetadataError::Missing)) => return Ok(ReviewBranchSelection::New(base)),
-        (true, Ok(existing)) if existing == *metadata => {
-            return Ok(ReviewBranchSelection::Existing(base))
+        local_branch_exists(base, verbose).map_err(ReviewBranchSelectionError::Git)?;
+    match (base_exists, read_review_metadata(base, verbose)) {
+        (false, Err(ReviewMetadataError::Missing)) => {
+            return Ok(ReviewBranchSelection::New(base.to_string()))
         }
         (_, Err(ReviewMetadataError::Git(error))) => {
             return Err(ReviewBranchSelectionError::Git(error))
@@ -117,7 +156,7 @@ pub fn select_review_branch(
         _ => {}
     }
 
-    let suffix = suffixed_review_branch(&base, metadata);
+    let suffix = suffixed_review_branch(base, metadata);
     let suffix_exists =
         local_branch_exists(&suffix, verbose).map_err(ReviewBranchSelectionError::Git)?;
     match (suffix_exists, read_review_metadata(&suffix, verbose)) {
@@ -526,9 +565,6 @@ pub fn current_branch_name(verbose: bool) -> Result<String, GitCommandError> {
 
 pub fn current_review_metadata(verbose: bool) -> Result<ReviewMetadata, ReviewMetadataError> {
     let branch = current_branch_name(verbose).map_err(ReviewMetadataError::Git)?;
-    if !branch.starts_with("review-") {
-        return Err(ReviewMetadataError::InvalidBranchName);
-    }
     read_review_metadata(&branch, verbose)
 }
 

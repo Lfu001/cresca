@@ -1,8 +1,9 @@
+use crate::branch_naming::resolve_new_review_branch_name;
 use crate::git::{
-    is_clean, read_review_scope, resolve_remote_tracking_branch, run_git_command,
-    run_git_command_machine_output, select_review_branch, write_review_metadata,
-    write_review_scope, ReviewBranchSelection, ReviewBranchSelectionError, ReviewMetadata,
-    ReviewScope, ReviewScopeError,
+    find_existing_review_branch, is_clean, read_review_scope, resolve_remote_tracking_branch,
+    run_git_command, run_git_command_machine_output, select_new_review_branch,
+    write_review_metadata, write_review_scope, ReviewBranchSelection, ReviewBranchSelectionError,
+    ReviewMetadata, ReviewScope, ReviewScopeError,
 };
 use crate::review::{
     find_unique_merge_base, reconstruct_approval_tree, ReviewError, ReviewPreparation,
@@ -179,10 +180,19 @@ fn prepare_review_plan(
         None
     };
 
-    let selection = select_review_branch(&metadata, verbose).map_err(|error| match error {
+    let map_selection_error = |error| match error {
         ReviewBranchSelectionError::Git(error) => ReviewError::Git(error),
         ReviewBranchSelectionError::Conflict(message) => ReviewError::Message(message),
-    })?;
+    };
+    let selection =
+        match find_existing_review_branch(&metadata, verbose).map_err(map_selection_error)? {
+            Some(branch) => ReviewBranchSelection::Existing(branch),
+            None => {
+                let base = resolve_new_review_branch_name(&metadata, verbose)
+                    .map_err(|error| ReviewError::Message(error.to_string()))?;
+                select_new_review_branch(&base, &metadata, verbose).map_err(map_selection_error)?
+            }
+        };
     let (old_review, old_base) = match &selection {
         ReviewBranchSelection::New(_) => (None, None),
         ReviewBranchSelection::Existing(branch) => {
