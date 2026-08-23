@@ -320,10 +320,6 @@ fn can_transition(stored: &ReviewSide, requested: &ResolvedBranch) -> bool {
         return false;
     };
     stored.local_anchors.contains(anchor)
-        || matches!(
-            &stored.canonical,
-            CanonicalBranch::Local { reference } if reference == anchor
-        )
 }
 
 #[derive(Clone, Copy)]
@@ -1017,12 +1013,21 @@ mod tests {
         }
     }
 
+    fn anchored_local_identity(reference: &str) -> ReviewSide {
+        ReviewSide {
+            canonical: CanonicalBranch::Local {
+                reference: reference.to_string(),
+            },
+            local_anchors: BTreeSet::from([reference.to_string()]),
+        }
+    }
+
     #[test]
     fn exact_and_transition_candidates_are_ambiguous_together() {
         let request = request_for_plain_remote("refs/heads/dev", "origin", "refs/heads/dev");
         let candidates = vec![
             candidate("remote-review", remote_identity("origin", "refs/heads/dev")),
-            candidate("local-review", local_identity("refs/heads/dev")),
+            candidate("local-review", anchored_local_identity("refs/heads/dev")),
         ];
 
         let requested = request.source.canonical.clone();
@@ -1038,7 +1043,7 @@ mod tests {
         let request = request_for_explicit_remote("origin", "refs/heads/dev");
         let candidates = vec![
             candidate("remote-review", remote_identity("origin", "refs/heads/dev")),
-            candidate("local-review", local_identity("refs/heads/dev")),
+            candidate("local-review", anchored_local_identity("refs/heads/dev")),
         ];
 
         let ReviewSelection::Existing(existing) =
@@ -1314,6 +1319,7 @@ mod tests {
                 },
                 local_anchors: BTreeSet::from([
                     "refs/heads/deleted".to_string(),
+                    "refs/heads/dev".to_string(),
                     "refs/heads/kept".to_string(),
                 ]),
             },
@@ -1328,6 +1334,7 @@ mod tests {
             }],
             move |anchor| match anchor {
                 "refs/heads/deleted" => Ok(None),
+                "refs/heads/dev" => Ok(Some(requested.clone())),
                 "refs/heads/kept" => Ok(Some(requested.clone())),
                 other => panic!("unexpected stored anchor: {other}"),
             },
@@ -1360,9 +1367,13 @@ mod tests {
                 canonical: CanonicalBranch::Local {
                     reference: "refs/heads/dev".to_string(),
                 },
-                local_anchors: BTreeSet::from(["refs/heads/diverged".to_string()]),
+                local_anchors: BTreeSet::from([
+                    "refs/heads/dev".to_string(),
+                    "refs/heads/diverged".to_string(),
+                ]),
             },
         };
+        let requested = request.source.canonical.clone();
 
         let error = select_review(
             &request,
@@ -1370,11 +1381,13 @@ mod tests {
                 branch: "transition-review".to_string(),
                 identity: StoredReviewIdentity::V2(stored),
             }],
-            |_| {
-                Ok(Some(CanonicalBranch::Remote {
+            move |anchor| match anchor {
+                "refs/heads/dev" => Ok(Some(requested.clone())),
+                "refs/heads/diverged" => Ok(Some(CanonicalBranch::Remote {
                     remote: "fork".to_string(),
                     reference: "refs/heads/other".to_string(),
-                }))
+                })),
+                other => panic!("unexpected stored anchor: {other}"),
             },
         )
         .unwrap_err()

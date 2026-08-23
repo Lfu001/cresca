@@ -258,6 +258,63 @@ fn differently_named_upstream_promotes_local_review() {
     assert_eq!(repo.read_file("new.txt"), "new change\n");
 }
 
+// Production break caught: treating an explicit local canonical ref as transition
+// evidence carries explicit-only approvals into a later plain upstream review.
+#[test]
+fn explicit_local_review_does_not_transition_after_upstream_publication() {
+    let repo = TempGitRepo::new();
+    repo.create_branch("dev");
+    repo.write_file("explicit-approved.txt", "explicit approval\n");
+    repo.write_file("pending.txt", "pending change\n");
+    repo.git(&["add", "."]);
+    repo.commit("Add explicitly reviewed changes");
+    repo.switch_branch("main");
+
+    assert_cresca_success(&repo.run_cresca(&["review", "refs/heads/main", "refs/heads/dev"]));
+    let explicit_review = repo.current_branch();
+    repo.git(&["add", "explicit-approved.txt"]);
+    assert_cresca_success(&repo.run_cresca(&["approve"]));
+    let explicit_head = repo.rev_parse(&explicit_review);
+    assert!(repo
+        .git_maybe(&[
+            "cat-file",
+            "-e",
+            &format!("{explicit_review}:explicit-approved.txt"),
+        ])
+        .status
+        .success());
+    assert!(!repo
+        .git_maybe(&["cat-file", "-e", &format!("{explicit_review}:pending.txt"),])
+        .status
+        .success());
+
+    repo.switch_branch("dev");
+    repo.git(&["push", "-u", "origin", "dev"]);
+    repo.write_file("published-later.txt", "published later\n");
+    repo.git(&["add", "."]);
+    repo.commit("Add later published change");
+    repo.git(&["push", "origin", "dev"]);
+    repo.switch_branch("main");
+
+    assert_cresca_success(&repo.run_cresca(&["review", "refs/heads/main", "dev"]));
+
+    assert_ne!(repo.current_branch(), explicit_review);
+    assert_eq!(repo.rev_parse(&explicit_review), explicit_head);
+    assert_eq!(
+        repo.git_config_values(&format!("branch.{explicit_review}.cresca-source-kind")),
+        ["local"]
+    );
+    assert_eq!(
+        repo.git_config_values(&format!("branch.{explicit_review}.cresca-source-ref")),
+        ["refs/heads/dev"]
+    );
+    assert!(repo
+        .git_config_values(&format!("branch.{explicit_review}.cresca-source-anchor"))
+        .is_empty());
+    assert_eq!(repo.cached_diff(), Vec::<u8>::new());
+    assert_eq!(repo.worktree_diff(), repo.diff("main", "origin/dev"));
+}
+
 // Production break caught: matching only the saved remote identity starts a new
 // review when the same plain local branch is republished to another upstream.
 #[test]
