@@ -1,9 +1,10 @@
-use crate::branch_ref::CanonicalBranch;
+use crate::branch_ref::{BranchResolutionError, CanonicalBranch, ResolutionMode, ResolvedBranch};
 use crate::git::{
-    add_review_config_value, replace_review_config_value, review_config_values,
-    unset_review_config_values, GitCommandError,
+    add_review_config_value, replace_review_config_value, review_config_values, run_git_command,
+    run_git_command_machine_output, unset_review_config_values, GitCommandError,
 };
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
 
 pub const REVIEW_METADATA_V2: &str = "2";
 
@@ -29,6 +30,93 @@ pub struct LegacyReviewIdentity {
 pub enum StoredReviewIdentity {
     V1(LegacyReviewIdentity),
     V2(ReviewIdentity),
+}
+
+#[derive(Clone, Debug)]
+pub struct ReviewRequest {
+    pub target: ResolvedBranch,
+    pub source: ResolvedBranch,
+}
+
+impl ReviewRequest {
+    pub fn identity(&self) -> ReviewIdentity {
+        fn side(resolved: &ResolvedBranch) -> ReviewSide {
+            let local_anchors = if resolved.mode == ResolutionMode::Plain {
+                resolved.local_anchor.iter().cloned().collect()
+            } else {
+                BTreeSet::new()
+            };
+            ReviewSide {
+                canonical: resolved.canonical.clone(),
+                local_anchors,
+            }
+        }
+
+        ReviewIdentity {
+            target: side(&self.target),
+            source: side(&self.source),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExistingReview {
+    pub branch: String,
+    pub stored: StoredReviewIdentity,
+    pub next_identity: ReviewIdentity,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ReviewSelection {
+    New { identity: ReviewIdentity },
+    Existing(ExistingReview),
+}
+
+#[derive(Clone, Debug)]
+pub struct StoredReview {
+    pub branch: String,
+    pub identity: StoredReviewIdentity,
+}
+
+#[derive(Debug)]
+pub enum ReviewSelectionError {
+    Git(GitCommandError),
+    Conflict(String),
+    RelevantReviewInvalid { branch: String, reason: String },
+}
+
+impl fmt::Display for ReviewSelectionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Git(error) => formatter.write_str(&error.description),
+            Self::Conflict(message) => formatter.write_str(message),
+            Self::RelevantReviewInvalid { branch, reason } => write!(
+                formatter,
+                "Review branch `{branch}` has invalid relevant metadata: {reason}"
+            ),
+        }
+    }
+}
+
+impl From<GitCommandError> for ReviewSelectionError {
+    fn from(error: GitCommandError) -> Self {
+        Self::Git(error)
+    }
+}
+
+impl From<BranchResolutionError> for ReviewSelectionError {
+    fn from(error: BranchResolutionError) -> Self {
+        match error {
+            BranchResolutionError::Git(error) => Self::Git(error),
+            BranchResolutionError::Message(message) => Self::Conflict(message),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct V2Candidate {
+    branch: String,
+    identity: ReviewIdentity,
 }
 
 #[derive(Debug)]
@@ -121,6 +209,368 @@ pub fn read_stored_review_identity(
     verbose: bool,
 ) -> Result<StoredReviewIdentity, ReviewIdentityReadError> {
     decode_stored_fields(&read_fields(branch, verbose)?)
+}
+
+fn load_candidates_from_branches<I, F>(
+    branches: I,
+    mut read: F,
+) -> Result<Vec<StoredReview>, ReviewSelectionError>
+where
+    I: IntoIterator<Item = String>,
+    F: FnMut(&str) -> Result<StoredReviewIdentity, ReviewIdentityReadError>,
+{
+    let mut branches: Vec<_> = branches.into_iter().collect();
+    branches.sort();
+    let mut candidates = Vec::new();
+    for branch in branches {
+        match read(&branch) {
+            Ok(identity) => candidates.push(StoredReview { branch, identity }),
+            Err(ReviewIdentityReadError::Missing)
+            | Err(ReviewIdentityReadError::UnsupportedVersion(_))
+            | Err(ReviewIdentityReadError::Invalid(_)) => {}
+            Err(ReviewIdentityReadError::Git(error)) => {
+                return Err(ReviewSelectionError::Git(error))
+            }
+        }
+    }
+    Ok(candidates)
+}
+
+pub fn load_review_candidates(verbose: bool) -> Result<Vec<StoredReview>, ReviewSelectionError> {
+    let output = run_git_command_machine_output(
+        "list local branches for review identity",
+        &[
+            "for-each-ref",
+            "--sort=refname",
+            "--format=%(refname:short)",
+            "refs/heads",
+        ],
+        &[],
+        verbose,
+    )?;
+    let branches = std::str::from_utf8(&output.stdout).map_err(|_| {
+        ReviewSelectionError::Conflict(
+            "Cannot identify review branches because Git returned a non-UTF-8 local branch name."
+                .to_string(),
+        )
+    })?;
+    load_candidates_from_branches(
+        branches
+            .lines()
+            .filter(|branch| !branch.is_empty())
+            .map(str::to_string),
+        |branch| read_stored_review_identity(branch, verbose),
+    )
+}
+
+fn validate_anchor_transition<F>(
+    stored: &ReviewSide,
+    requested: &ReviewSide,
+    mut resolve_anchor: F,
+) -> Result<BTreeSet<String>, ReviewSelectionError>
+where
+    F: FnMut(&str) -> Result<Option<CanonicalBranch>, BranchResolutionError>,
+{
+    let mut current_anchors = requested.local_anchors.iter();
+    let Some(current_anchor) = current_anchors.next() else {
+        return Err(ReviewSelectionError::Conflict(
+            "A plain request needs exactly one local anchor to follow a review transition."
+                .to_string(),
+        ));
+    };
+    if current_anchors.next().is_some() {
+        return Err(ReviewSelectionError::Conflict(
+            "A plain request needs exactly one local anchor to follow a review transition."
+                .to_string(),
+        ));
+    }
+    let mut next = BTreeSet::new();
+    for anchor in &stored.local_anchors {
+        match resolve_anchor(anchor)? {
+            None => {}
+            Some(canonical) if canonical == requested.canonical => {
+                next.insert(anchor.clone());
+            }
+            Some(canonical) => {
+                return Err(ReviewSelectionError::Conflict(format!(
+                    "Stored local anchor `{anchor}` now resolves to `{}`, not the requested `{}`.",
+                    describe_canonical(&canonical),
+                    describe_canonical(&requested.canonical)
+                )))
+            }
+        }
+    }
+    next.insert(current_anchor.clone());
+    Ok(next)
+}
+
+fn describe_canonical(canonical: &CanonicalBranch) -> String {
+    match canonical {
+        CanonicalBranch::Local { reference } => reference.clone(),
+        CanonicalBranch::Remote { remote, reference } => format!(
+            "{remote}/{}",
+            reference.strip_prefix("refs/heads/").unwrap_or(reference)
+        ),
+    }
+}
+
+fn can_transition(stored: &ReviewSide, requested: &ResolvedBranch) -> bool {
+    if requested.mode != ResolutionMode::Plain {
+        return false;
+    }
+    let Some(anchor) = requested.local_anchor.as_deref() else {
+        return false;
+    };
+    stored.local_anchors.contains(anchor)
+        || matches!(
+            &stored.canonical,
+            CanonicalBranch::Local { reference } if reference == anchor
+        )
+}
+
+#[derive(Clone, Copy)]
+enum SideCompatibility {
+    Exact,
+    Transition,
+}
+
+fn side_compatibility(
+    stored: &ReviewSide,
+    requested: &ResolvedBranch,
+) -> Option<SideCompatibility> {
+    if stored.canonical == requested.canonical {
+        Some(SideCompatibility::Exact)
+    } else if can_transition(stored, requested) {
+        Some(SideCompatibility::Transition)
+    } else {
+        None
+    }
+}
+
+fn next_side<F>(
+    branch: &str,
+    stored: &ReviewSide,
+    requested: &ResolvedBranch,
+    compatibility: SideCompatibility,
+    mut resolve_anchor: F,
+) -> Result<Option<ReviewSide>, ReviewSelectionError>
+where
+    F: FnMut(&str) -> Result<Option<CanonicalBranch>, BranchResolutionError>,
+{
+    if matches!(compatibility, SideCompatibility::Exact) {
+        let mut next = stored.clone();
+        if requested.mode == ResolutionMode::Plain {
+            if let Some(anchor) = &requested.local_anchor {
+                next.local_anchors.insert(anchor.clone());
+            }
+        }
+        return Ok(Some(next));
+    }
+    let mut next = ReviewSide {
+        canonical: requested.canonical.clone(),
+        local_anchors: requested.local_anchor.iter().cloned().collect(),
+    };
+    next.local_anchors = validate_anchor_transition(stored, &next, &mut resolve_anchor).map_err(
+        |error| match error {
+            ReviewSelectionError::Conflict(reason) => ReviewSelectionError::RelevantReviewInvalid {
+                branch: branch.to_string(),
+                reason,
+            },
+            other => other,
+        },
+    )?;
+    Ok(Some(next))
+}
+
+fn next_v2_identity<F>(
+    branch: &str,
+    stored: &ReviewIdentity,
+    request: &ReviewRequest,
+    mut resolve_anchor: F,
+) -> Result<Option<ReviewIdentity>, ReviewSelectionError>
+where
+    F: FnMut(&str) -> Result<Option<CanonicalBranch>, BranchResolutionError>,
+{
+    let Some(target_compatibility) = side_compatibility(&stored.target, &request.target) else {
+        return Ok(None);
+    };
+    let Some(source_compatibility) = side_compatibility(&stored.source, &request.source) else {
+        return Ok(None);
+    };
+    let Some(target) = next_side(
+        branch,
+        &stored.target,
+        &request.target,
+        target_compatibility,
+        &mut resolve_anchor,
+    )?
+    else {
+        return Ok(None);
+    };
+    let Some(source) = next_side(
+        branch,
+        &stored.source,
+        &request.source,
+        source_compatibility,
+        &mut resolve_anchor,
+    )?
+    else {
+        return Ok(None);
+    };
+    Ok(Some(ReviewIdentity { target, source }))
+}
+
+fn ambiguous_reviews(mut branches: Vec<String>) -> ReviewSelectionError {
+    branches.sort();
+    ReviewSelectionError::Conflict(format!(
+        "Found multiple compatible review branches: {}. Use explicit local or remote branch syntax, or correct the duplicate review metadata before retrying.",
+        branches
+            .iter()
+            .map(|branch| format!("`{branch}`"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    ))
+}
+
+pub fn select_review<F>(
+    request: &ReviewRequest,
+    candidates: Vec<StoredReview>,
+    mut resolve_anchor: F,
+) -> Result<ReviewSelection, ReviewSelectionError>
+where
+    F: FnMut(&str) -> Result<Option<CanonicalBranch>, BranchResolutionError>,
+{
+    let requested_identity = request.identity();
+    let mut matches = Vec::new();
+    for candidate in candidates {
+        let next_identity = match &candidate.identity {
+            StoredReviewIdentity::V1(legacy)
+                if legacy.target == request.target.requested
+                    && legacy.source == request.source.requested =>
+            {
+                Some(requested_identity.clone())
+            }
+            StoredReviewIdentity::V1(_) => None,
+            StoredReviewIdentity::V2(identity) => {
+                next_v2_identity(&candidate.branch, identity, request, &mut resolve_anchor)?
+            }
+        };
+        if let Some(next_identity) = next_identity {
+            matches.push(ExistingReview {
+                branch: candidate.branch,
+                stored: candidate.identity,
+                next_identity,
+            });
+        }
+    }
+    match matches.len() {
+        0 => Ok(ReviewSelection::New {
+            identity: requested_identity,
+        }),
+        1 => Ok(ReviewSelection::Existing(
+            matches.pop().expect("one match must be present"),
+        )),
+        _ => Err(ambiguous_reviews(
+            matches.into_iter().map(|review| review.branch).collect(),
+        )),
+    }
+}
+
+fn select_from_v2_candidates(
+    request: &ReviewRequest,
+    candidates: Vec<V2Candidate>,
+    resolve_anchor: impl FnMut(&str) -> Result<Option<CanonicalBranch>, BranchResolutionError>,
+) -> Result<Option<ExistingReview>, ReviewSelectionError> {
+    let candidates = candidates
+        .into_iter()
+        .map(|candidate| StoredReview {
+            branch: candidate.branch,
+            identity: StoredReviewIdentity::V2(candidate.identity),
+        })
+        .collect();
+    match select_review(request, candidates, resolve_anchor)? {
+        ReviewSelection::New { .. } => Ok(None),
+        ReviewSelection::Existing(existing) => Ok(Some(existing)),
+    }
+}
+
+fn canonical_identity_hash(identity: &ReviewIdentity) -> u64 {
+    const OFFSET: u64 = 0xcbf29ce484222325;
+    const PRIME: u64 = 0x100000001b3;
+    let mut hash = OFFSET;
+    let mut feed = |value: &str| {
+        for byte in (value.len() as u64)
+            .to_be_bytes()
+            .into_iter()
+            .chain(value.bytes())
+        {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(PRIME);
+        }
+    };
+    let mut feed_side = |position: &str, side: &ReviewSide| {
+        feed(position);
+        match &side.canonical {
+            CanonicalBranch::Local { reference } => {
+                feed("local");
+                feed(reference);
+            }
+            CanonicalBranch::Remote { remote, reference } => {
+                feed("remote");
+                feed(remote);
+                feed(reference);
+            }
+        }
+    };
+    feed_side("target", &identity.target);
+    feed_side("source", &identity.source);
+    hash
+}
+
+fn suffixed_review_branch(base: &str, identity: &ReviewIdentity) -> String {
+    format!("{base}-{:016x}", canonical_identity_hash(identity))
+}
+
+fn allocate_new_review_branch_with<F>(
+    base: &str,
+    identity: &ReviewIdentity,
+    mut branch_exists: F,
+) -> Result<String, ReviewSelectionError>
+where
+    F: FnMut(&str) -> Result<bool, GitCommandError>,
+{
+    if !branch_exists(base)? {
+        return Ok(base.to_string());
+    }
+    let suffix = suffixed_review_branch(base, identity);
+    if !branch_exists(&suffix)? {
+        return Ok(suffix);
+    }
+    Err(ReviewSelectionError::Conflict(format!(
+        "Found conflicting review branches `{base}` and `{suffix}`. Delete or rename an occupied local review branch before retrying."
+    )))
+}
+
+pub fn allocate_new_review_branch(
+    base: &str,
+    identity: &ReviewIdentity,
+    verbose: bool,
+) -> Result<String, ReviewSelectionError> {
+    allocate_new_review_branch_with(base, identity, |branch| {
+        Ok(run_git_command(
+            "check existence of review branch",
+            &[
+                "show-ref",
+                "--verify",
+                "--quiet",
+                &format!("refs/heads/{branch}"),
+            ],
+            &[1],
+            verbose,
+        )?
+        .status
+        .success())
+    })
 }
 
 fn write_side(
@@ -313,10 +763,13 @@ fn decode_v2_fields(fields: &BTreeMap<String, Vec<String>>) -> Result<ReviewIden
 #[cfg(test)]
 mod tests {
     use super::{
-        decode_stored_fields, decode_v2_fields, encode_v2_fields, LegacyReviewIdentity,
-        ReviewIdentity, ReviewSide, StoredReviewIdentity, REVIEW_METADATA_V2,
+        allocate_new_review_branch_with, decode_stored_fields, decode_v2_fields, encode_v2_fields,
+        load_candidates_from_branches, select_from_v2_candidates, select_review,
+        suffixed_review_branch, LegacyReviewIdentity, ReviewIdentity, ReviewRequest,
+        ReviewSelection, ReviewSide, StoredReview, StoredReviewIdentity, V2Candidate,
+        REVIEW_METADATA_V2,
     };
-    use crate::branch_ref::CanonicalBranch;
+    use crate::branch_ref::{CanonicalBranch, ResolutionMode, ResolvedBranch};
     use std::collections::{BTreeMap, BTreeSet};
 
     #[test]
@@ -467,5 +920,352 @@ mod tests {
         ]);
 
         assert!(decode_stored_fields(&fields).is_err());
+    }
+
+    fn resolved_source(
+        canonical: CanonicalBranch,
+        anchor: Option<&str>,
+        mode: ResolutionMode,
+    ) -> ResolvedBranch {
+        ResolvedBranch {
+            requested: anchor.unwrap_or("origin/dev").to_string(),
+            canonical,
+            local_anchor: anchor.map(str::to_string),
+            mode,
+            commit_oid: "1111111111111111111111111111111111111111".to_string(),
+        }
+    }
+
+    fn remote_side(remote: &str, reference: &str) -> ReviewSide {
+        ReviewSide {
+            canonical: CanonicalBranch::Remote {
+                remote: remote.to_string(),
+                reference: reference.to_string(),
+            },
+            local_anchors: BTreeSet::new(),
+        }
+    }
+
+    fn request_for_plain_remote(anchor: &str, remote: &str, reference: &str) -> ReviewRequest {
+        ReviewRequest {
+            target: resolved_source(
+                CanonicalBranch::Remote {
+                    remote: "origin".to_string(),
+                    reference: "refs/heads/main".to_string(),
+                },
+                Some("refs/heads/main"),
+                ResolutionMode::Plain,
+            ),
+            source: resolved_source(
+                CanonicalBranch::Remote {
+                    remote: remote.to_string(),
+                    reference: reference.to_string(),
+                },
+                Some(anchor),
+                ResolutionMode::Plain,
+            ),
+        }
+    }
+
+    fn request_for_explicit_remote(remote: &str, reference: &str) -> ReviewRequest {
+        ReviewRequest {
+            target: resolved_source(
+                CanonicalBranch::Remote {
+                    remote: "origin".to_string(),
+                    reference: "refs/heads/main".to_string(),
+                },
+                None,
+                ResolutionMode::ExplicitRemote,
+            ),
+            source: resolved_source(
+                CanonicalBranch::Remote {
+                    remote: remote.to_string(),
+                    reference: reference.to_string(),
+                },
+                None,
+                ResolutionMode::ExplicitRemote,
+            ),
+        }
+    }
+
+    fn candidate(branch: &str, source: ReviewSide) -> V2Candidate {
+        V2Candidate {
+            branch: branch.to_string(),
+            identity: ReviewIdentity {
+                target: remote_side("origin", "refs/heads/main"),
+                source,
+            },
+        }
+    }
+
+    fn remote_identity(remote: &str, reference: &str) -> ReviewSide {
+        remote_side(remote, reference)
+    }
+
+    fn local_identity(reference: &str) -> ReviewSide {
+        ReviewSide {
+            canonical: CanonicalBranch::Local {
+                reference: reference.to_string(),
+            },
+            local_anchors: BTreeSet::new(),
+        }
+    }
+
+    #[test]
+    fn exact_and_transition_candidates_are_ambiguous_together() {
+        let request = request_for_plain_remote("refs/heads/dev", "origin", "refs/heads/dev");
+        let candidates = vec![
+            candidate("remote-review", remote_identity("origin", "refs/heads/dev")),
+            candidate("local-review", local_identity("refs/heads/dev")),
+        ];
+
+        let requested = request.source.canonical.clone();
+        let error =
+            select_from_v2_candidates(&request, candidates, move |_| Ok(Some(requested.clone())))
+                .unwrap_err();
+
+        assert!(error.to_string().contains("remote-review"));
+        assert!(error.to_string().contains("local-review"));
+    }
+
+    #[test]
+    fn explicit_remote_does_not_match_local_anchor_transition() {
+        let request = request_for_explicit_remote("origin", "refs/heads/dev");
+        let candidates = vec![
+            candidate("remote-review", remote_identity("origin", "refs/heads/dev")),
+            candidate("local-review", local_identity("refs/heads/dev")),
+        ];
+
+        assert_eq!(
+            select_from_v2_candidates(&request, candidates, |_| Ok(None))
+                .unwrap()
+                .unwrap()
+                .branch,
+            "remote-review"
+        );
+    }
+
+    #[test]
+    fn zero_candidates_returns_new_identity() {
+        let request = request_for_plain_remote("refs/heads/dev", "origin", "refs/heads/dev");
+
+        assert_eq!(
+            select_review(&request, Vec::new(), |_| Ok(None)).unwrap(),
+            ReviewSelection::New {
+                identity: ReviewIdentity {
+                    target: ReviewSide {
+                        canonical: CanonicalBranch::Remote {
+                            remote: "origin".to_string(),
+                            reference: "refs/heads/main".to_string(),
+                        },
+                        local_anchors: BTreeSet::from(["refs/heads/main".to_string()]),
+                    },
+                    source: ReviewSide {
+                        canonical: CanonicalBranch::Remote {
+                            remote: "origin".to_string(),
+                            reference: "refs/heads/dev".to_string(),
+                        },
+                        local_anchors: BTreeSet::from(["refs/heads/dev".to_string()]),
+                    },
+                }
+            }
+        );
+    }
+
+    #[test]
+    fn one_exact_v2_candidate_is_reused() {
+        let request = request_for_plain_remote("refs/heads/dev", "origin", "refs/heads/dev");
+        let stored = ReviewIdentity {
+            target: remote_side("origin", "refs/heads/main"),
+            source: remote_side("origin", "refs/heads/dev"),
+        };
+
+        let selected = select_review(
+            &request,
+            vec![StoredReview {
+                branch: "review-dev".to_string(),
+                identity: StoredReviewIdentity::V2(stored.clone()),
+            }],
+            |_| Ok(None),
+        )
+        .unwrap();
+
+        let ReviewSelection::Existing(existing) = selected else {
+            panic!("expected the exact review to be reused");
+        };
+        assert_eq!(existing.branch, "review-dev");
+        assert_eq!(existing.stored, StoredReviewIdentity::V2(stored));
+        assert_eq!(
+            existing.next_identity.source.local_anchors,
+            BTreeSet::from(["refs/heads/dev".to_string()])
+        );
+    }
+
+    #[test]
+    fn two_exact_v2_candidates_are_rejected_in_sorted_order() {
+        let request = request_for_explicit_remote("origin", "refs/heads/dev");
+        let stored = ReviewIdentity {
+            target: remote_side("origin", "refs/heads/main"),
+            source: remote_side("origin", "refs/heads/dev"),
+        };
+        let error = select_review(
+            &request,
+            vec![
+                StoredReview {
+                    branch: "z-review".to_string(),
+                    identity: StoredReviewIdentity::V2(stored.clone()),
+                },
+                StoredReview {
+                    branch: "a-review".to_string(),
+                    identity: StoredReviewIdentity::V2(stored),
+                },
+            ],
+            |_| Ok(None),
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.find("a-review").unwrap() < error.find("z-review").unwrap());
+    }
+
+    #[test]
+    fn exact_raw_v1_candidate_is_reused() {
+        let request = request_for_plain_remote("refs/heads/dev", "origin", "refs/heads/dev");
+        let legacy = LegacyReviewIdentity {
+            target: "refs/heads/main".to_string(),
+            source: "refs/heads/dev".to_string(),
+        };
+
+        let selected = select_review(
+            &request,
+            vec![StoredReview {
+                branch: "legacy-review".to_string(),
+                identity: StoredReviewIdentity::V1(legacy.clone()),
+            }],
+            |_| Ok(None),
+        )
+        .unwrap();
+
+        let ReviewSelection::Existing(existing) = selected else {
+            panic!("expected the legacy review to be reused");
+        };
+        assert_eq!(existing.branch, "legacy-review");
+        assert_eq!(existing.stored, StoredReviewIdentity::V1(legacy));
+        assert_eq!(existing.next_identity, request.identity());
+    }
+
+    #[test]
+    fn exact_v1_and_exact_v2_candidates_are_ambiguous_together() {
+        let request = request_for_plain_remote("refs/heads/dev", "origin", "refs/heads/dev");
+        let error = select_review(
+            &request,
+            vec![
+                StoredReview {
+                    branch: "legacy-review".to_string(),
+                    identity: StoredReviewIdentity::V1(LegacyReviewIdentity {
+                        target: "refs/heads/main".to_string(),
+                        source: "refs/heads/dev".to_string(),
+                    }),
+                },
+                StoredReview {
+                    branch: "canonical-review".to_string(),
+                    identity: StoredReviewIdentity::V2(ReviewIdentity {
+                        target: remote_side("origin", "refs/heads/main"),
+                        source: remote_side("origin", "refs/heads/dev"),
+                    }),
+                },
+            ],
+            |_| Ok(None),
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("legacy-review"));
+        assert!(error.contains("canonical-review"));
+    }
+
+    #[test]
+    fn unmatched_candidate_does_not_validate_partial_transition() {
+        let mut request = request_for_plain_remote("refs/heads/dev", "origin", "refs/heads/dev");
+        request.target.canonical = CanonicalBranch::Remote {
+            remote: "upstream".to_string(),
+            reference: "refs/heads/main".to_string(),
+        };
+        let stored = ReviewIdentity {
+            target: ReviewSide {
+                canonical: CanonicalBranch::Remote {
+                    remote: "origin".to_string(),
+                    reference: "refs/heads/main".to_string(),
+                },
+                local_anchors: BTreeSet::from(["refs/heads/main".to_string()]),
+            },
+            source: local_identity("refs/heads/unrelated"),
+        };
+
+        assert!(matches!(
+            select_review(
+                &request,
+                vec![StoredReview {
+                    branch: "unrelated-review".to_string(),
+                    identity: StoredReviewIdentity::V2(stored),
+                }],
+                |_| Ok(Some(CanonicalBranch::Local {
+                    reference: "refs/heads/elsewhere".to_string(),
+                })),
+            )
+            .unwrap(),
+            ReviewSelection::New { .. }
+        ));
+    }
+
+    #[test]
+    fn malformed_metadata_is_not_loaded_as_a_candidate() {
+        let candidates = load_candidates_from_branches(vec!["broken-review".to_string()], |_| {
+            Err(super::ReviewIdentityReadError::Invalid(
+                "missing source-ref".to_string(),
+            ))
+        })
+        .unwrap();
+
+        assert!(candidates.is_empty());
+    }
+
+    #[test]
+    fn canonical_collision_hash_has_a_fixed_vector() {
+        let identity = ReviewIdentity {
+            target: remote_side("origin", "refs/heads/main"),
+            source: remote_side("origin", "refs/heads/dev"),
+        };
+
+        assert_eq!(
+            suffixed_review_branch("review-main-dev", &identity),
+            "review-main-dev-89555ad1f942bfb8"
+        );
+    }
+
+    #[test]
+    fn canonical_collision_suffix_ignores_raw_cli_spelling_and_anchors() {
+        let mut plain = request_for_plain_remote("refs/heads/dev", "origin", "refs/heads/dev");
+        plain.source.requested = "dev".to_string();
+        let explicit = request_for_explicit_remote("origin", "refs/heads/dev");
+
+        assert_eq!(
+            suffixed_review_branch("review", &plain.identity()),
+            suffixed_review_branch("review", &explicit.identity())
+        );
+    }
+
+    #[test]
+    fn occupied_base_and_suffix_are_rejected_by_allocator() {
+        let identity = ReviewIdentity {
+            target: remote_side("origin", "refs/heads/main"),
+            source: remote_side("origin", "refs/heads/dev"),
+        };
+        let error = allocate_new_review_branch_with("review", &identity, |_| Ok(true))
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("`review`"));
+        assert!(error.contains("`review-89555ad1f942bfb8`"));
     }
 }
