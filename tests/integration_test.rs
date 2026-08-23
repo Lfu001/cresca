@@ -265,8 +265,10 @@ fn test_tmpdir_inside_worktree_does_not_endanger_transaction_backup() {
     );
 }
 
+// Production break caught: swallowing a fatal local-branch existence probe would let
+// review preparation continue from an unknown local state and risk later mutation.
 #[test]
-fn test_fatal_show_ref_probe_is_rendered_without_mutation() {
+fn test_fatal_local_branch_probe_is_rendered_without_mutation() {
     let (repo, _) = setup_linear_range();
     let before = repo.snapshot();
     let wrapper = install_git_wrapper(
@@ -278,10 +280,7 @@ fn test_fatal_show_ref_probe_is_rendered_without_mutation() {
 
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("check existence of review branch"),
-        "{stderr}"
-    );
+    assert!(stderr.contains("check local branch `main`"), "{stderr}");
     assert!(stderr.contains("exit status: 128"), "{stderr}");
     assert!(stderr.contains("fatal show-ref failure"), "{stderr}");
     assert_eq!(repo.snapshot(), before);
@@ -442,18 +441,20 @@ fn test_partial_reconcile_failure_still_restores_independent_paths() {
     assert_eq!(repo.read_file("a-restore.txt"), "must be restored\n");
 }
 
+// Production break caught: publishing the fetched OID would mutate a user's
+// remote-tracking refs or FETCH_HEAD during otherwise successful preflight.
 #[test]
-fn test_successful_review_publishes_fetched_source_tracking_ref() {
+fn test_successful_review_preserves_remote_tracking_refs_and_fetch_head() {
     let (repo, _) = setup_linear_range();
     let stale_source = repo.rev_parse("refs/remotes/origin/develop");
     repo.switch_branch("develop");
     repo.write_file("advanced-source.txt", "advanced remote source\n");
     repo.git(&["add", "advanced-source.txt"]);
     repo.commit("Advance source after tracking ref became stale");
-    let advanced_source = repo.rev_parse("HEAD");
     repo.git(&["push", "origin", "develop"]);
     repo.git(&["update-ref", "refs/remotes/origin/develop", &stale_source]);
     repo.switch_branch("main");
+    let before = repo.snapshot();
 
     let review = repo.run_cresca(&["review", "main", "develop"]);
     assert!(
@@ -462,22 +463,24 @@ fn test_successful_review_publishes_fetched_source_tracking_ref() {
         String::from_utf8_lossy(&review.stdout),
         String::from_utf8_lossy(&review.stderr)
     );
+    let after = repo.snapshot();
+    assert_eq!(after.remote_refs, before.remote_refs);
+    assert_eq!(after.fetch_head, before.fetch_head);
     assert_eq!(
-        repo.rev_parse("refs/remotes/origin/develop"),
-        advanced_source,
-        "successful review must publish the source fetched during preflight"
+        repo.read_file("advanced-source.txt"),
+        "advanced remote source\n"
     );
 }
 
+// Production break caught: ignoring an isolated fetch failure after Git downloaded
+// objects would continue review preparation from an unverified remote endpoint.
 #[test]
-fn test_tracking_ref_publication_failure_rolls_back_exact_state() {
+fn test_isolated_fetch_failure_preserves_exact_state() {
     let (repo, _) = setup_linear_range();
     let before = repo.snapshot();
-    let before_target = repo.rev_parse("refs/remotes/origin/main");
-    let before_source = repo.rev_parse("refs/remotes/origin/develop");
     let wrapper = install_git_wrapper(
         &repo,
-        "#!/bin/sh\nif [ \"$1\" = update-ref ] && [ \"$2\" = refs/remotes/origin/develop ]; then\n  \"$CRESCA_REAL_GIT\" \"$@\" || exit $?\n  printf 'injected tracking publication failure\\n' >&2\n  exit 58\nfi\nexec \"$CRESCA_REAL_GIT\" \"$@\"\n",
+        "#!/bin/sh\nif [ \"$1\" = fetch ]; then\n  \"$CRESCA_REAL_GIT\" \"$@\" || exit $?\n  printf 'injected isolated fetch failure\\n' >&2\n  exit 58\nfi\nexec \"$CRESCA_REAL_GIT\" \"$@\"\n",
     );
 
     let output = run_cresca_with_git_wrapper(&repo, &wrapper, &["review", "main", "develop"]);
@@ -485,12 +488,10 @@ fn test_tracking_ref_publication_failure_rolls_back_exact_state() {
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("injected tracking publication failure"),
+        stderr.contains("injected isolated fetch failure"),
         "{stderr}"
     );
     assert_eq!(repo.snapshot(), before);
-    assert_eq!(repo.rev_parse("refs/remotes/origin/main"), before_target);
-    assert_eq!(repo.rev_parse("refs/remotes/origin/develop"), before_source);
 }
 
 #[test]
@@ -520,13 +521,15 @@ fn test_isolated_fetch_does_not_auto_follow_tags_on_late_failure() {
     );
 }
 
+// Production break caught: swallowing a fatal live-remote query would turn an unknown
+// selected-remote state into a false absence or stale local result.
 #[test]
-fn test_fatal_remote_tracking_probe_is_rendered_without_mutation() {
+fn test_fatal_remote_query_is_rendered_without_mutation() {
     let (repo, _) = setup_linear_range();
     let before = repo.snapshot();
     let wrapper = install_git_wrapper(
         &repo,
-        "#!/bin/sh\nif [ \"$1\" = rev-parse ] && [ \"$2\" = --verify ] && [ \"$3\" = --quiet ]; then\n  printf 'fatal remote tracking probe\\n' >&2\n  exit 128\nfi\nexec \"$CRESCA_REAL_GIT\" \"$@\"\n",
+        "#!/bin/sh\nif [ \"$1\" = ls-remote ]; then\n  printf 'fatal remote query\\n' >&2\n  exit 128\nfi\nexec \"$CRESCA_REAL_GIT\" \"$@\"\n",
     );
 
     let output = run_cresca_with_git_wrapper(&repo, &wrapper, &["review", "main", "develop"]);
@@ -534,32 +537,40 @@ fn test_fatal_remote_tracking_probe_is_rendered_without_mutation() {
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("verify if branch is already a remote tracking branch"),
+        stderr.contains("resolve branch input `main`: query remote branch `origin/main`"),
         "{stderr}"
     );
     assert!(stderr.contains("exit status: 128"), "{stderr}");
-    assert!(stderr.contains("fatal remote tracking probe"), "{stderr}");
+    assert!(stderr.contains("fatal remote query"), "{stderr}");
     assert_eq!(repo.snapshot(), before);
 }
 
+// Production break caught: swallowing a direct local-config read failure would
+// misclassify an unknown upstream relationship as absent.
 #[test]
-fn test_fatal_upstream_probe_is_rendered_without_mutation() {
+fn test_fatal_direct_upstream_config_probe_is_rendered_without_mutation() {
     let (repo, _) = setup_linear_range();
     repo.git(&["update-ref", "-d", "refs/remotes/origin/main"]);
     repo.git(&["update-ref", "-d", "refs/remotes/origin/develop"]);
     let before = repo.snapshot();
     let wrapper = install_git_wrapper(
         &repo,
-        "#!/bin/sh\nif [ \"$1\" = rev-parse ] && [ \"$2\" = --abbrev-ref ]; then\n  case \"$3\" in\n    *'@{upstream}') printf 'fatal upstream probe\\n' >&2; exit 128 ;;\n  esac\nfi\nif [ \"$1\" = for-each-ref ]; then\n  case \"$*\" in\n    *'%(upstream:short)'*) printf 'fatal upstream probe\\n' >&2; exit 128 ;;\n  esac\nfi\nexec \"$CRESCA_REAL_GIT\" \"$@\"\n",
+        "#!/bin/sh\nif [ \"$1\" = config ] && [ \"$2\" = --local ] && [ \"$3\" = --get-all ] && [ \"$4\" = branch.main.remote ]; then\n  printf 'fatal direct upstream config probe\\n' >&2\n  exit 128\nfi\nexec \"$CRESCA_REAL_GIT\" \"$@\"\n",
     );
 
     let output = run_cresca_with_git_wrapper(&repo, &wrapper, &["review", "main", "develop"]);
 
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("get upstream branch"), "{stderr}");
+    assert!(
+        stderr.contains("read upstream configuration `branch.main.remote`"),
+        "{stderr}"
+    );
     assert!(stderr.contains("exit status: 128"), "{stderr}");
-    assert!(stderr.contains("fatal upstream probe"), "{stderr}");
+    assert!(
+        stderr.contains("fatal direct upstream config probe"),
+        "{stderr}"
+    );
     assert_eq!(repo.snapshot(), before);
 }
 
@@ -2149,10 +2160,13 @@ fn setup_multiple_merge_bases() -> TempGitRepo {
     repo.git(&["update-ref", "refs/heads/main", &target]);
     repo.git(&["update-ref", "refs/heads/develop", &source]);
     repo.git(&["push", "--force", "origin", "main", "develop"]);
+    repo.set_upstream("develop", "origin", "develop");
     repo.git(&["checkout", "--force", "main"]);
     repo
 }
 
+// Production break caught: accepting one of several best common ancestors would make
+// the review base dependent on Git output ordering.
 #[test]
 fn test_review_fails_closed_for_multiple_merge_bases_without_mutation() {
     let repo = setup_multiple_merge_bases();

@@ -1,9 +1,10 @@
 use crate::branch_naming::resolve_new_review_branch_name;
+use crate::branch_ref::resolve_branch;
 use crate::git::{
-    find_existing_review_branch, is_clean, read_review_scope, resolve_remote_tracking_branch,
-    run_git_command, run_git_command_machine_output, select_new_review_branch,
-    write_review_metadata, write_review_scope, ReviewBranchSelection, ReviewBranchSelectionError,
-    ReviewMetadata, ReviewScope, ReviewScopeError,
+    find_existing_review_branch, is_clean, read_review_scope, run_git_command,
+    run_git_command_machine_output, select_new_review_branch, write_review_metadata,
+    write_review_scope, ReviewBranchSelection, ReviewBranchSelectionError, ReviewMetadata,
+    ReviewScope, ReviewScopeError,
 };
 use crate::review::{
     find_unique_merge_base, reconstruct_approval_tree, ReviewError, ReviewPreparation,
@@ -20,7 +21,6 @@ struct ReviewPlan {
     old_review: Option<String>,
     old_base: Option<String>,
     scope: ReviewScope,
-    tracking_updates: Vec<(String, String)>,
 }
 
 /// Prepare a review branch with explicit approval-tree reconstruction.
@@ -69,16 +69,10 @@ fn prepare_review_plan(
         target: to_branch.to_string(),
         source: from_branch.to_string(),
     };
-    let resolved_to = resolve_remote_tracking_branch(to_branch, verbose)?;
-    let resolved_from = resolve_remote_tracking_branch(from_branch, verbose)?;
+    let resolved_to = resolve_branch(to_branch, verbose)?;
+    let resolved_from = resolve_branch(from_branch, verbose)?;
 
-    let tracking_from = fetch_remote_commit(
-        "source",
-        &resolved_from.remote,
-        &resolved_from.remote_branch,
-        verbose,
-    )?;
-    let scope_end_revision = stop_at.unwrap_or(&tracking_from);
+    let scope_end_revision = stop_at.unwrap_or(&resolved_from.commit_oid);
     let scope_end_commit = format!("{scope_end_revision}^{{commit}}");
     let scope_end_output = run_git_command(
         "resolve review range endpoint",
@@ -95,17 +89,14 @@ fn prepare_review_plan(
     let endpoint = String::from_utf8_lossy(&scope_end_output.stdout)
         .trim()
         .to_string();
-    let tracking_to = fetch_remote_commit(
-        "target",
-        &resolved_to.remote,
-        &resolved_to.remote_branch,
-        verbose,
-    )?;
-    let new_base = find_unique_merge_base(&tracking_to, &endpoint, verbose)?;
+    let new_base = find_unique_merge_base(&resolved_to.commit_oid, &endpoint, verbose)?;
 
     let valid_commits = run_git_command(
         "get valid commit range",
-        &["rev-list", &format!("{}..{}", new_base, tracking_from)],
+        &[
+            "rev-list",
+            &format!("{}..{}", new_base, resolved_from.commit_oid),
+        ],
         &[],
         verbose,
     )?;
@@ -138,7 +129,10 @@ fn prepare_review_plan(
         if let Some(skip_hash) = skip_to {
             let skip_to_commits = run_git_command(
                 "get commits after skip_to",
-                &["rev-list", &format!("{}..{}", skip_hash, tracking_from)],
+                &[
+                    "rev-list",
+                    &format!("{}..{}", skip_hash, resolved_from.commit_oid),
+                ],
                 &[],
                 verbose,
             )?;
@@ -221,17 +215,6 @@ fn prepare_review_plan(
             (Some(old_review), Some(old_base))
         }
     };
-    let tracking_updates = vec![
-        (
-            format!("refs/remotes/{}", resolved_to.tracking_ref),
-            tracking_to,
-        ),
-        (
-            format!("refs/remotes/{}", resolved_from.tracking_ref),
-            tracking_from,
-        ),
-    ];
-
     Ok(ReviewPlan {
         metadata,
         new_base,
@@ -240,55 +223,7 @@ fn prepare_review_plan(
         old_review,
         old_base,
         scope,
-        tracking_updates,
     })
-}
-
-fn fetch_remote_commit(
-    role: &str,
-    remote: &str,
-    remote_branch: &str,
-    verbose: bool,
-) -> Result<String, ReviewError> {
-    let remote_ref = format!("refs/heads/{remote_branch}");
-    let output = run_git_command(
-        &format!("resolve {role} branch on {remote}"),
-        &["ls-remote", "--exit-code", remote, &remote_ref],
-        &[],
-        verbose,
-    )?;
-    let oid = String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .next()
-        .and_then(|line| line.split_whitespace().next())
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| {
-            ReviewError::Message(format!(
-                "Remote branch `{remote}/{remote_branch}` did not resolve to a commit."
-            ))
-        })?
-        .to_string();
-    run_git_command(
-        &format!("fetch {role} branch from {remote}"),
-        &[
-            "fetch",
-            "--no-write-fetch-head",
-            "--no-tags",
-            "--refmap=",
-            remote,
-            &remote_ref,
-        ],
-        &[],
-        verbose,
-    )?;
-    let commit = format!("{oid}^{{commit}}");
-    let output = run_git_command(
-        &format!("validate fetched {role} commit"),
-        &["rev-parse", "--verify", &commit],
-        &[],
-        verbose,
-    )?;
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
 fn merge_auto_approved_tree(
@@ -340,17 +275,7 @@ fn apply_review_plan(plan: ReviewPlan, verbose: bool) -> Result<ReviewPreparatio
         old_review,
         old_base,
         scope,
-        tracking_updates,
     } = plan;
-    for (number, (tracking_ref, oid)) in tracking_updates.iter().enumerate() {
-        let role = if number == 0 { "target" } else { "source" };
-        run_git_command(
-            &format!("publish fetched {role} tracking ref"),
-            &["update-ref", tracking_ref, oid],
-            &[],
-            verbose,
-        )?;
-    }
     let (review_branch, is_new) = match selection {
         ReviewBranchSelection::Existing(name) => {
             run_git_command("switch to review branch", &["switch", &name], &[], verbose)?;
