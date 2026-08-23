@@ -3,6 +3,7 @@ mod branch_ref;
 mod commands;
 mod git;
 mod review;
+mod review_identity;
 
 use clap::builder::styling::{AnsiColor, Effects};
 use clap::{builder::Styles, ArgAction, Args, Parser, Subcommand};

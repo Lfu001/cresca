@@ -179,11 +179,11 @@ pub fn select_new_review_branch(
     )))
 }
 
-fn review_config_key(branch: &str, field: &str) -> String {
+pub(crate) fn review_config_key(branch: &str, field: &str) -> String {
     format!("branch.{branch}.cresca-{field}")
 }
 
-fn review_config_values(
+pub(crate) fn review_config_values(
     branch: &str,
     field: &str,
     verbose: bool,
@@ -218,6 +218,60 @@ fn review_config_values(
         stdout: output.stdout,
         stderr: output.stderr,
     })
+}
+
+pub(crate) fn replace_review_config_value(
+    branch: &str,
+    field: &str,
+    value: &str,
+    description: &str,
+    verbose: bool,
+) -> Result<(), GitCommandError> {
+    let key = review_config_key(branch, field);
+    run_git_command(
+        description,
+        &["config", "--local", "--replace-all", &key, value],
+        &[],
+        verbose,
+    )?;
+    Ok(())
+}
+
+pub(crate) fn unset_review_config_values(
+    branch: &str,
+    field: &str,
+    description: &str,
+    verbose: bool,
+) -> Result<(), GitCommandError> {
+    let values = review_config_values(branch, field, verbose)?;
+    if values.is_empty() {
+        return Ok(());
+    }
+    let key = review_config_key(branch, field);
+    run_git_command(
+        description,
+        &["config", "--local", "--unset-all", &key],
+        &[],
+        verbose,
+    )?;
+    Ok(())
+}
+
+pub(crate) fn add_review_config_value(
+    branch: &str,
+    field: &str,
+    value: &str,
+    description: &str,
+    verbose: bool,
+) -> Result<(), GitCommandError> {
+    let key = review_config_key(branch, field);
+    run_git_command(
+        description,
+        &["config", "--local", "--add", &key, value],
+        &[],
+        verbose,
+    )?;
+    Ok(())
 }
 
 pub fn read_review_metadata(
