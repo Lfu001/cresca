@@ -73,6 +73,26 @@ fn run_cresca_offline(
         .expect("Cresca should run with the offline Git wrapper")
 }
 
+fn assert_cresca_success(output: &std::process::Output) {
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn approve_all(repo: &TempGitRepo) {
+    repo.git(&["add", "-A"]);
+    assert_cresca_success(&repo.run_cresca(&["approve"]));
+}
+
+fn clean_and_switch(repo: &TempGitRepo, branch: &str) {
+    repo.git(&["reset", "--hard"]);
+    repo.git(&["clean", "-fd"]);
+    repo.switch_branch(branch);
+}
+
 // Production break caught: selecting reviews by raw command-line spelling creates
 // duplicate reviews for local branches and their configured upstream identities.
 #[test]
@@ -202,6 +222,638 @@ fn local_review_survives_push_u_and_only_new_changes_remain_unreviewed() {
     );
     assert_eq!(repo.read_file("approved.txt"), "approved change\n");
     assert_eq!(repo.read_file("new.txt"), "new change\n");
+}
+
+// Production break caught: restricting local publication continuity to a
+// same-named upstream loses the plain review's remembered local relationship.
+#[test]
+fn differently_named_upstream_promotes_local_review() {
+    let repo = TempGitRepo::new();
+    repo.create_branch("dev");
+    repo.write_file("approved.txt", "approved change\n");
+    repo.git(&["add", "."]);
+    repo.commit("Add approved local change");
+    let approved_source = repo.rev_parse("dev");
+    repo.switch_branch("main");
+
+    assert_cresca_success(&repo.run_cresca(&["review", "main", "dev"]));
+    let review_branch = repo.current_branch();
+    approve_all(&repo);
+
+    repo.switch_branch("dev");
+    repo.git(&["push", "origin", "dev:team-dev"]);
+    repo.set_upstream("dev", "origin", "team-dev");
+    repo.write_file("new.txt", "new change\n");
+    repo.git(&["add", "."]);
+    repo.commit("Add new upstream change");
+    repo.git(&["push", "origin", "dev:team-dev"]);
+    repo.switch_branch("main");
+
+    assert_cresca_success(&repo.run_cresca(&["review", "main", "dev"]));
+
+    assert_eq!(repo.current_branch(), review_branch);
+    assert_eq!(repo.cached_diff(), Vec::<u8>::new());
+    assert_eq!(repo.worktree_diff(), repo.diff(&approved_source, "dev"));
+    assert_eq!(repo.read_file("approved.txt"), "approved change\n");
+    assert_eq!(repo.read_file("new.txt"), "new change\n");
+}
+
+// Production break caught: matching only the saved remote identity starts a new
+// review when the same plain local branch is republished to another upstream.
+#[test]
+fn changing_upstream_reuses_unique_anchored_review() {
+    let repo = TempGitRepo::new();
+    repo.create_branch("dev");
+    repo.write_file("approved.txt", "approved change\n");
+    repo.git(&["add", "."]);
+    repo.commit("Add approved origin change");
+    repo.git(&["push", "-u", "origin", "dev"]);
+    let approved_source = repo.rev_parse("dev");
+    repo.switch_branch("main");
+
+    assert_cresca_success(&repo.run_cresca(&["review", "main", "dev"]));
+    let review_branch = repo.current_branch();
+    approve_all(&repo);
+
+    let _upstream = repo.add_bare_remote("upstream");
+    repo.switch_branch("dev");
+    repo.write_file("new.txt", "new change\n");
+    repo.git(&["add", "."]);
+    repo.commit("Add replacement upstream change");
+    repo.git(&["push", "upstream", "dev:team-dev"]);
+    repo.set_upstream("dev", "upstream", "team-dev");
+    repo.switch_branch("main");
+
+    assert_cresca_success(&repo.run_cresca(&["review", "main", "dev"]));
+
+    assert_eq!(repo.current_branch(), review_branch);
+    assert_eq!(repo.cached_diff(), Vec::<u8>::new());
+    assert_eq!(repo.worktree_diff(), repo.diff(&approved_source, "dev"));
+    assert_eq!(repo.read_file("approved.txt"), "approved change\n");
+    assert_eq!(repo.read_file("new.txt"), "new change\n");
+    assert_eq!(
+        repo.git_config_values(&format!("branch.{review_branch}.cresca-source-remote")),
+        ["upstream"]
+    );
+    assert_eq!(
+        repo.git_config_values(&format!("branch.{review_branch}.cresca-source-ref")),
+        ["refs/heads/team-dev"]
+    );
+}
+
+// Production break caught: requiring the old remote identity to remain available
+// loses a plain review after its upstream is deleted and safely removed.
+#[test]
+fn removing_upstream_after_remote_deletion_reuses_unique_anchored_review() {
+    let repo = TempGitRepo::new();
+    repo.create_branch("dev");
+    repo.write_file("approved.txt", "approved change\n");
+    repo.git(&["add", "."]);
+    repo.commit("Add approved upstream change");
+    repo.git(&["push", "-u", "origin", "dev"]);
+    let approved_source = repo.rev_parse("dev");
+    repo.switch_branch("main");
+
+    assert_cresca_success(&repo.run_cresca(&["review", "main", "dev"]));
+    let review_branch = repo.current_branch();
+    approve_all(&repo);
+
+    repo.switch_branch("dev");
+    repo.git(&["push", "origin", "--delete", "dev"]);
+    repo.unset_upstream("dev");
+    repo.write_file("new.txt", "new local change\n");
+    repo.git(&["add", "."]);
+    repo.commit("Add local change after upstream removal");
+    repo.switch_branch("main");
+
+    assert_cresca_success(&repo.run_cresca(&["review", "main", "dev"]));
+
+    assert_eq!(repo.current_branch(), review_branch);
+    assert_eq!(repo.cached_diff(), Vec::<u8>::new());
+    assert_eq!(repo.worktree_diff(), repo.diff(&approved_source, "dev"));
+    assert_eq!(repo.read_file("approved.txt"), "approved change\n");
+    assert_eq!(repo.read_file("new.txt"), "new local change\n");
+    assert_eq!(
+        repo.git_config_values(&format!("branch.{review_branch}.cresca-source-kind")),
+        ["local"]
+    );
+}
+
+// Production break caught: treating upstream removal as unconditional transition
+// permission would silently choose between the local branch and origin/dev.
+#[test]
+fn removing_upstream_while_same_named_remote_exists_is_ambiguous() {
+    let repo = TempGitRepo::new();
+    repo.create_branch("dev");
+    repo.write_file("approved.txt", "approved change\n");
+    repo.git(&["add", "."]);
+    repo.commit("Add tracked dev change");
+    repo.git(&["push", "-u", "origin", "dev"]);
+    repo.switch_branch("main");
+
+    assert_cresca_success(&repo.run_cresca(&["review", "main", "dev"]));
+    approve_all(&repo);
+    clean_and_switch(&repo, "main");
+    repo.unset_upstream("dev");
+    let before = repo.snapshot();
+
+    let output = repo.run_cresca(&["review", "main", "dev"]);
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("ambiguous"), "stderr: {stderr}");
+    assert!(stderr.contains("refs/heads/dev"), "stderr: {stderr}");
+    assert!(stderr.contains("origin/dev"), "stderr: {stderr}");
+    assert_eq!(repo.snapshot(), before);
+}
+
+// Production break caught: exact canonical matching that merely appends the current
+// anchor leaves a deleted pre-rename local anchor in review metadata.
+#[test]
+fn local_rename_with_same_remote_identity_updates_anchor() {
+    let repo = TempGitRepo::new();
+    repo.create_branch("dev");
+    repo.write_file("approved.txt", "approved change\n");
+    repo.git(&["add", "."]);
+    repo.commit("Add approved dev change");
+    repo.git(&["push", "-u", "origin", "dev"]);
+    let approved_source = repo.rev_parse("dev");
+    repo.switch_branch("main");
+
+    assert_cresca_success(&repo.run_cresca(&["review", "main", "dev"]));
+    let review_branch = repo.current_branch();
+    approve_all(&repo);
+
+    repo.git(&["branch", "-m", "dev", "feature"]);
+    repo.switch_branch("feature");
+    repo.write_file("new.txt", "new change\n");
+    repo.git(&["add", "."]);
+    repo.commit("Add change after local rename");
+    repo.git(&["push", "origin", "feature:dev"]);
+    repo.switch_branch("main");
+
+    assert_cresca_success(&repo.run_cresca(&["review", "main", "feature"]));
+
+    assert_eq!(repo.current_branch(), review_branch);
+    assert_eq!(repo.cached_diff(), Vec::<u8>::new());
+    assert_eq!(repo.worktree_diff(), repo.diff(&approved_source, "feature"));
+    assert_eq!(repo.read_file("approved.txt"), "approved change\n");
+    assert_eq!(repo.read_file("new.txt"), "new change\n");
+    assert_eq!(
+        repo.git_config_values(&format!("branch.{review_branch}.cresca-source-anchor")),
+        ["refs/heads/feature"]
+    );
+}
+
+// Production break caught: requiring the saved remote ref to stay exact ignores the
+// unchanged plain local anchor that proves a remote branch rename relationship.
+#[test]
+fn remote_rename_with_same_local_anchor_updates_identity() {
+    let repo = TempGitRepo::new();
+    repo.create_branch("dev");
+    repo.write_file("approved.txt", "approved change\n");
+    repo.git(&["add", "."]);
+    repo.commit("Add approved remote change");
+    repo.git(&["push", "-u", "origin", "dev"]);
+    let approved_source = repo.rev_parse("dev");
+    repo.switch_branch("main");
+
+    assert_cresca_success(&repo.run_cresca(&["review", "main", "dev"]));
+    let review_branch = repo.current_branch();
+    approve_all(&repo);
+
+    repo.switch_branch("dev");
+    repo.git(&["push", "origin", "dev:team-dev"]);
+    repo.git(&["push", "origin", "--delete", "dev"]);
+    repo.set_upstream("dev", "origin", "team-dev");
+    repo.write_file("new.txt", "new change\n");
+    repo.git(&["add", "."]);
+    repo.commit("Add change after remote rename");
+    repo.git(&["push", "origin", "dev:team-dev"]);
+    repo.switch_branch("main");
+
+    assert_cresca_success(&repo.run_cresca(&["review", "main", "dev"]));
+
+    assert_eq!(repo.current_branch(), review_branch);
+    assert_eq!(repo.cached_diff(), Vec::<u8>::new());
+    assert_eq!(repo.worktree_diff(), repo.diff(&approved_source, "dev"));
+    assert_eq!(repo.read_file("approved.txt"), "approved change\n");
+    assert_eq!(repo.read_file("new.txt"), "new change\n");
+    assert_eq!(
+        repo.git_config_values(&format!("branch.{review_branch}.cresca-source-ref")),
+        ["refs/heads/team-dev"]
+    );
+    assert_eq!(
+        repo.git_config_values(&format!("branch.{review_branch}.cresca-source-anchor")),
+        ["refs/heads/dev"]
+    );
+}
+
+// Production break caught: inferring a local-only rename from commit equality would
+// combine approvals even though no stable branch relationship proves continuity.
+#[test]
+fn local_only_rename_starts_a_new_review() {
+    let repo = TempGitRepo::new();
+    repo.create_branch("dev");
+    repo.write_file("approved.txt", "approved change\n");
+    repo.git(&["add", "."]);
+    repo.commit("Add local dev change");
+    repo.switch_branch("main");
+
+    assert_cresca_success(&repo.run_cresca(&["review", "main", "dev"]));
+    let old_review = repo.current_branch();
+    approve_all(&repo);
+
+    repo.git(&["branch", "-m", "dev", "feature"]);
+    repo.switch_branch("feature");
+    repo.write_file("new.txt", "new change\n");
+    repo.git(&["add", "."]);
+    repo.commit("Add feature change");
+    repo.switch_branch("main");
+
+    assert_cresca_success(&repo.run_cresca(&["review", "main", "feature"]));
+
+    assert_ne!(repo.current_branch(), old_review);
+    assert_eq!(repo.cached_diff(), Vec::<u8>::new());
+    assert_eq!(repo.worktree_diff(), repo.diff("main", "feature"));
+    assert_eq!(
+        repo.git_config_values(&format!("branch.{old_review}.cresca-source-ref")),
+        ["refs/heads/dev"]
+    );
+}
+
+// Production break caught: treating equal remote tips as rename evidence would carry
+// approvals across remote-only names without a remembered local anchor.
+#[test]
+fn remote_only_rename_starts_a_new_review() {
+    let repo = TempGitRepo::new();
+    repo.create_branch("dev");
+    repo.write_file("approved.txt", "approved change\n");
+    repo.git(&["add", "."]);
+    repo.commit("Add remote-only dev change");
+    repo.git(&["push", "origin", "dev"]);
+    repo.switch_branch("main");
+    repo.git(&["branch", "-D", "dev"]);
+
+    assert_cresca_success(&repo.run_cresca(&["review", "main", "dev"]));
+    let old_review = repo.current_branch();
+    approve_all(&repo);
+    clean_and_switch(&repo, "main");
+
+    repo.git(&[
+        "push",
+        "origin",
+        "refs/remotes/origin/dev:refs/heads/feature",
+    ]);
+    repo.git(&["push", "origin", "--delete", "dev"]);
+
+    assert_cresca_success(&repo.run_cresca(&["review", "main", "feature"]));
+
+    assert_ne!(repo.current_branch(), old_review);
+    assert_eq!(repo.cached_diff(), Vec::<u8>::new());
+    assert_eq!(repo.worktree_diff(), repo.diff("main", "origin/feature"));
+    assert_eq!(
+        repo.git_config_values(&format!("branch.{old_review}.cresca-source-ref")),
+        ["refs/heads/dev"]
+    );
+}
+
+// Production break caught: exact plain review matching must not require a local
+// anchor when the branch exists only on one configured remote.
+#[test]
+fn plain_remote_only_review_reuses_exact_identity() {
+    let repo = TempGitRepo::new();
+    repo.create_branch("dev");
+    repo.write_file("change.txt", "change\n");
+    repo.git(&["add", "."]);
+    repo.commit("Add remote-only change");
+    repo.git(&["push", "origin", "dev"]);
+    repo.switch_branch("main");
+    repo.git(&["branch", "-D", "dev"]);
+
+    assert_cresca_success(&repo.run_cresca(&["review", "main", "dev"]));
+    let review_branch = repo.current_branch();
+    approve_all(&repo);
+    clean_and_switch(&repo, "main");
+
+    assert_cresca_success(&repo.run_cresca(&["review", "main", "dev"]));
+
+    assert_eq!(repo.current_branch(), review_branch);
+    assert_eq!(repo.cached_diff(), Vec::<u8>::new());
+    assert_eq!(repo.worktree_diff(), Vec::<u8>::new());
+}
+
+// Production break caught: matching simultaneous local and remote renames by shared
+// history would merge reviews after both stable identity relationships disappeared.
+#[test]
+fn simultaneous_local_and_remote_rename_starts_a_new_review() {
+    let repo = TempGitRepo::new();
+    repo.create_branch("dev");
+    repo.write_file("approved.txt", "approved change\n");
+    repo.git(&["add", "."]);
+    repo.commit("Add tracked dev change");
+    repo.git(&["push", "-u", "origin", "dev"]);
+    repo.switch_branch("main");
+
+    assert_cresca_success(&repo.run_cresca(&["review", "main", "dev"]));
+    let old_review = repo.current_branch();
+    approve_all(&repo);
+
+    repo.git(&["branch", "-m", "dev", "feature"]);
+    repo.git(&["push", "origin", "feature:feature"]);
+    repo.git(&["push", "origin", "--delete", "dev"]);
+    repo.set_upstream("feature", "origin", "feature");
+    repo.switch_branch("feature");
+    repo.write_file("new.txt", "new change\n");
+    repo.git(&["add", "."]);
+    repo.commit("Add renamed feature change");
+    repo.git(&["push", "origin", "feature"]);
+    repo.switch_branch("main");
+
+    assert_cresca_success(&repo.run_cresca(&["review", "main", "feature"]));
+
+    assert_ne!(repo.current_branch(), old_review);
+    assert_eq!(repo.cached_diff(), Vec::<u8>::new());
+    assert_eq!(repo.worktree_diff(), repo.diff("main", "feature"));
+    assert_eq!(
+        repo.git_config_values(&format!("branch.{old_review}.cresca-source-ref")),
+        ["refs/heads/dev"]
+    );
+    assert_eq!(
+        repo.git_config_values(&format!("branch.{old_review}.cresca-source-anchor")),
+        ["refs/heads/dev"]
+    );
+}
+
+// Production break caught: applying anchored transition matching only to the source
+// would start a new review when the target gains a differently named upstream.
+#[test]
+fn target_upstream_change_reuses_unique_anchored_review() {
+    let repo = TempGitRepo::new();
+    repo.create_branch("base");
+    repo.create_branch("dev");
+    repo.write_file("approved.txt", "approved change\n");
+    repo.git(&["add", "."]);
+    repo.commit("Add approved source change");
+    let approved_source = repo.rev_parse("dev");
+    repo.switch_branch("main");
+
+    assert_cresca_success(&repo.run_cresca(&["review", "base", "refs/heads/dev"]));
+    let review_branch = repo.current_branch();
+    approve_all(&repo);
+
+    repo.git(&["push", "origin", "base:team-base"]);
+    repo.set_upstream("base", "origin", "team-base");
+    repo.switch_branch("dev");
+    repo.write_file("new.txt", "new change\n");
+    repo.git(&["add", "."]);
+    repo.commit("Add change after target promotion");
+    repo.switch_branch("main");
+
+    assert_cresca_success(&repo.run_cresca(&["review", "base", "refs/heads/dev"]));
+
+    assert_eq!(repo.current_branch(), review_branch);
+    assert_eq!(repo.cached_diff(), Vec::<u8>::new());
+    assert_eq!(repo.worktree_diff(), repo.diff(&approved_source, "dev"));
+    assert_eq!(repo.read_file("approved.txt"), "approved change\n");
+    assert_eq!(repo.read_file("new.txt"), "new change\n");
+    assert_eq!(
+        repo.git_config_values(&format!("branch.{review_branch}.cresca-target-ref")),
+        ["refs/heads/team-base"]
+    );
+    assert_eq!(
+        repo.git_config_values(&format!("branch.{review_branch}.cresca-target-anchor")),
+        ["refs/heads/base"]
+    );
+}
+
+// Production break caught: inferring target renames from commit equality would merge
+// approval histories even though no stable local/upstream relationship remains.
+#[test]
+fn target_rename_without_stable_relationship_starts_a_new_review() {
+    let repo = TempGitRepo::new();
+    repo.create_branch("base");
+    repo.create_branch("dev");
+    repo.write_file("approved.txt", "approved change\n");
+    repo.git(&["add", "."]);
+    repo.commit("Add approved source change");
+    repo.switch_branch("main");
+
+    assert_cresca_success(&repo.run_cresca(&["review", "base", "refs/heads/dev"]));
+    let old_review = repo.current_branch();
+    approve_all(&repo);
+
+    repo.git(&["branch", "-m", "base", "landing"]);
+    repo.switch_branch("dev");
+    repo.write_file("new.txt", "new change\n");
+    repo.git(&["add", "."]);
+    repo.commit("Add change after target rename");
+    repo.switch_branch("main");
+
+    assert_cresca_success(&repo.run_cresca(&["review", "landing", "refs/heads/dev"]));
+
+    assert_ne!(repo.current_branch(), old_review);
+    assert_eq!(repo.cached_diff(), Vec::<u8>::new());
+    assert_eq!(repo.worktree_diff(), repo.diff("landing", "dev"));
+    assert_eq!(
+        repo.git_config_values(&format!("branch.{old_review}.cresca-target-ref")),
+        ["refs/heads/base"]
+    );
+}
+
+// Production break caught: treating delete/recreate as a new identity discards safe
+// approval reconstruction for the same canonical local branch reference.
+#[test]
+fn delete_and_recreate_uses_force_push_reconstruction_rules() {
+    let repo = TempGitRepo::new();
+    repo.create_branch("dev");
+    repo.write_file("approved.txt", "approved change\n");
+    repo.git(&["add", "."]);
+    repo.commit("Add original approved change");
+    repo.switch_branch("main");
+
+    assert_cresca_success(&repo.run_cresca(&["review", "main", "dev"]));
+    let review_branch = repo.current_branch();
+    approve_all(&repo);
+
+    repo.git(&["branch", "-D", "dev"]);
+    repo.git(&["branch", "dev", "main"]);
+    repo.switch_branch("dev");
+    repo.write_file("approved.txt", "approved change\n");
+    repo.git(&["add", "."]);
+    repo.commit("Recreate approved dev change");
+    let recreated_approved = repo.rev_parse("dev");
+    repo.write_file("new.txt", "new recreated change\n");
+    repo.git(&["add", "."]);
+    repo.commit("Add new recreated change");
+    repo.switch_branch("main");
+
+    assert_cresca_success(&repo.run_cresca(&["review", "main", "dev"]));
+
+    assert_eq!(repo.current_branch(), review_branch);
+    assert_eq!(repo.cached_diff(), Vec::<u8>::new());
+    assert_eq!(repo.worktree_diff(), repo.diff(&recreated_approved, "dev"));
+    assert_eq!(repo.read_file("approved.txt"), "approved change\n");
+    assert_eq!(repo.read_file("new.txt"), "new recreated change\n");
+}
+
+// Production break caught: accepting a recreated same-name branch without a safe
+// merge base would mutate review metadata and approvals for unrelated history.
+#[test]
+fn unsafe_recreated_history_fails_without_mutation() {
+    let repo = TempGitRepo::new();
+    repo.create_branch("dev");
+    repo.write_file("approved.txt", "approved change\n");
+    repo.git(&["add", "."]);
+    repo.commit("Add original dev change");
+    repo.switch_branch("main");
+
+    assert_cresca_success(&repo.run_cresca(&["review", "main", "dev"]));
+    approve_all(&repo);
+
+    repo.git(&["branch", "-D", "dev"]);
+    repo.git(&["checkout", "--orphan", "dev"]);
+    repo.git(&["rm", "-rf", "."]);
+    repo.write_file("unrelated.txt", "unrelated history\n");
+    repo.git(&["add", "."]);
+    repo.commit("Create unrelated dev history");
+    repo.switch_branch("main");
+    let before = repo.snapshot();
+
+    let output = repo.run_cresca(&["review", "main", "dev"]);
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("No unique safe merge base"),
+        "stderr: {stderr}"
+    );
+    assert_eq!(repo.snapshot(), before);
+}
+
+// Production break caught: exact canonical matching that skips stored-anchor
+// validation would accept one review whose remembered local branches split apart.
+#[test]
+fn split_anchor_destinations_are_rejected_without_mutation() {
+    let repo = TempGitRepo::new();
+    repo.create_branch("dev");
+    repo.write_file("approved.txt", "approved change\n");
+    repo.git(&["add", "."]);
+    repo.commit("Add shared upstream change");
+    repo.git(&["push", "-u", "origin", "dev"]);
+    repo.git(&["branch", "feature", "dev"]);
+    repo.set_upstream("feature", "origin", "dev");
+    repo.switch_branch("main");
+
+    assert_cresca_success(&repo.run_cresca(&["review", "main", "dev"]));
+    let review_branch = repo.current_branch();
+    approve_all(&repo);
+    clean_and_switch(&repo, "main");
+    assert_cresca_success(&repo.run_cresca(&["review", "main", "feature"]));
+    assert_eq!(repo.current_branch(), review_branch);
+    assert_eq!(
+        repo.git_config_values(&format!("branch.{review_branch}.cresca-source-anchor")),
+        ["refs/heads/dev", "refs/heads/feature"]
+    );
+    clean_and_switch(&repo, "main");
+
+    let _fork = repo.add_bare_remote("fork");
+    repo.git(&["push", "fork", "dev:other"]);
+    repo.set_upstream("dev", "fork", "other");
+    let before = repo.snapshot();
+
+    let output = repo.run_cresca(&["review", "main", "feature"]);
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains(&review_branch), "stderr: {stderr}");
+    assert!(stderr.contains("refs/heads/dev"), "stderr: {stderr}");
+    assert!(stderr.contains("fork/other"), "stderr: {stderr}");
+    assert!(stderr.contains("origin/dev"), "stderr: {stderr}");
+    assert_eq!(repo.snapshot(), before);
+}
+
+// Production break caught: preferring an exact canonical review over a transition
+// candidate would silently combine or discard one independent approval history.
+#[test]
+fn plain_request_with_exact_and_transition_reviews_is_rejected() {
+    let repo = TempGitRepo::new();
+    repo.create_branch("dev");
+    repo.write_file("change.txt", "change\n");
+    repo.git(&["add", "."]);
+    repo.commit("Add local dev change");
+    repo.switch_branch("main");
+
+    assert_cresca_success(&repo.run_cresca(&["review", "refs/heads/main", "dev"]));
+    let transition_review = repo.current_branch();
+    approve_all(&repo);
+    repo.switch_branch("dev");
+    repo.git(&["push", "-u", "origin", "dev"]);
+    repo.switch_branch("main");
+
+    assert_cresca_success(&repo.run_cresca(&["review", "refs/heads/main", "origin/dev"]));
+    let exact_review = repo.current_branch();
+    assert_ne!(exact_review, transition_review);
+    approve_all(&repo);
+    clean_and_switch(&repo, "main");
+    let before = repo.snapshot();
+
+    let output = repo.run_cresca(&["review", "refs/heads/main", "dev"]);
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("multiple compatible"), "stderr: {stderr}");
+    assert!(stderr.contains(&transition_review), "stderr: {stderr}");
+    assert!(stderr.contains(&exact_review), "stderr: {stderr}");
+    assert_eq!(repo.snapshot(), before);
+}
+
+// Production break caught: allowing explicit remote syntax to follow a local anchor
+// transition would keep the plain conflict or select the wrong approval history.
+#[test]
+fn explicit_remote_selects_remote_review_after_plain_conflict() {
+    let repo = TempGitRepo::new();
+    repo.create_branch("dev");
+    repo.write_file("local-approved.txt", "local approval\n");
+    repo.write_file("remote-approved.txt", "remote approval\n");
+    repo.git(&["add", "."]);
+    repo.commit("Add independently reviewed files");
+    repo.switch_branch("main");
+
+    assert_cresca_success(&repo.run_cresca(&["review", "refs/heads/main", "dev"]));
+    let local_review = repo.current_branch();
+    repo.git(&["add", "local-approved.txt"]);
+    assert_cresca_success(&repo.run_cresca(&["approve"]));
+    repo.switch_branch("dev");
+    repo.git(&["push", "-u", "origin", "dev"]);
+    repo.switch_branch("main");
+
+    assert_cresca_success(&repo.run_cresca(&["review", "refs/heads/main", "origin/dev"]));
+    let remote_review = repo.current_branch();
+    assert_ne!(remote_review, local_review);
+    repo.git(&["add", "remote-approved.txt"]);
+    assert_cresca_success(&repo.run_cresca(&["approve"]));
+    clean_and_switch(&repo, "main");
+
+    let conflict = repo.run_cresca(&["review", "refs/heads/main", "dev"]);
+    assert!(!conflict.status.success());
+    let stderr = String::from_utf8_lossy(&conflict.stderr);
+    assert!(stderr.contains(&local_review), "stderr: {stderr}");
+    assert!(stderr.contains(&remote_review), "stderr: {stderr}");
+
+    assert_cresca_success(&repo.run_cresca(&["review", "refs/heads/main", "origin/dev"]));
+
+    assert_eq!(repo.current_branch(), remote_review);
+    assert!(repo
+        .git_maybe(&["cat-file", "-e", "HEAD:remote-approved.txt"])
+        .status
+        .success());
+    assert!(!repo
+        .git_maybe(&["cat-file", "-e", "HEAD:local-approved.txt"])
+        .status
+        .success());
+    assert_eq!(repo.cached_diff(), Vec::<u8>::new());
+    assert_eq!(repo.worktree_diff(), repo.diff("HEAD", "origin/dev"));
 }
 
 // Production break caught: reparsing a verified stored local anchor lets a configured

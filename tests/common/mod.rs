@@ -168,6 +168,22 @@ impl TempGitRepo {
         ]);
     }
 
+    pub fn unset_upstream(&self, local: &str) {
+        for field in ["remote", "merge"] {
+            let output = self.git_maybe(&[
+                "config",
+                "--local",
+                "--unset-all",
+                &format!("branch.{local}.{field}"),
+            ]);
+            assert!(
+                output.status.success(),
+                "failed to unset branch.{local}.{field}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+
     pub fn review_metadata_values(&self, branch: &str) -> (Vec<String>, Vec<String>, Vec<String>) {
         (
             self.git_config_values(&format!("branch.{branch}.cresca-version")),

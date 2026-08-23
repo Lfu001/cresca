@@ -257,7 +257,7 @@ pub fn load_review_candidates(verbose: bool) -> Result<Vec<StoredReview>, Review
     )
 }
 
-fn validate_anchor_transition<F>(
+fn validate_stored_anchors<F>(
     stored: &ReviewSide,
     requested: &ReviewSide,
     mut resolve_anchor: F,
@@ -265,19 +265,6 @@ fn validate_anchor_transition<F>(
 where
     F: FnMut(&str) -> Result<Option<CanonicalBranch>, BranchResolutionError>,
 {
-    let mut current_anchors = requested.local_anchors.iter();
-    let Some(current_anchor) = current_anchors.next() else {
-        return Err(ReviewSelectionError::Conflict(
-            "A plain request needs exactly one local anchor to follow a review transition."
-                .to_string(),
-        ));
-    };
-    if current_anchors.next().is_some() {
-        return Err(ReviewSelectionError::Conflict(
-            "A plain request needs exactly one local anchor to follow a review transition."
-                .to_string(),
-        ));
-    }
     let mut next = BTreeSet::new();
     for anchor in &stored.local_anchors {
         match resolve_anchor(anchor)? {
@@ -294,8 +281,25 @@ where
             }
         }
     }
-    next.insert(current_anchor.clone());
+    next.extend(requested.local_anchors.iter().cloned());
     Ok(next)
+}
+
+fn validate_anchor_transition<F>(
+    stored: &ReviewSide,
+    requested: &ReviewSide,
+    resolve_anchor: F,
+) -> Result<BTreeSet<String>, ReviewSelectionError>
+where
+    F: FnMut(&str) -> Result<Option<CanonicalBranch>, BranchResolutionError>,
+{
+    if requested.local_anchors.len() != 1 {
+        return Err(ReviewSelectionError::Conflict(
+            "A plain request needs exactly one local anchor to follow a review transition."
+                .to_string(),
+        ));
+    }
+    validate_stored_anchors(stored, requested, resolve_anchor)
 }
 
 fn describe_canonical(canonical: &CanonicalBranch) -> String {
@@ -354,9 +358,22 @@ where
     if matches!(compatibility, SideCompatibility::Exact) {
         let mut next = stored.clone();
         if requested.mode == ResolutionMode::Plain {
-            if let Some(anchor) = &requested.local_anchor {
-                next.local_anchors.insert(anchor.clone());
-            }
+            let requested_side = ReviewSide {
+                canonical: requested.canonical.clone(),
+                local_anchors: requested.local_anchor.iter().cloned().collect(),
+            };
+            next.local_anchors =
+                validate_stored_anchors(stored, &requested_side, &mut resolve_anchor).map_err(
+                    |error| match error {
+                        ReviewSelectionError::Conflict(reason) => {
+                            ReviewSelectionError::RelevantReviewInvalid {
+                                branch: branch.to_string(),
+                                reason,
+                            }
+                        }
+                        other => other,
+                    },
+                )?;
         }
         return Ok(Some(next));
     }
