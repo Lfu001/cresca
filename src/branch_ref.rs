@@ -325,7 +325,19 @@ fn discover_remote_matches(
             matches.push((remote.clone(), oid));
         }
     }
+    matches.sort_by(|left, right| left.0.cmp(&right.0));
     Ok(matches)
+}
+
+fn ambiguous_branch(input: &str, candidates: Vec<String>) -> BranchResolutionError {
+    let rendered = candidates
+        .iter()
+        .map(|candidate| format!("`{candidate}`"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    BranchResolutionError::Message(format!(
+        "Branch `{input}` is ambiguous. Candidates: {rendered}. Use one explicitly: {rendered}."
+    ))
 }
 
 fn resolve_remote(
@@ -361,18 +373,25 @@ fn resolve_remote(
 }
 
 pub fn resolve_branch(input: &str, verbose: bool) -> Result<ResolvedBranch, BranchResolutionError> {
+    if input.starts_with("refs/heads/") {
+        let BranchRequest::ExplicitLocal { reference } = parse_branch_request(input, &[])? else {
+            unreachable!("refs/heads input must parse as explicit local")
+        };
+        validate_local_branch_ref(&reference, verbose)?;
+        let commit_oid = resolve_local_commit(&reference, verbose)?;
+        return Ok(ResolvedBranch {
+            requested: input.to_string(),
+            canonical: CanonicalBranch::Local { reference },
+            local_anchor: None,
+            mode: ResolutionMode::ExplicitLocal,
+            commit_oid,
+        });
+    }
+
     let remotes = configured_remotes(verbose)?;
     match parse_branch_request(input, &remotes)? {
-        BranchRequest::ExplicitLocal { reference } => {
-            validate_local_branch_ref(&reference, verbose)?;
-            let commit_oid = resolve_local_commit(&reference, verbose)?;
-            Ok(ResolvedBranch {
-                requested: input.to_string(),
-                canonical: CanonicalBranch::Local { reference },
-                local_anchor: None,
-                mode: ResolutionMode::ExplicitLocal,
-                commit_oid,
-            })
+        BranchRequest::ExplicitLocal { .. } => {
+            unreachable!("explicit local inputs return before remote enumeration")
         }
         BranchRequest::ExplicitRemote { remote, branch_ref } => {
             let name = branch_ref
@@ -398,6 +417,18 @@ pub fn resolve_branch(input: &str, verbose: bool) -> Result<ResolvedBranch, Bran
                 verbose,
             )?;
             let local_exists = local_probe.status.success();
+            if !local_exists {
+                let tag_ref = format!("refs/tags/{name}");
+                let tag = run_git_command(
+                    &format!("check whether `{input}` is only a tag"),
+                    &["show-ref", "--verify", "--quiet", &tag_ref],
+                    &[1],
+                    verbose,
+                )?;
+                if tag.status.success() {
+                    return Err(invalid_branch(input));
+                }
+            }
             if local_exists {
                 if let UpstreamConfig::Remote { remote, branch_ref } =
                     read_upstream_config(&name, &remotes, verbose)?
@@ -427,9 +458,11 @@ pub fn resolve_branch(input: &str, verbose: bool) -> Result<ResolvedBranch, Bran
                         commit_oid,
                     })
                 }
-                (true, _) => Err(BranchResolutionError::Message(format!(
-                    "Branch `{input}` is ambiguous between local `{local_ref}` and remote branches. Use `{local_ref}` or `<remote>/{name}` explicitly."
-                ))),
+                (true, matches) => {
+                    let mut candidates = vec![local_ref];
+                    candidates.extend(matches.iter().map(|(remote, _)| format!("{remote}/{name}")));
+                    Err(ambiguous_branch(input, candidates))
+                }
                 (false, [(remote, _)]) => resolve_remote(
                     input,
                     remote.clone(),
@@ -438,25 +471,16 @@ pub fn resolve_branch(input: &str, verbose: bool) -> Result<ResolvedBranch, Bran
                     ResolutionMode::Plain,
                     verbose,
                 ),
-                (false, []) => {
-                    let tag_ref = format!("refs/tags/{name}");
-                    let tag = run_git_command(
-                        &format!("check whether `{input}` is only a tag"),
-                        &["show-ref", "--verify", "--quiet", &tag_ref],
-                        &[1],
-                        verbose,
-                    )?;
-                    if tag.status.success() {
-                        Err(invalid_branch(input))
-                    } else {
-                        Err(BranchResolutionError::Message(format!(
-                            "Branch `{input}` was not found locally or on any configured remote."
-                        )))
-                    }
-                }
-                (false, _) => Err(BranchResolutionError::Message(format!(
-                    "Branch `{input}` is ambiguous across multiple remotes. Use `<remote>/{name}` explicitly."
+                (false, []) => Err(BranchResolutionError::Message(format!(
+                    "Branch `{input}` was not found locally or on any configured remote."
                 ))),
+                (false, matches) => Err(ambiguous_branch(
+                    input,
+                    matches
+                        .iter()
+                        .map(|(remote, _)| format!("{remote}/{name}"))
+                        .collect(),
+                )),
             }
         }
     }

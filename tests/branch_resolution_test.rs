@@ -1,6 +1,47 @@
 mod common;
 
 use common::TempGitRepo;
+use std::os::unix::fs::PermissionsExt;
+use std::process::Command;
+
+fn install_git_wrapper(repo: &TempGitRepo, script: &str) -> tempfile::TempDir {
+    let wrapper = tempfile::TempDir::new().expect("Git wrapper directory should be created");
+    let path = wrapper.path().join("git");
+    std::fs::write(&path, script).expect("Git wrapper should be written");
+    let mut permissions = std::fs::metadata(&path)
+        .expect("Git wrapper should exist")
+        .permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&path, permissions).expect("Git wrapper should be executable");
+    assert!(repo.path().exists());
+    wrapper
+}
+
+fn run_cresca_with_git_wrapper(
+    repo: &TempGitRepo,
+    wrapper: &tempfile::TempDir,
+    args: &[&str],
+) -> std::process::Output {
+    let real_git = Command::new("sh")
+        .args(["-c", "command -v git"])
+        .output()
+        .expect("shell should locate Git");
+    assert!(real_git.status.success());
+    let real_git = String::from_utf8(real_git.stdout)
+        .expect("Git path should be UTF-8")
+        .trim()
+        .to_string();
+    let home = tempfile::TempDir::new().expect("isolated Cresca home should be created");
+    Command::new(TempGitRepo::cresca_binary())
+        .args(args)
+        .env("HOME", home.path())
+        .env("NO_COLOR", "1")
+        .env("PATH", wrapper.path())
+        .env("CRESCA_REAL_GIT", real_git)
+        .current_dir(repo.path())
+        .output()
+        .expect("Cresca should execute through Git wrapper")
+}
 
 fn assert_rejected_unchanged(
     repo: &TempGitRepo,
@@ -124,6 +165,22 @@ fn tag_only_name_is_rejected_as_not_a_branch() {
         &repo,
         &["review", "main", "release-only"],
         "release-only",
+        "not a branch",
+    );
+}
+
+// Production break caught: discovering remotes before checking a locally known
+// tag-only name would let an unrelated remote outage mask the branch-validation error.
+#[test]
+fn tag_only_name_is_rejected_before_unavailable_remote_discovery() {
+    let repo = TempGitRepo::new();
+    repo.git(&["tag", "offline-tag-only"]);
+    let offline = repo.add_bare_remote("offline-tag-probe");
+    drop(offline);
+    assert_rejected_unchanged(
+        &repo,
+        &["review", "refs/heads/main", "offline-tag-only"],
+        "offline-tag-only",
         "not a branch",
     );
 }
@@ -505,12 +562,19 @@ fn plain_local_and_same_named_remote_is_ambiguous() {
     let repo = TempGitRepo::new();
     create_untracked_local_branch(&repo, "shared-topic");
     repo.git(&["push", "origin", "shared-topic"]);
-    assert_rejected_unchanged(
-        &repo,
-        &["review", "refs/heads/main", "shared-topic"],
-        "shared-topic",
-        "ambiguous",
+    let before = repo.snapshot();
+
+    let output = repo.run_cresca(&["review", "refs/heads/main", "shared-topic"]);
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(
+            "Branch `shared-topic` is ambiguous. Candidates: `refs/heads/shared-topic`, `origin/shared-topic`. Use one explicitly: `refs/heads/shared-topic`, `origin/shared-topic`."
+        ),
+        "{stderr}"
     );
+    assert_eq!(repo.snapshot(), before);
 }
 
 // Production break caught: requiring a local tracking ref for a plain remote-only
@@ -542,12 +606,19 @@ fn plain_branch_on_two_remotes_is_ambiguous() {
     repo.git(&["push", "second", "multi-remote"]);
     repo.git(&["branch", "-D", "multi-remote"]);
     assert!(second.path().exists());
-    assert_rejected_unchanged(
-        &repo,
-        &["review", "main", "multi-remote"],
-        "multi-remote",
-        "ambiguous",
+    let before = repo.snapshot();
+
+    let output = repo.run_cresca(&["review", "main", "multi-remote"]);
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(
+            "Branch `multi-remote` is ambiguous. Candidates: `origin/multi-remote`, `second/multi-remote`. Use one explicitly: `origin/multi-remote`, `second/multi-remote`."
+        ),
+        "{stderr}"
     );
+    assert_eq!(repo.snapshot(), before);
 }
 
 // Production break caught: falling back to an assumed origin branch would turn a
@@ -597,6 +668,39 @@ fn explicit_local_bypasses_unreachable_remote() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert_eq!(repo.read_file("local-explicit.txt"), "local-explicit");
+}
+
+// Production break caught: enumerating remotes before recognizing refs/heads syntax
+// would reject an explicit-local review when the independent `git remote` command fails.
+#[test]
+fn explicit_local_bypasses_failing_remote_enumeration() {
+    let repo = TempGitRepo::new();
+    create_untracked_local_branch(&repo, "local-enumeration-bypass");
+    let wrapper = install_git_wrapper(
+        &repo,
+        "#!/bin/sh\nif [ \"$1\" = remote ] && [ \"$#\" -eq 1 ]; then\n  printf 'remote enumeration must be bypassed\\n' >&2\n  exit 71\nfi\nexec \"$CRESCA_REAL_GIT\" \"$@\"\n",
+    );
+
+    let output = run_cresca_with_git_wrapper(
+        &repo,
+        &wrapper,
+        &[
+            "review",
+            "refs/heads/main",
+            "refs/heads/local-enumeration-bypass",
+        ],
+    );
+
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        repo.read_file("local-enumeration-bypass.txt"),
+        "local-enumeration-bypass"
+    );
 }
 
 // Production break caught: falling back after a partial upstream configuration would
