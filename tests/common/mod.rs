@@ -1,3 +1,8 @@
+#![allow(
+    dead_code,
+    reason = "each integration-test target uses a different subset of this shared test utility"
+)]
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::{Path, PathBuf};

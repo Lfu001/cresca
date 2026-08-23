@@ -67,6 +67,23 @@ fn assert_rejected_unchanged(
     assert_eq!(repo.snapshot(), before);
 }
 
+// Production break caught: omitting accepted branch spellings from `review --help`
+// makes explicit local and remote resolution undiscoverable at the CLI boundary.
+#[test]
+fn review_help_lists_all_branch_reference_forms() {
+    let output = Command::new(TempGitRepo::cresca_binary())
+        .args(["review", "--help"])
+        .env("NO_COLOR", "1")
+        .output()
+        .expect("review help should execute");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for required in ["plain branch name", "refs/heads/<name>", "<remote>/<name>"] {
+        assert!(stdout.contains(required), "missing `{required}`: {stdout}");
+    }
+}
+
 // Production break caught: omitting any protected remote/admin field from RepoState
 // would let a rejecting review mutate Git state without an atomicity assertion noticing.
 #[test]
@@ -412,19 +429,29 @@ fn remote_dot_uses_no_upstream_resolution_table() {
     );
 }
 
-// Production break caught: silently tolerating a remote-only upstream setting would
-// fall back to local resolution despite incomplete user configuration.
+// Production break caught: reporting only which half of a partial upstream is
+// absent leaves users without the exact two Git keys they need to inspect or repair.
 #[test]
-fn upstream_with_only_remote_is_broken() {
+fn invalid_upstream_error_names_remote_and_merge_keys() {
     let repo = TempGitRepo::new();
     create_untracked_local_branch(&repo, "only-remote");
     repo.git(&["config", "branch.only-remote.remote", "origin"]);
-    assert_rejected_unchanged(
-        &repo,
-        &["review", "refs/heads/main", "only-remote"],
+    let before = repo.snapshot();
+
+    let output = repo.run_cresca(&["review", "refs/heads/main", "only-remote"]);
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    for required in [
         "only-remote",
         "invalid configured upstream",
-    );
+        "branch.only-remote.remote",
+        "branch.only-remote.merge",
+        "merge setting is missing",
+    ] {
+        assert!(stderr.contains(required), "missing `{required}`: {stderr}");
+    }
+    assert_eq!(repo.snapshot(), before);
 }
 
 // Production break caught: silently tolerating a merge-only upstream setting would
@@ -534,10 +561,10 @@ fn confirmed_deleted_upstream_is_rejected() {
     );
 }
 
-// Production break caught: reporting an unreachable configured upstream as deleted
-// would turn an unknown remote state into a false conclusive absence.
+// Production break caught: rendering an unreachable configured upstream only as a
+// generic Git failure obscures which remote is unavailable while users diagnose it.
 #[test]
-fn unreachable_configured_upstream_is_unavailable() {
+fn unavailable_remote_error_names_the_failed_remote() {
     let repo = TempGitRepo::new();
     create_untracked_local_branch(&repo, "offline-upstream");
     repo.set_upstream("offline-upstream", "origin", "offline-upstream");
@@ -547,18 +574,29 @@ fn unreachable_configured_upstream_is_unavailable() {
         "origin",
         "/definitely/missing/upstream",
     ]);
-    assert_rejected_unchanged(
-        &repo,
-        &["review", "refs/heads/main", "offline-upstream"],
+    let before = repo.snapshot();
+
+    let output = repo.run_cresca(&["review", "refs/heads/main", "offline-upstream"]);
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    for required in [
         "offline-upstream",
-        "query remote branch",
-    );
+        "Remote `origin`",
+        "could not be queried",
+        "query remote branch `origin/offline-upstream`",
+        "Git arguments:",
+        "Git stderr:",
+    ] {
+        assert!(stderr.contains(required), "missing `{required}`: {stderr}");
+    }
+    assert_eq!(repo.snapshot(), before);
 }
 
 // Production break caught: preferring a local branch when a reachable same-named
 // remote also exists would violate the no-upstream uniqueness table.
 #[test]
-fn plain_local_and_same_named_remote_is_ambiguous() {
+fn local_remote_ambiguity_error_lists_explicit_alternatives() {
     let repo = TempGitRepo::new();
     create_untracked_local_branch(&repo, "shared-topic");
     repo.git(&["push", "origin", "shared-topic"]);
@@ -568,12 +606,14 @@ fn plain_local_and_same_named_remote_is_ambiguous() {
 
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains(
-            "Branch `shared-topic` is ambiguous. Candidates: `refs/heads/shared-topic`, `origin/shared-topic`. Use one explicitly: `refs/heads/shared-topic`, `origin/shared-topic`."
-        ),
-        "{stderr}"
-    );
+    for required in [
+        "Branch `shared-topic` is ambiguous",
+        "Candidates: `refs/heads/shared-topic`, `origin/shared-topic`",
+        "local: `refs/heads/shared-topic`",
+        "remote: `origin/shared-topic`",
+    ] {
+        assert!(stderr.contains(required), "missing `{required}`: {stderr}");
+    }
     assert_eq!(repo.snapshot(), before);
 }
 
@@ -596,10 +636,10 @@ fn plain_remote_only_branch_uses_the_unique_remote() {
     assert_eq!(repo.read_file("remote-only.txt"), "remote-only");
 }
 
-// Production break caught: taking the first matching remote would make plain branch
-// resolution depend on configured-remote enumeration order.
+// Production break caught: taking the first matching remote or rendering only one
+// remedy would hide a valid explicit choice and make discovery order observable.
 #[test]
-fn plain_branch_on_two_remotes_is_ambiguous() {
+fn multi_remote_ambiguity_error_lists_every_remote_candidate() {
     let repo = TempGitRepo::new();
     let second = repo.add_bare_remote("second");
     create_and_push_branch(&repo, "multi-remote", "origin", "multi.txt");
@@ -612,12 +652,14 @@ fn plain_branch_on_two_remotes_is_ambiguous() {
 
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains(
-            "Branch `multi-remote` is ambiguous. Candidates: `origin/multi-remote`, `second/multi-remote`. Use one explicitly: `origin/multi-remote`, `second/multi-remote`."
-        ),
-        "{stderr}"
-    );
+    for required in [
+        "Branch `multi-remote` is ambiguous",
+        "Candidates: `origin/multi-remote`, `second/multi-remote`",
+        "remote: `origin/multi-remote`",
+        "remote: `second/multi-remote`",
+    ] {
+        assert!(stderr.contains(required), "missing `{required}`: {stderr}");
+    }
     assert_eq!(repo.snapshot(), before);
 }
 

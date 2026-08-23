@@ -257,7 +257,7 @@ fn valid_merge_ref(reference: &str, verbose: bool) -> Result<bool, BranchResolut
 
 fn broken_upstream(local_name: &str, detail: &str) -> BranchResolutionError {
     BranchResolutionError::Message(format!(
-        "Branch `{local_name}` has invalid configured upstream: {detail}."
+        "Branch `{local_name}` has invalid configured upstream: {detail}. Inspect `branch.{local_name}.remote` and `branch.{local_name}.merge`."
     ))
 }
 
@@ -309,7 +309,14 @@ fn discover_remote_matches(
             &["ls-remote", "--exit-code", remote, &branch_ref],
             &[2],
             verbose,
-        )?;
+        )
+        .map_err(|mut error| {
+            error.description = format!(
+                "{}; Remote `{remote}` could not be queried while discovering branch `{name}`",
+                error.description
+            );
+            BranchResolutionError::Git(error)
+        })?;
         if output.status.success() {
             let oid = String::from_utf8_lossy(&output.stdout)
                 .lines()
@@ -335,8 +342,20 @@ fn ambiguous_branch(input: &str, candidates: Vec<String>) -> BranchResolutionErr
         .map(|candidate| format!("`{candidate}`"))
         .collect::<Vec<_>>()
         .join(", ");
+    let alternatives = candidates
+        .iter()
+        .map(|candidate| {
+            let kind = if candidate.starts_with("refs/heads/") {
+                "local"
+            } else {
+                "remote"
+            };
+            format!("{kind}: `{candidate}`")
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
     BranchResolutionError::Message(format!(
-        "Branch `{input}` is ambiguous. Candidates: {rendered}. Use one explicitly: {rendered}."
+        "Branch `{input}` is ambiguous. Candidates: {rendered}. Select one explicitly ({alternatives})."
     ))
 }
 
@@ -351,8 +370,10 @@ fn resolve_remote(
     let commit_oid =
         resolve_remote_commit(&remote, &branch_ref, verbose).map_err(|error| match error {
             BranchResolutionError::Git(mut error) => {
-                error.description =
-                    format!("resolve branch input `{requested}`: {}", error.description);
+                error.description = format!(
+                    "resolve branch input `{requested}`: {}; Remote `{remote}` could not be queried or fetched",
+                    error.description
+                );
                 BranchResolutionError::Git(error)
             }
             BranchResolutionError::Message(message) if !message.contains(requested) => {

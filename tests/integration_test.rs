@@ -2034,6 +2034,119 @@ fn test_review_existing_metadata_match_bypasses_failing_naming_hook() {
     assert!(!String::from_utf8_lossy(&output.stderr).contains("must not run"));
 }
 
+// Production break caught: rerunning the naming hook before canonical selection
+// makes an equivalent raw spelling fail instead of reusing the existing review.
+#[test]
+fn equivalent_existing_review_does_not_run_failing_hook() {
+    let (repo, _) = setup_linear_range();
+    assert!(repo
+        .run_cresca(&["review", "main", "develop"])
+        .status
+        .success());
+    let review_branch = repo.current_branch();
+    repo.git(&["add", "-A"]);
+    assert!(repo.run_cresca(&["approve"]).status.success());
+    let home =
+        cresca_home_with_naming_hook(b"#!/bin/sh\nprintf 'must not run\\n' >&2\nexit 41\n", &[]);
+
+    let output =
+        repo.run_cresca_with_home(&["review", "origin/main", "origin/develop"], home.path());
+
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(repo.current_branch(), review_branch);
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("must not run"));
+}
+
+// Production break caught: treating a safe local-to-upstream identity transition as
+// new review allocation reruns the naming hook and loses the existing branch name.
+#[test]
+fn identity_transition_does_not_run_failing_hook() {
+    let repo = TempGitRepo::new();
+    repo.create_branch("develop");
+    repo.write_file("develop.txt", "change\n");
+    repo.git(&["add", "."]);
+    repo.commit("Add local develop change");
+    repo.switch_branch("main");
+    assert!(repo
+        .run_cresca(&["review", "main", "develop"])
+        .status
+        .success());
+    let review_branch = repo.current_branch();
+    repo.git(&["add", "-A"]);
+    assert!(repo.run_cresca(&["approve"]).status.success());
+    repo.switch_branch("develop");
+    repo.git(&["push", "-u", "origin", "develop"]);
+    repo.switch_branch("main");
+    let home =
+        cresca_home_with_naming_hook(b"#!/bin/sh\nprintf 'must not run\\n' >&2\nexit 41\n", &[]);
+
+    let output = repo.run_cresca_with_home(&["review", "main", "develop"], home.path());
+
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(repo.current_branch(), review_branch);
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("must not run"));
+}
+
+// Production break caught: routing a uniquely selected v1 migration through new
+// review naming reruns the hook instead of retaining the legacy branch name.
+#[test]
+fn legacy_migration_does_not_run_failing_hook() {
+    let (repo, _) = setup_linear_range();
+    assert!(repo
+        .run_cresca(&["review", "main", "develop"])
+        .status
+        .success());
+    let review_branch = repo.current_branch();
+    repo.git(&["add", "-A"]);
+    assert!(repo.run_cresca(&["approve"]).status.success());
+    for field in [
+        "target-kind",
+        "target-ref",
+        "target-remote",
+        "target-anchor",
+        "source-kind",
+        "source-ref",
+        "source-remote",
+        "source-anchor",
+    ] {
+        let _ = repo.git_maybe(&[
+            "config",
+            "--local",
+            "--unset-all",
+            &format!("branch.{review_branch}.cresca-{field}"),
+        ]);
+    }
+    set_review_metadata(&repo, &review_branch, "main", "develop");
+    let home =
+        cresca_home_with_naming_hook(b"#!/bin/sh\nprintf 'must not run\\n' >&2\nexit 41\n", &[]);
+
+    let output =
+        repo.run_cresca_with_home(&["review", "origin/main", "origin/develop"], home.path());
+
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(repo.current_branch(), review_branch);
+    assert_eq!(
+        repo.git_config_values(&format!("branch.{review_branch}.cresca-version")),
+        ["2"]
+    );
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("must not run"));
+}
+
 #[test]
 fn test_review_naming_hook_success_stderr_is_verbose_only() {
     let (normal_repo, _) = setup_linear_range();
@@ -2080,6 +2193,36 @@ fn test_review_naming_hook_collision_uses_identity_suffix() {
     assert_eq!(
         repo.rev_parse("refs/heads/shared-review-name"),
         occupied_oid
+    );
+}
+
+// Production break caught: hashing raw request spelling or plain-only anchors makes
+// equivalent invocations allocate different collision suffixes.
+#[test]
+fn canonical_collision_suffix_is_stable_across_raw_spellings() {
+    let allocate = |target: &str, source: &str| {
+        let (repo, _) = setup_linear_range();
+        repo.git(&["branch", "shared-review-name", "main"]);
+        set_review_metadata(&repo, "shared-review-name", "other", "identity");
+        let home =
+            cresca_home_with_naming_hook(b"#!/bin/sh\nprintf 'shared-review-name\\n'\n", &[]);
+
+        let output = repo.run_cresca_with_home(&["review", target, source], home.path());
+
+        assert!(
+            output.status.success(),
+            "stdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let branch = repo.current_branch();
+        assert_identity_suffixed_branch(&branch, "shared-review-name");
+        branch
+    };
+
+    assert_eq!(
+        allocate("main", "develop"),
+        allocate("origin/main", "origin/develop")
     );
 }
 

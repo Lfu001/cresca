@@ -71,9 +71,9 @@ enum Commands {
 
 #[derive(Args)]
 struct ReviewArgs {
-    /// The branch where the PR is planned to be merged into.
+    /// Target as a plain branch name, `refs/heads/<name>`, or `<remote>/<name>`.
     to: String,
-    /// The development branch to be reviewed.
+    /// Source as a plain branch name, `refs/heads/<name>`, or `<remote>/<name>`.
     from: String,
     /// Skip to this commit (auto-approve earlier commits).
     /// Use `git log --oneline <to>..<from>` to see available commits.

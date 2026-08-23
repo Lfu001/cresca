@@ -30,7 +30,7 @@ fn cresca_home_with_naming_hook(script: &[u8]) -> tempfile::TempDir {
 }
 
 #[cfg(unix)]
-fn install_offline_git_wrapper() -> (tempfile::TempDir, String) {
+fn install_git_wrapper(script: &[u8]) -> (tempfile::TempDir, String) {
     let real_git = Command::new("sh")
         .args(["-c", "command -v git"])
         .output()
@@ -42,17 +42,20 @@ fn install_offline_git_wrapper() -> (tempfile::TempDir, String) {
         .to_string();
     let wrapper = tempfile::TempDir::new().expect("Git wrapper directory should be created");
     let path = wrapper.path().join("git");
-    std::fs::write(
-        &path,
-        b"#!/bin/sh\ncase \"$1\" in\n  ls-remote|fetch) printf 'network Git command forbidden\\n' >&2; exit 97 ;;\nesac\nexec \"$CRESCA_REAL_GIT\" \"$@\"\n",
-    )
-    .expect("Git wrapper should be written");
+    std::fs::write(&path, script).expect("Git wrapper should be written");
     let mut permissions = std::fs::metadata(&path)
         .expect("Git wrapper metadata should be readable")
         .permissions();
     permissions.set_mode(0o755);
     std::fs::set_permissions(&path, permissions).expect("Git wrapper should be executable");
     (wrapper, real_git)
+}
+
+#[cfg(unix)]
+fn install_offline_git_wrapper() -> (tempfile::TempDir, String) {
+    install_git_wrapper(
+        b"#!/bin/sh\ncase \"$1\" in\n  ls-remote|fetch) printf 'network Git command forbidden\\n' >&2; exit 97 ;;\nesac\nexec \"$CRESCA_REAL_GIT\" \"$@\"\n",
+    )
 }
 
 #[cfg(unix)]
@@ -91,6 +94,92 @@ fn clean_and_switch(repo: &TempGitRepo, branch: &str) {
     repo.git(&["reset", "--hard"]);
     repo.git(&["clean", "-fd"]);
     repo.switch_branch(branch);
+}
+
+fn setup_version_one_approved_review(target: &str, source: &str) -> (TempGitRepo, String) {
+    let repo = TempGitRepo::new();
+    repo.create_branch(source);
+    repo.write_file("approved.txt", "approved");
+    repo.git(&["add", "."]);
+    repo.commit("Add approved path");
+    repo.git(&["push", "-u", "origin", source]);
+    repo.switch_branch("main");
+    assert!(repo
+        .run_cresca(&["review", target, source])
+        .status
+        .success());
+    repo.git(&["add", "-A"]);
+    assert!(repo.run_cresca(&["approve"]).status.success());
+    let review_branch = repo.current_branch();
+
+    for field in [
+        "target-kind",
+        "target-ref",
+        "target-remote",
+        "target-anchor",
+        "source-kind",
+        "source-ref",
+        "source-remote",
+        "source-anchor",
+    ] {
+        repo.git_maybe(&[
+            "config",
+            "--local",
+            "--unset-all",
+            &format!("branch.{review_branch}.cresca-{field}"),
+        ]);
+    }
+    repo.git(&[
+        "config",
+        "--local",
+        "--replace-all",
+        &format!("branch.{review_branch}.cresca-target"),
+        target,
+    ]);
+    repo.git(&[
+        "config",
+        "--local",
+        "--replace-all",
+        &format!("branch.{review_branch}.cresca-source"),
+        source,
+    ]);
+    repo.git(&[
+        "config",
+        "--local",
+        "--replace-all",
+        &format!("branch.{review_branch}.cresca-version"),
+        "1",
+    ]);
+    (repo, review_branch)
+}
+
+fn write_version_one_identity(repo: &TempGitRepo, branch: &str, target: &str, source: &str) {
+    for field in [
+        "target-kind",
+        "target-ref",
+        "target-remote",
+        "target-anchor",
+        "source-kind",
+        "source-ref",
+        "source-remote",
+        "source-anchor",
+    ] {
+        repo.git_maybe(&[
+            "config",
+            "--local",
+            "--unset-all",
+            &format!("branch.{branch}.cresca-{field}"),
+        ]);
+    }
+    for (field, value) in [("target", target), ("source", source), ("version", "1")] {
+        repo.git(&[
+            "config",
+            "--local",
+            "--replace-all",
+            &format!("branch.{branch}.cresca-{field}"),
+            value,
+        ]);
+    }
 }
 
 // Production break caught: selecting reviews by raw command-line spelling creates
@@ -137,6 +226,412 @@ fn equivalent_local_and_upstream_spellings_reuse_one_review_branch() {
         })
         .count();
     assert_eq!(reviews, 1);
+}
+
+// Production break caught: comparing v0.5.0 metadata as raw strings creates a
+// duplicate review when current explicit aliases resolve to the same identity.
+#[test]
+fn version_one_raw_alias_migrates_to_matching_version_two_identity() {
+    let (repo, review_branch) = setup_version_one_approved_review("main", "dev");
+
+    let output = repo.run_cresca(&["review", "origin/main", "origin/dev"]);
+
+    assert_cresca_success(&output);
+    assert_eq!(repo.current_branch(), review_branch);
+    assert_eq!(
+        repo.git_config_values(&format!("branch.{review_branch}.cresca-version")),
+        ["2"]
+    );
+}
+
+// Production break caught: selecting a raw-equal legacy review before canonical
+// candidate counting silently ignores a second alias for the same review identity.
+#[test]
+fn two_legacy_aliases_resolving_to_one_identity_are_rejected() {
+    let (repo, first_review) = setup_version_one_approved_review("main", "dev");
+    let second_review = "legacy-explicit-alias";
+    repo.git(&["branch", second_review, &first_review]);
+    write_version_one_identity(&repo, second_review, "origin/main", "origin/dev");
+    let before = repo.snapshot();
+
+    let output = repo.run_cresca(&["review", "origin/main", "origin/dev"]);
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains(&first_review), "stderr: {stderr}");
+    assert!(stderr.contains(second_review), "stderr: {stderr}");
+    assert_eq!(repo.snapshot(), before);
+}
+
+// Production break caught: flattening a Git failure while resolving a name-relevant
+// legacy endpoint loses the real arguments, status, and stderr needed to diagnose it.
+#[test]
+fn unreachable_relevant_legacy_review_blocks_duplicate_creation() {
+    let (repo, review_branch) = setup_version_one_approved_review("main", "dev");
+    repo.git(&[
+        "remote",
+        "set-url",
+        "origin",
+        repo.path()
+            .join("missing-origin.git")
+            .to_str()
+            .expect("missing remote path should be UTF-8"),
+    ]);
+    let before = repo.snapshot();
+
+    let output = repo.run_cresca(&["review", "refs/heads/main", "refs/heads/dev"]);
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    for required in [
+        review_branch.as_str(),
+        "saved legacy endpoint `main`",
+        "Git arguments:",
+        "Git exit status:",
+        "Git stderr:",
+    ] {
+        assert!(stderr.contains(required), "missing `{required}`: {stderr}");
+    }
+    assert_eq!(repo.snapshot(), before);
+}
+
+// Production break caught: resolving every legacy branch before checking both
+// endpoint names lets unrelated stale metadata block a valid new review.
+#[test]
+fn unrelated_stale_legacy_review_does_not_block_new_review() {
+    let repo = TempGitRepo::new();
+    repo.create_branch("dev");
+    repo.write_file("dev.txt", "change\n");
+    repo.git(&["add", "."]);
+    repo.commit("Add dev change");
+    repo.git(&["push", "-u", "origin", "dev"]);
+    repo.switch_branch("main");
+    let stale_review = "unrelated-legacy-review";
+    repo.git(&["branch", stale_review, "main"]);
+    write_version_one_identity(&repo, stale_review, "deleted-target", "deleted-source");
+    let stale_metadata = repo.review_metadata_values(stale_review);
+
+    let output = repo.run_cresca(&["review", "main", "dev"]);
+
+    assert_cresca_success(&output);
+    assert_ne!(repo.current_branch(), stale_review);
+    assert_eq!(repo.review_metadata_values(stale_review), stale_metadata);
+}
+
+// Production break caught: excluding a saved full local ref from the upstream-tuple
+// prefilter can hide an otherwise relevant legacy review before its other endpoint
+// reports that the old remote is unavailable.
+#[test]
+fn explicit_legacy_local_upstream_prefilter_keeps_candidate_relevant() {
+    let repo = TempGitRepo::new();
+    let _upstream = repo.add_bare_remote("upstream");
+    repo.create_branch("dev");
+    repo.write_file("dev.txt", "change\n");
+    repo.git(&["add", "."]);
+    repo.commit("Add dev change");
+    repo.git(&["push", "-u", "upstream", "dev"]);
+    repo.switch_branch("main");
+    assert!(repo
+        .run_cresca(&["review", "refs/heads/main", "refs/heads/dev"])
+        .status
+        .success());
+    let review_branch = repo.current_branch();
+    repo.git(&["add", "-A"]);
+    assert!(repo.run_cresca(&["approve"]).status.success());
+    write_version_one_identity(&repo, &review_branch, "main", "refs/heads/dev");
+    repo.git(&[
+        "remote",
+        "set-url",
+        "origin",
+        repo.path()
+            .join("missing-origin.git")
+            .to_str()
+            .expect("missing remote path should be UTF-8"),
+    ]);
+    let before = repo.snapshot();
+
+    let output = repo.run_cresca(&["review", "refs/heads/main", "upstream/dev"]);
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains(&review_branch), "stderr: {stderr}");
+    for required in [
+        "saved legacy endpoint `main`",
+        "Git arguments:",
+        "Git stderr:",
+    ] {
+        assert!(stderr.contains(required), "missing `{required}`: {stderr}");
+    }
+    assert_eq!(repo.snapshot(), before);
+}
+
+// Production break caught: parsing `origin/legacy` only as an explicit remote
+// overlooks the current local branch with that literal name and its upstream tuple,
+// allowing an unresolved relevant v1 review to be duplicated.
+#[test]
+fn remote_prefix_local_upstream_prefilter_keeps_candidate_relevant() {
+    let repo = TempGitRepo::new();
+    let _upstream = repo.add_bare_remote("upstream");
+    repo.create_branch("origin/legacy");
+    repo.write_file("legacy.txt", "change\n");
+    repo.git(&["add", "."]);
+    repo.commit("Add remote-prefix local branch change");
+    repo.git(&["push", "upstream", "origin/legacy:team"]);
+    repo.set_upstream("origin/legacy", "upstream", "team");
+    repo.switch_branch("main");
+    assert!(repo
+        .run_cresca(&["review", "refs/heads/main", "refs/heads/origin/legacy",])
+        .status
+        .success());
+    let review_branch = repo.current_branch();
+    repo.git(&["add", "-A"]);
+    assert!(repo.run_cresca(&["approve"]).status.success());
+    write_version_one_identity(&repo, &review_branch, "refs/heads/main", "origin/legacy");
+    let before = repo.snapshot();
+
+    let output = repo.run_cresca(&["review", "refs/heads/main", "upstream/team"]);
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains(&review_branch), "stderr: {stderr}");
+    assert!(
+        stderr.contains("cannot resolve saved legacy endpoint `origin/legacy`"),
+        "stderr: {stderr}"
+    );
+    assert_eq!(repo.snapshot(), before);
+}
+
+// Production break caught: using the raw-local relevance probe as transition
+// evidence lets explicit remote syntax inherit approvals from a different identity.
+#[test]
+fn remote_prefix_saved_endpoint_does_not_gain_plain_anchor_transition() {
+    let repo = TempGitRepo::new();
+    let _upstream = repo.add_bare_remote("upstream");
+    repo.create_branch("origin/legacy");
+    repo.write_file("legacy.txt", "change\n");
+    repo.git(&["add", "."]);
+    repo.commit("Add remote-prefix local branch change");
+    repo.git(&["push", "origin", "origin/legacy:legacy"]);
+    repo.git(&["push", "upstream", "origin/legacy:team"]);
+    repo.set_upstream("origin/legacy", "upstream", "team");
+    repo.switch_branch("main");
+    assert_cresca_success(&repo.run_cresca(&[
+        "review",
+        "refs/heads/main",
+        "refs/heads/origin/legacy",
+    ]));
+    approve_all(&repo);
+    let legacy_review = repo.current_branch();
+    write_version_one_identity(&repo, &legacy_review, "refs/heads/main", "origin/legacy");
+    let legacy_metadata = repo.review_metadata_values(&legacy_review);
+    clean_and_switch(&repo, "main");
+
+    let output = repo.run_cresca(&["review", "refs/heads/main", "upstream/team"]);
+
+    assert_cresca_success(&output);
+    assert_ne!(repo.current_branch(), legacy_review);
+    assert_eq!(repo.review_metadata_values(&legacy_review), legacy_metadata);
+    assert_eq!(
+        repo.git_config_values(&format!("branch.{}.cresca-version", repo.current_branch())),
+        ["2"]
+    );
+}
+
+// Production break caught: writing v2 metadata outside the review transaction can
+// erase valid v1 identity and approval state when a later migration write fails.
+#[cfg(unix)]
+#[test]
+fn failed_legacy_migration_preserves_version_one_metadata() {
+    let (repo, review_branch) = setup_version_one_approved_review("main", "dev");
+    let before = repo.snapshot();
+    let script = format!(
+        "#!/bin/sh\ncase \" $* \" in\n  *' config --local --replace-all branch.{review_branch}.cresca-target-kind '*)\n    \"$CRESCA_REAL_GIT\" \"$@\" || exit $?\n    printf 'injected legacy migration failure\\n' >&2\n    exit 98\n    ;;\nesac\nexec \"$CRESCA_REAL_GIT\" \"$@\"\n"
+    );
+    let (wrapper, real_git) = install_git_wrapper(script.as_bytes());
+
+    let output = run_cresca_offline(
+        &repo,
+        &wrapper,
+        &real_git,
+        &["review", "origin/main", "origin/dev"],
+    );
+
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("injected legacy migration failure"));
+    assert_eq!(repo.snapshot(), before);
+    assert_eq!(
+        repo.review_metadata_values(&review_branch),
+        (
+            vec!["1".to_string()],
+            vec!["main".to_string()],
+            vec!["dev".to_string()]
+        )
+    );
+}
+
+// Production break caught: restoring only the review branch and metadata after a
+// late transition write fails would leave Git admin files, remote refs, or worktree
+// entries changed even though the identity transition was rejected.
+#[cfg(unix)]
+#[test]
+fn failed_identity_transition_restores_all_named_state() {
+    let repo = TempGitRepo::new();
+    repo.create_branch("dev");
+    repo.write_file("approved.txt", "approved change\n");
+    repo.git(&["add", "."]);
+    repo.commit("Add local dev change");
+    repo.switch_branch("main");
+    assert_cresca_success(&repo.run_cresca(&["review", "refs/heads/main", "dev"]));
+    let review_branch = repo.current_branch();
+    approve_all(&repo);
+    repo.switch_branch("dev");
+    repo.git(&["push", "-u", "origin", "dev"]);
+    repo.write_file("new.txt", "new transition change\n");
+    repo.git(&["add", "."]);
+    repo.commit("Add transition change");
+    repo.git(&["push", "origin", "dev"]);
+    repo.switch_branch("main");
+    let before = repo.snapshot();
+    let script = format!(
+        "#!/bin/sh\ncase \" $* \" in\n  *' config --local --replace-all branch.{review_branch}.cresca-source-kind '*)\n    \"$CRESCA_REAL_GIT\" \"$@\" || exit $?\n    \"$CRESCA_REAL_GIT\" update-ref refs/remotes/origin/transition-probe HEAD || exit $?\n    git_dir=$(\"$CRESCA_REAL_GIT\" rev-parse --git-dir) || exit $?\n    for name in FETCH_HEAD ORIG_HEAD MERGE_HEAD CHERRY_PICK_HEAD REVERT_HEAD; do\n      printf 'transition probe\\n' > \"$git_dir/$name\" || exit $?\n    done\n    printf 'transition probe\\n' > transition-probe.txt || exit $?\n    printf 'injected identity transition failure\\n' >&2\n    exit 98\n    ;;\nesac\nexec \"$CRESCA_REAL_GIT\" \"$@\"\n"
+    );
+    let (wrapper, real_git) = install_git_wrapper(script.as_bytes());
+
+    let output = run_cresca_offline(
+        &repo,
+        &wrapper,
+        &real_git,
+        &["review", "refs/heads/main", "dev"],
+    );
+
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("injected identity transition failure"),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(repo.snapshot(), before);
+}
+
+// Production break caught: running a failing new-review naming hook after endpoint
+// discovery must preserve every named repository field, including pre-existing
+// remote-tracking refs and Git admin-file contents.
+#[cfg(unix)]
+#[test]
+fn naming_hook_failure_restores_all_named_state() {
+    let repo = TempGitRepo::new();
+    repo.create_branch("dev");
+    repo.write_file("dev.txt", "change\n");
+    repo.git(&["add", "."]);
+    repo.commit("Add dev change");
+    repo.git(&["push", "-u", "origin", "dev"]);
+    repo.switch_branch("main");
+    repo.git(&[
+        "update-ref",
+        "refs/remotes/origin/named-state-probe",
+        "HEAD",
+    ]);
+    std::fs::write(repo.git_path("FETCH_HEAD"), b"named state probe\n")
+        .expect("FETCH_HEAD fixture should be written");
+    std::fs::write(repo.git_path("ORIG_HEAD"), b"named state probe\n")
+        .expect("ORIG_HEAD fixture should be written");
+    let before = repo.snapshot();
+    let home = cresca_home_with_naming_hook(
+        b"#!/bin/sh\nprintf 'injected naming hook failure\\n' >&2\nexit 41\n",
+    );
+
+    let output = repo.run_cresca_with_home(&["review", "main", "dev"], home.path());
+
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("injected naming hook failure"),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(repo.snapshot(), before);
+}
+
+// Production break caught: refreshing v1 identity during approve would make an
+// otherwise valid saved review range depend on network access.
+#[cfg(unix)]
+#[test]
+fn version_one_approve_remains_offline() {
+    let (repo, review_branch) = setup_version_one_approved_review("main", "dev");
+    let (wrapper, real_git) = install_offline_git_wrapper();
+
+    let output = run_cresca_offline(&repo, &wrapper, &real_git, &["approve"]);
+
+    assert_cresca_success(&output);
+    assert_eq!(repo.current_branch(), review_branch);
+    assert_eq!(
+        repo.review_metadata_values(&review_branch),
+        (
+            vec!["1".to_string()],
+            vec!["main".to_string()],
+            vec!["dev".to_string()]
+        )
+    );
+}
+
+// Production break caught: refreshing v1 identity during status would make saved
+// review range reporting fail whenever the original remote is unavailable.
+#[cfg(unix)]
+#[test]
+fn version_one_status_remains_offline() {
+    let (repo, review_branch) = setup_version_one_approved_review("main", "dev");
+    let (wrapper, real_git) = install_offline_git_wrapper();
+
+    let output = run_cresca_offline(&repo, &wrapper, &real_git, &["status"]);
+
+    assert_cresca_success(&output);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("Unresolved legacy target: main"),
+        "stdout: {stdout}"
+    );
+    assert!(
+        stdout.contains("Unresolved legacy source: dev"),
+        "stdout: {stdout}"
+    );
+    assert_eq!(repo.current_branch(), review_branch);
+    assert_eq!(
+        repo.review_metadata_values(&review_branch),
+        (
+            vec!["1".to_string()],
+            vec!["main".to_string()],
+            vec!["dev".to_string()]
+        )
+    );
+}
+
+// Production break caught: treating a migrated legacy candidate like a new review
+// discards the approved tree instead of reconstructing only later source changes.
+#[test]
+fn successful_legacy_alias_migration_preserves_approvals() {
+    let (repo, review_branch) = setup_version_one_approved_review("main", "dev");
+    let approved_source = repo.rev_parse("dev");
+    repo.switch_branch("dev");
+    repo.write_file("new.txt", "new\n");
+    repo.git(&["add", "."]);
+    repo.commit("Add unreviewed path");
+    repo.git(&["push", "origin", "dev"]);
+    repo.switch_branch("main");
+
+    let output = repo.run_cresca(&["review", "origin/main", "origin/dev"]);
+
+    assert_cresca_success(&output);
+    assert_eq!(repo.current_branch(), review_branch);
+    assert!(repo.cached_diff().is_empty());
+    assert_eq!(
+        repo.worktree_diff(),
+        repo.diff(&approved_source, "origin/dev")
+    );
+    assert_eq!(repo.read_file("approved.txt"), "approved");
+    assert_eq!(repo.read_file("new.txt"), "new\n");
+    assert_eq!(
+        repo.git_config_values(&format!("branch.{review_branch}.cresca-version")),
+        ["2"]
+    );
 }
 
 // Production break caught: finding an existing canonical review after an equivalent
@@ -830,10 +1325,10 @@ fn split_anchor_destinations_are_rejected_without_mutation() {
     assert_eq!(repo.snapshot(), before);
 }
 
-// Production break caught: preferring an exact canonical review over a transition
-// candidate would silently combine or discard one independent approval history.
+// Production break caught: preferring one compatible review or rendering candidates
+// in discovery order would hide an independent approval history from the user.
 #[test]
-fn plain_request_with_exact_and_transition_reviews_is_rejected() {
+fn duplicate_review_error_lists_every_review_branch() {
     let repo = TempGitRepo::new();
     repo.create_branch("dev");
     repo.write_file("change.txt", "change\n");
@@ -859,9 +1354,13 @@ fn plain_request_with_exact_and_transition_reviews_is_rejected() {
 
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("multiple compatible"), "stderr: {stderr}");
-    assert!(stderr.contains(&transition_review), "stderr: {stderr}");
-    assert!(stderr.contains(&exact_review), "stderr: {stderr}");
+    let mut review_branches = [transition_review.as_str(), exact_review.as_str()];
+    review_branches.sort();
+    let expected = format!(
+        "Conflicting review branches: `{}`, `{}`",
+        review_branches[0], review_branches[1]
+    );
+    assert!(stderr.contains(&expected), "missing `{expected}`: {stderr}");
     assert_eq!(repo.snapshot(), before);
 }
 

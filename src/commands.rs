@@ -92,9 +92,13 @@ fn prepare_review_plan(
         }
     };
     let candidates = load_review_candidates(verbose).map_err(map_selection_error)?;
-    let selection = select_review(&request, candidates, |anchor| {
-        resolve_existing_anchor(anchor, verbose)
-    })
+    let selection = select_review(
+        &request,
+        candidates,
+        |anchor| resolve_existing_anchor(anchor, verbose),
+        |legacy| resolve_branch(legacy, verbose),
+        verbose,
+    )
     .map_err(map_selection_error)?;
     let (identity, branch) = match selection {
         ReviewSelection::Existing(existing) => (
