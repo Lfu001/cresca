@@ -372,6 +372,69 @@ fn resolve_remote(
     })
 }
 
+fn resolve_plain_branch(
+    input: &str,
+    name: &str,
+    remotes: &[String],
+    local_exists: bool,
+    verbose: bool,
+) -> Result<ResolvedBranch, BranchResolutionError> {
+    let local_ref = format!("refs/heads/{name}");
+    if local_exists {
+        if let UpstreamConfig::Remote { remote, branch_ref } =
+            read_upstream_config(name, remotes, verbose)?
+        {
+            return resolve_remote(
+                input,
+                remote,
+                branch_ref,
+                Some(local_ref),
+                ResolutionMode::Plain,
+                verbose,
+            );
+        }
+    }
+
+    let matches = discover_remote_matches(name, remotes, verbose)?;
+    match (local_exists, matches.as_slice()) {
+        (true, []) => {
+            let commit_oid = resolve_local_commit(&local_ref, verbose)?;
+            Ok(ResolvedBranch {
+                requested: input.to_string(),
+                canonical: CanonicalBranch::Local {
+                    reference: local_ref.clone(),
+                },
+                local_anchor: Some(local_ref),
+                mode: ResolutionMode::Plain,
+                commit_oid,
+            })
+        }
+        (true, matches) => {
+            let mut candidates = vec![local_ref];
+            candidates.extend(matches.iter().map(|(remote, _)| format!("{remote}/{name}")));
+            Err(ambiguous_branch(input, candidates))
+        }
+        (false, [(remote, _)]) => resolve_remote(
+            input,
+            remote.clone(),
+            format!("refs/heads/{name}"),
+            None,
+            ResolutionMode::Plain,
+            verbose,
+        ),
+        (false, []) => Err(BranchResolutionError::Message(format!(
+            "Branch `{input}` was not found locally or on any configured remote."
+        ))),
+        (false, matches) => Err(ambiguous_branch(
+            input,
+            matches
+                .iter()
+                .map(|(remote, _)| format!("{remote}/{name}"))
+                .collect(),
+        )),
+    }
+}
+
 pub fn resolve_branch(input: &str, verbose: bool) -> Result<ResolvedBranch, BranchResolutionError> {
     if input.starts_with("refs/heads/") {
         let BranchRequest::ExplicitLocal { reference } = parse_branch_request(input, &[])? else {
@@ -429,59 +492,7 @@ pub fn resolve_branch(input: &str, verbose: bool) -> Result<ResolvedBranch, Bran
                     return Err(invalid_branch(input));
                 }
             }
-            if local_exists {
-                if let UpstreamConfig::Remote { remote, branch_ref } =
-                    read_upstream_config(&name, &remotes, verbose)?
-                {
-                    return resolve_remote(
-                        input,
-                        remote,
-                        branch_ref,
-                        Some(local_ref),
-                        ResolutionMode::Plain,
-                        verbose,
-                    );
-                }
-            }
-
-            let matches = discover_remote_matches(&name, &remotes, verbose)?;
-            match (local_exists, matches.as_slice()) {
-                (true, []) => {
-                    let commit_oid = resolve_local_commit(&local_ref, verbose)?;
-                    Ok(ResolvedBranch {
-                        requested: input.to_string(),
-                        canonical: CanonicalBranch::Local {
-                            reference: local_ref.clone(),
-                        },
-                        local_anchor: Some(local_ref),
-                        mode: ResolutionMode::Plain,
-                        commit_oid,
-                    })
-                }
-                (true, matches) => {
-                    let mut candidates = vec![local_ref];
-                    candidates.extend(matches.iter().map(|(remote, _)| format!("{remote}/{name}")));
-                    Err(ambiguous_branch(input, candidates))
-                }
-                (false, [(remote, _)]) => resolve_remote(
-                    input,
-                    remote.clone(),
-                    format!("refs/heads/{name}"),
-                    None,
-                    ResolutionMode::Plain,
-                    verbose,
-                ),
-                (false, []) => Err(BranchResolutionError::Message(format!(
-                    "Branch `{input}` was not found locally or on any configured remote."
-                ))),
-                (false, matches) => Err(ambiguous_branch(
-                    input,
-                    matches
-                        .iter()
-                        .map(|(remote, _)| format!("{remote}/{name}"))
-                        .collect(),
-                )),
-            }
+            resolve_plain_branch(input, &name, &remotes, local_exists, verbose)
         }
     }
 }
@@ -508,7 +519,9 @@ pub fn resolve_existing_anchor(
     if !local_probe.status.success() {
         return Ok(None);
     }
-    resolve_branch(name, verbose).map(|resolved| Some(resolved.canonical))
+    let remotes = configured_remotes(verbose)?;
+    resolve_plain_branch(name, name, &remotes, true, verbose)
+        .map(|resolved| Some(resolved.canonical))
 }
 
 #[cfg(test)]

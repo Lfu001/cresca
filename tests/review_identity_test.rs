@@ -204,6 +204,72 @@ fn local_review_survives_push_u_and_only_new_changes_remain_unreviewed() {
     assert_eq!(repo.read_file("new.txt"), "new change\n");
 }
 
+// Production break caught: reparsing a verified stored local anchor lets a configured
+// remote prefix turn `refs/heads/team/dev` into the unrelated shorthand `team/dev`.
+#[test]
+fn stored_remote_prefix_local_anchor_uses_forced_plain_transition() {
+    let repo = TempGitRepo::new();
+    repo.create_branch("dev");
+    repo.write_file("dev.txt", "change\n");
+    repo.git(&["add", "."]);
+    repo.commit("Add dev change");
+    repo.git(&["push", "-u", "origin", "dev"]);
+    repo.git(&["branch", "team/dev", "dev"]);
+    repo.set_upstream("team/dev", "origin", "dev");
+    repo.switch_branch("main");
+
+    let first = repo.run_cresca(&["review", "refs/heads/main", "dev"]);
+    assert!(
+        first.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&first.stdout),
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let review_branch = repo.current_branch();
+    repo.git(&["reset", "--hard"]);
+    repo.git(&["clean", "-fd"]);
+    repo.switch_branch("main");
+
+    let source_kind = format!("branch.{review_branch}.cresca-source-kind");
+    let source_ref = format!("branch.{review_branch}.cresca-source-ref");
+    let source_remote = format!("branch.{review_branch}.cresca-source-remote");
+    let source_anchor = format!("branch.{review_branch}.cresca-source-anchor");
+    repo.git(&["config", "--local", "--replace-all", &source_kind, "local"]);
+    repo.git(&[
+        "config",
+        "--local",
+        "--replace-all",
+        &source_ref,
+        "refs/heads/team/dev",
+    ]);
+    let _ = repo.git_maybe(&["config", "--local", "--unset-all", &source_remote]);
+    repo.git(&[
+        "config",
+        "--local",
+        "--add",
+        &source_anchor,
+        "refs/heads/team/dev",
+    ]);
+    let _team_remote = repo.add_bare_remote("team");
+
+    let output = repo.run_cresca(&["review", "refs/heads/main", "dev"]);
+
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(repo.current_branch(), review_branch);
+    assert_eq!(repo.git_config_values(&source_kind), ["remote"]);
+    assert_eq!(repo.git_config_values(&source_remote), ["origin"]);
+    assert_eq!(repo.git_config_values(&source_ref), ["refs/heads/dev"]);
+    assert_eq!(
+        repo.git_config_values(&source_anchor),
+        ["refs/heads/dev", "refs/heads/team/dev"]
+    );
+}
+
 // Production break caught: checking only endpoint OIDs would accept one canonical
 // branch as both sides and mutate repository state for a meaningless review.
 #[test]
