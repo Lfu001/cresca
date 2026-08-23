@@ -242,7 +242,7 @@ pub fn load_review_candidates(verbose: bool) -> Result<Vec<StoredReview>, Review
         &[
             "for-each-ref",
             "--sort=refname",
-            "--format=%(refname:short)",
+            "--format=%(refname:lstrip=2)",
             "refs/heads",
         ],
         &[],
@@ -764,13 +764,17 @@ fn decode_v2_fields(fields: &BTreeMap<String, Vec<String>>) -> Result<ReviewIden
 mod tests {
     use super::{
         allocate_new_review_branch_with, decode_stored_fields, decode_v2_fields, encode_v2_fields,
-        load_candidates_from_branches, select_from_v2_candidates, select_review,
-        suffixed_review_branch, LegacyReviewIdentity, ReviewIdentity, ReviewRequest,
-        ReviewSelection, ReviewSide, StoredReview, StoredReviewIdentity, V2Candidate,
-        REVIEW_METADATA_V2,
+        load_candidates_from_branches, load_review_candidates, select_from_v2_candidates,
+        select_review, suffixed_review_branch, write_review_identity_v2, LegacyReviewIdentity,
+        ReviewIdentity, ReviewRequest, ReviewSelection, ReviewSide, StoredReview,
+        StoredReviewIdentity, V2Candidate, REVIEW_METADATA_V2,
     };
     use crate::branch_ref::{CanonicalBranch, ResolutionMode, ResolvedBranch};
     use std::collections::{BTreeMap, BTreeSet};
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+    use std::sync::{Mutex, OnceLock};
+    use tempfile::TempDir;
 
     #[test]
     fn version_two_fields_round_trip_remote_identity_and_anchors() {
@@ -1228,6 +1232,158 @@ mod tests {
         .unwrap();
 
         assert!(candidates.is_empty());
+    }
+
+    fn git_at(repo: &Path, args: &[&str]) {
+        assert!(Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(args)
+            .status()
+            .unwrap()
+            .success());
+    }
+
+    struct CurrentDirectory {
+        original: PathBuf,
+    }
+
+    impl CurrentDirectory {
+        fn enter(path: &Path) -> Self {
+            let original = std::env::current_dir().unwrap();
+            std::env::set_current_dir(path).unwrap();
+            Self { original }
+        }
+    }
+
+    impl Drop for CurrentDirectory {
+        fn drop(&mut self) {
+            std::env::set_current_dir(&self.original).unwrap();
+        }
+    }
+
+    #[test]
+    fn same_named_tag_does_not_hide_existing_review_candidate() {
+        static CURRENT_DIR_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        let _lock = CURRENT_DIR_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let repo = TempDir::new().unwrap();
+        git_at(repo.path(), &["init", "--initial-branch=main", "--quiet"]);
+        git_at(repo.path(), &["config", "user.name", "Cresca Test"]);
+        git_at(
+            repo.path(),
+            &["config", "user.email", "cresca@example.invalid"],
+        );
+        git_at(
+            repo.path(),
+            &["commit", "--allow-empty", "--quiet", "-m", "base"],
+        );
+        git_at(repo.path(), &["branch", "review-demo"]);
+        git_at(repo.path(), &["tag", "review-demo"]);
+
+        let identity = ReviewIdentity {
+            target: remote_side("origin", "refs/heads/main"),
+            source: remote_side("origin", "refs/heads/dev"),
+        };
+        let candidates = {
+            let _directory = CurrentDirectory::enter(repo.path());
+            write_review_identity_v2("review-demo", &identity, false).unwrap();
+            load_review_candidates(false).unwrap()
+        };
+
+        let request = request_for_explicit_remote("origin", "refs/heads/dev");
+        let ReviewSelection::Existing(existing) =
+            select_review(&request, candidates, |_| Ok(None)).unwrap()
+        else {
+            panic!("the existing review must be selected instead of allocating a duplicate");
+        };
+        assert_eq!(existing.branch, "review-demo");
+        assert_eq!(existing.stored, StoredReviewIdentity::V2(identity));
+    }
+
+    #[test]
+    fn compatible_transition_prunes_retains_and_inserts_anchors() {
+        let request = request_for_plain_remote("refs/heads/dev", "upstream", "refs/heads/team-dev");
+        let stored = ReviewIdentity {
+            target: remote_side("origin", "refs/heads/main"),
+            source: ReviewSide {
+                canonical: CanonicalBranch::Local {
+                    reference: "refs/heads/dev".to_string(),
+                },
+                local_anchors: BTreeSet::from([
+                    "refs/heads/deleted".to_string(),
+                    "refs/heads/kept".to_string(),
+                ]),
+            },
+        };
+        let requested = request.source.canonical.clone();
+
+        let ReviewSelection::Existing(existing) = select_review(
+            &request,
+            vec![StoredReview {
+                branch: "transition-review".to_string(),
+                identity: StoredReviewIdentity::V2(stored),
+            }],
+            move |anchor| match anchor {
+                "refs/heads/deleted" => Ok(None),
+                "refs/heads/kept" => Ok(Some(requested.clone())),
+                other => panic!("unexpected stored anchor: {other}"),
+            },
+        )
+        .unwrap() else {
+            panic!("the fully compatible transition must reuse its review");
+        };
+
+        assert_eq!(
+            existing.next_identity.source,
+            ReviewSide {
+                canonical: CanonicalBranch::Remote {
+                    remote: "upstream".to_string(),
+                    reference: "refs/heads/team-dev".to_string(),
+                },
+                local_anchors: BTreeSet::from([
+                    "refs/heads/dev".to_string(),
+                    "refs/heads/kept".to_string(),
+                ]),
+            }
+        );
+    }
+
+    #[test]
+    fn compatible_transition_rejects_differing_anchor_destination() {
+        let request = request_for_plain_remote("refs/heads/dev", "upstream", "refs/heads/team-dev");
+        let stored = ReviewIdentity {
+            target: remote_side("origin", "refs/heads/main"),
+            source: ReviewSide {
+                canonical: CanonicalBranch::Local {
+                    reference: "refs/heads/dev".to_string(),
+                },
+                local_anchors: BTreeSet::from(["refs/heads/diverged".to_string()]),
+            },
+        };
+
+        let error = select_review(
+            &request,
+            vec![StoredReview {
+                branch: "transition-review".to_string(),
+                identity: StoredReviewIdentity::V2(stored),
+            }],
+            |_| {
+                Ok(Some(CanonicalBranch::Remote {
+                    remote: "fork".to_string(),
+                    reference: "refs/heads/other".to_string(),
+                }))
+            },
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("transition-review"));
+        assert!(error.contains("refs/heads/diverged"));
+        assert!(error.contains("fork/other"));
+        assert!(error.contains("upstream/team-dev"));
     }
 
     #[test]
