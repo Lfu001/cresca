@@ -9,10 +9,8 @@ use clap::builder::styling::{AnsiColor, Effects};
 use clap::{builder::Styles, ArgAction, Args, Parser, Subcommand};
 use colored::Colorize;
 use commands::{approve_changes, get_review_status, prepare_review_branch};
-use git::{
-    current_branch_name, current_review_metadata, read_review_scope, ReviewMetadata,
-    ReviewMetadataError, ReviewScopeError,
-};
+use git::{current_branch_name, current_review_metadata, read_review_scope, ReviewScopeError};
+use review_identity::{ReviewIdentityReadError, ReviewSide, StoredReviewIdentity};
 use std::process::exit;
 
 #[derive(Debug)]
@@ -99,11 +97,17 @@ fn run() -> Result<(), CliError> {
 
     match &cli.command {
         Commands::Approve => {
-            match current_review_metadata(cli.verbose) {
-                Ok(_) => {}
-                Err(ReviewMetadataError::Git(error)) => return Err(error.into()),
+            let metadata = match current_review_metadata(cli.verbose) {
+                Ok(metadata) => metadata,
+                Err(ReviewIdentityReadError::Git(error)) => return Err(error.into()),
                 Err(error) => exit_invalid_review_branch(error),
-            }
+            };
+            let branch = current_branch_name(cli.verbose)?;
+            match read_review_scope(&branch, cli.verbose) {
+                Ok(_) => {}
+                Err(ReviewScopeError::Git(error)) => return Err(error.into()),
+                Err(error) => exit_invalid_review_scope(error, &metadata),
+            };
             let res = approve_changes(cli.verbose);
             match res? {
                 false => println!("There are no reviewed changes to approve. Ending the review."),
@@ -127,7 +131,7 @@ fn run() -> Result<(), CliError> {
         Commands::Status => {
             let metadata = match current_review_metadata(cli.verbose) {
                 Ok(metadata) => metadata,
-                Err(ReviewMetadataError::Git(error)) => return Err(error.into()),
+                Err(ReviewIdentityReadError::Git(error)) => return Err(error.into()),
                 Err(error) => exit_invalid_review_branch(error),
             };
             let branch = current_branch_name(cli.verbose)?;
@@ -138,6 +142,7 @@ fn run() -> Result<(), CliError> {
             };
             let status = get_review_status(&scope.end_oid, "in current review range", cli.verbose)?;
             println!("📋 Review status (current range):");
+            print_saved_review_identity(&metadata);
             println!(
                 "  Remaining diff {}: {} file(s), {} insertion(s), {} deletion(s)",
                 status.display_label,
@@ -200,7 +205,40 @@ fn render_git_error(error: &git::GitCommandError) {
     eprintln!("{}", String::from_utf8_lossy(&error.stderr));
 }
 
-fn exit_invalid_review_scope(error: ReviewScopeError, metadata: &ReviewMetadata) -> ! {
+fn display_review_side(side: &ReviewSide) -> String {
+    match &side.canonical {
+        branch_ref::CanonicalBranch::Local { reference } => reference.clone(),
+        branch_ref::CanonicalBranch::Remote { remote, reference } => format!(
+            "{remote}/{}",
+            reference.strip_prefix("refs/heads/").unwrap_or(reference)
+        ),
+    }
+}
+
+fn saved_target_and_source(metadata: &StoredReviewIdentity) -> (String, String) {
+    match metadata {
+        StoredReviewIdentity::V1(identity) => (identity.target.clone(), identity.source.clone()),
+        StoredReviewIdentity::V2(identity) => (
+            display_review_side(&identity.target),
+            display_review_side(&identity.source),
+        ),
+    }
+}
+
+fn print_saved_review_identity(metadata: &StoredReviewIdentity) {
+    match metadata {
+        StoredReviewIdentity::V1(identity) => {
+            println!("  Unresolved legacy target: {}", identity.target);
+            println!("  Unresolved legacy source: {}", identity.source);
+        }
+        StoredReviewIdentity::V2(identity) => {
+            println!("  Target: {}", display_review_side(&identity.target));
+            println!("  Source: {}", display_review_side(&identity.source));
+        }
+    }
+}
+
+fn exit_invalid_review_scope(error: ReviewScopeError, metadata: &StoredReviewIdentity) -> ! {
     let reason = match error {
         ReviewScopeError::Missing => "range metadata is missing".to_string(),
         ReviewScopeError::Duplicate => "range metadata has duplicate values".to_string(),
@@ -216,19 +254,31 @@ fn exit_invalid_review_scope(error: ReviewScopeError, metadata: &ReviewMetadata)
             exit(1);
         }
     };
+    let (target, source) = saved_target_and_source(metadata);
     eprintln!(
         "{}: Cannot show current review range because {}. This review branch must be recreated. Switch away from it, delete it, then run `cresca review {} {}`.",
         "error".red().bold(),
         reason,
-        metadata.target,
-        metadata.source
+        target,
+        source
     );
     exit(1);
 }
 
-fn exit_invalid_review_branch(_: ReviewMetadataError) -> ! {
+fn exit_invalid_review_branch(error: ReviewIdentityReadError) -> ! {
+    let reason = match error {
+        ReviewIdentityReadError::Missing => "its metadata is missing".to_string(),
+        ReviewIdentityReadError::UnsupportedVersion(version) => {
+            format!("metadata version '{version}' is unsupported")
+        }
+        ReviewIdentityReadError::Invalid(reason) => format!("its metadata is invalid: {reason}"),
+        ReviewIdentityReadError::Git(error) => {
+            render_git_error(&error);
+            exit(1);
+        }
+    };
     eprintln!(
-        "{}: Current branch is not a valid cresca review branch because its metadata is missing or invalid; run `{}` to prepare one.",
+        "{}: Current branch is not a valid cresca review branch because {reason}; run `{}` to prepare one.",
         "error".red().bold(),
         "cresca review <target> <source>".green()
     );

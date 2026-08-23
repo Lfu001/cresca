@@ -113,12 +113,6 @@ impl From<BranchResolutionError> for ReviewSelectionError {
     }
 }
 
-#[derive(Clone, Debug)]
-struct V2Candidate {
-    branch: String,
-    identity: ReviewIdentity,
-}
-
 #[derive(Debug)]
 pub enum ReviewIdentityReadError {
     Missing,
@@ -476,24 +470,6 @@ where
     }
 }
 
-fn select_from_v2_candidates(
-    request: &ReviewRequest,
-    candidates: Vec<V2Candidate>,
-    resolve_anchor: impl FnMut(&str) -> Result<Option<CanonicalBranch>, BranchResolutionError>,
-) -> Result<Option<ExistingReview>, ReviewSelectionError> {
-    let candidates = candidates
-        .into_iter()
-        .map(|candidate| StoredReview {
-            branch: candidate.branch,
-            identity: StoredReviewIdentity::V2(candidate.identity),
-        })
-        .collect();
-    match select_review(request, candidates, resolve_anchor)? {
-        ReviewSelection::New { .. } => Ok(None),
-        ReviewSelection::Existing(existing) => Ok(Some(existing)),
-    }
-}
-
 fn canonical_identity_hash(identity: &ReviewIdentity) -> u64 {
     const OFFSET: u64 = 0xcbf29ce484222325;
     const PRIME: u64 = 0x100000001b3;
@@ -557,7 +533,7 @@ pub fn allocate_new_review_branch(
     verbose: bool,
 ) -> Result<String, ReviewSelectionError> {
     allocate_new_review_branch_with(base, identity, |branch| {
-        Ok(run_git_command(
+        let branch_exists = run_git_command(
             "check existence of review branch",
             &[
                 "show-ref",
@@ -569,7 +545,16 @@ pub fn allocate_new_review_branch(
             verbose,
         )?
         .status
-        .success())
+        .success();
+        if branch_exists {
+            return Ok(true);
+        }
+        for field in V2_FIELDS.into_iter().chain(["target", "source"]) {
+            if !review_config_values(branch, field, verbose)?.is_empty() {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     })
 }
 
@@ -667,32 +652,6 @@ pub fn write_review_identity_v2(
     )
 }
 
-fn encode_side(fields: &mut BTreeMap<String, Vec<String>>, name: &str, side: &ReviewSide) {
-    match &side.canonical {
-        CanonicalBranch::Local { reference } => {
-            fields.insert(format!("{name}-kind"), vec!["local".to_string()]);
-            fields.insert(format!("{name}-ref"), vec![reference.clone()]);
-        }
-        CanonicalBranch::Remote { remote, reference } => {
-            fields.insert(format!("{name}-kind"), vec!["remote".to_string()]);
-            fields.insert(format!("{name}-ref"), vec![reference.clone()]);
-            fields.insert(format!("{name}-remote"), vec![remote.clone()]);
-        }
-    }
-    fields.insert(
-        format!("{name}-anchor"),
-        side.local_anchors.iter().cloned().collect(),
-    );
-}
-
-fn encode_v2_fields(identity: &ReviewIdentity) -> BTreeMap<String, Vec<String>> {
-    let mut fields = BTreeMap::new();
-    fields.insert("version".to_string(), vec![REVIEW_METADATA_V2.to_string()]);
-    encode_side(&mut fields, "target", &identity.target);
-    encode_side(&mut fields, "source", &identity.source);
-    fields
-}
-
 fn decode_side(fields: &BTreeMap<String, Vec<String>>, name: &str) -> Result<ReviewSide, String> {
     let singleton = |field: String| match fields.get(&field).map(Vec::as_slice).unwrap_or(&[]) {
         [value] if !value.is_empty() => Ok(value),
@@ -763,11 +722,11 @@ fn decode_v2_fields(fields: &BTreeMap<String, Vec<String>>) -> Result<ReviewIden
 #[cfg(test)]
 mod tests {
     use super::{
-        allocate_new_review_branch_with, decode_stored_fields, decode_v2_fields, encode_v2_fields,
-        load_candidates_from_branches, load_review_candidates, select_from_v2_candidates,
-        select_review, suffixed_review_branch, write_review_identity_v2, LegacyReviewIdentity,
-        ReviewIdentity, ReviewRequest, ReviewSelection, ReviewSide, StoredReview,
-        StoredReviewIdentity, V2Candidate, REVIEW_METADATA_V2,
+        allocate_new_review_branch_with, decode_stored_fields, decode_v2_fields,
+        load_candidates_from_branches, load_review_candidates, select_review,
+        suffixed_review_branch, write_review_identity_v2, LegacyReviewIdentity, ReviewIdentity,
+        ReviewRequest, ReviewSelection, ReviewSide, StoredReview, StoredReviewIdentity,
+        REVIEW_METADATA_V2,
     };
     use crate::branch_ref::{CanonicalBranch, ResolutionMode, ResolvedBranch};
     use std::collections::{BTreeMap, BTreeSet};
@@ -775,6 +734,32 @@ mod tests {
     use std::process::Command;
     use std::sync::{Mutex, OnceLock};
     use tempfile::TempDir;
+
+    fn encode_side(fields: &mut BTreeMap<String, Vec<String>>, name: &str, side: &ReviewSide) {
+        match &side.canonical {
+            CanonicalBranch::Local { reference } => {
+                fields.insert(format!("{name}-kind"), vec!["local".to_string()]);
+                fields.insert(format!("{name}-ref"), vec![reference.clone()]);
+            }
+            CanonicalBranch::Remote { remote, reference } => {
+                fields.insert(format!("{name}-kind"), vec!["remote".to_string()]);
+                fields.insert(format!("{name}-ref"), vec![reference.clone()]);
+                fields.insert(format!("{name}-remote"), vec![remote.clone()]);
+            }
+        }
+        fields.insert(
+            format!("{name}-anchor"),
+            side.local_anchors.iter().cloned().collect(),
+        );
+    }
+
+    fn encode_v2_fields(identity: &ReviewIdentity) -> BTreeMap<String, Vec<String>> {
+        let mut fields = BTreeMap::new();
+        fields.insert("version".to_string(), vec![REVIEW_METADATA_V2.to_string()]);
+        encode_side(&mut fields, "target", &identity.target);
+        encode_side(&mut fields, "source", &identity.source);
+        fields
+    }
 
     #[test]
     fn version_two_fields_round_trip_remote_identity_and_anchors() {
@@ -795,7 +780,7 @@ mod tests {
             },
         };
 
-        let fields: BTreeMap<String, Vec<String>> = encode_v2_fields(&identity);
+        let fields = encode_v2_fields(&identity);
         assert_eq!(decode_v2_fields(&fields).unwrap(), identity);
     }
 
@@ -992,13 +977,13 @@ mod tests {
         }
     }
 
-    fn candidate(branch: &str, source: ReviewSide) -> V2Candidate {
-        V2Candidate {
+    fn candidate(branch: &str, source: ReviewSide) -> StoredReview {
+        StoredReview {
             branch: branch.to_string(),
-            identity: ReviewIdentity {
+            identity: StoredReviewIdentity::V2(ReviewIdentity {
                 target: remote_side("origin", "refs/heads/main"),
                 source,
-            },
+            }),
         }
     }
 
@@ -1025,8 +1010,7 @@ mod tests {
 
         let requested = request.source.canonical.clone();
         let error =
-            select_from_v2_candidates(&request, candidates, move |_| Ok(Some(requested.clone())))
-                .unwrap_err();
+            select_review(&request, candidates, move |_| Ok(Some(requested.clone()))).unwrap_err();
 
         assert!(error.to_string().contains("remote-review"));
         assert!(error.to_string().contains("local-review"));
@@ -1040,13 +1024,12 @@ mod tests {
             candidate("local-review", local_identity("refs/heads/dev")),
         ];
 
-        assert_eq!(
-            select_from_v2_candidates(&request, candidates, |_| Ok(None))
-                .unwrap()
-                .unwrap()
-                .branch,
-            "remote-review"
-        );
+        let ReviewSelection::Existing(existing) =
+            select_review(&request, candidates, |_| Ok(None)).unwrap()
+        else {
+            panic!("the exact remote review must be selected");
+        };
+        assert_eq!(existing.branch, "remote-review");
     }
 
     #[test]

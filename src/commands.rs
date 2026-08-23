@@ -1,23 +1,30 @@
-use crate::branch_naming::resolve_new_review_branch_name;
-use crate::branch_ref::resolve_branch;
+use crate::branch_naming::{resolve_new_review_branch_name, ReviewNamingInput};
+use crate::branch_ref::{resolve_branch, resolve_existing_anchor};
 use crate::git::{
-    find_existing_review_branch, is_clean, read_review_scope, run_git_command,
-    run_git_command_machine_output, select_new_review_branch, write_review_metadata,
-    write_review_scope, ReviewBranchSelection, ReviewBranchSelectionError, ReviewMetadata,
-    ReviewScope, ReviewScopeError,
+    is_clean, read_review_scope, run_git_command, run_git_command_machine_output,
+    write_review_scope, ReviewScope, ReviewScopeError,
 };
 use crate::review::{
     find_unique_merge_base, reconstruct_approval_tree, ReviewError, ReviewPreparation,
     ReviewTransaction,
 };
+use crate::review_identity::{
+    allocate_new_review_branch, load_review_candidates, select_review, write_review_identity_v2,
+    ReviewIdentity, ReviewRequest, ReviewSelection, ReviewSelectionError,
+};
 use std::fmt::Write as _;
 use std::ops::Not;
 
+enum PlannedReviewBranch {
+    New(String),
+    Existing(String),
+}
+
 struct ReviewPlan {
-    metadata: ReviewMetadata,
+    identity: ReviewIdentity,
+    branch: PlannedReviewBranch,
     new_base: String,
     auto_approve_parent: Option<String>,
-    selection: ReviewBranchSelection,
     old_review: Option<String>,
     old_base: Option<String>,
     scope: ReviewScope,
@@ -65,14 +72,51 @@ fn prepare_review_plan(
     stop_at: Option<&str>,
     verbose: bool,
 ) -> Result<ReviewPlan, ReviewError> {
-    let metadata = ReviewMetadata {
-        target: to_branch.to_string(),
-        source: from_branch.to_string(),
-    };
     let resolved_to = resolve_branch(to_branch, verbose)?;
     let resolved_from = resolve_branch(from_branch, verbose)?;
+    if resolved_to.canonical == resolved_from.canonical {
+        return Err(ReviewError::Message(
+            "Target and source resolve to the same branch. Choose two distinct branch identities."
+                .to_string(),
+        ));
+    }
+    let request = ReviewRequest {
+        target: resolved_to,
+        source: resolved_from,
+    };
+    let map_selection_error = |error: ReviewSelectionError| match error {
+        ReviewSelectionError::Git(error) => ReviewError::Git(error),
+        error @ (ReviewSelectionError::Conflict(_)
+        | ReviewSelectionError::RelevantReviewInvalid { .. }) => {
+            ReviewError::Message(error.to_string())
+        }
+    };
+    let candidates = load_review_candidates(verbose).map_err(map_selection_error)?;
+    let selection = select_review(&request, candidates, |anchor| {
+        resolve_existing_anchor(anchor, verbose)
+    })
+    .map_err(map_selection_error)?;
+    let (identity, branch) = match selection {
+        ReviewSelection::Existing(existing) => (
+            existing.next_identity,
+            PlannedReviewBranch::Existing(existing.branch),
+        ),
+        ReviewSelection::New { identity } => {
+            let base = resolve_new_review_branch_name(
+                ReviewNamingInput {
+                    target: to_branch,
+                    source: from_branch,
+                },
+                verbose,
+            )
+            .map_err(|error| ReviewError::Message(error.to_string()))?;
+            let branch = allocate_new_review_branch(&base, &identity, verbose)
+                .map_err(map_selection_error)?;
+            (identity, PlannedReviewBranch::New(branch))
+        }
+    };
 
-    let scope_end_revision = stop_at.unwrap_or(&resolved_from.commit_oid);
+    let scope_end_revision = stop_at.unwrap_or(&request.source.commit_oid);
     let scope_end_commit = format!("{scope_end_revision}^{{commit}}");
     let scope_end_output = run_git_command(
         "resolve review range endpoint",
@@ -89,13 +133,13 @@ fn prepare_review_plan(
     let endpoint = String::from_utf8_lossy(&scope_end_output.stdout)
         .trim()
         .to_string();
-    let new_base = find_unique_merge_base(&resolved_to.commit_oid, &endpoint, verbose)?;
+    let new_base = find_unique_merge_base(&request.target.commit_oid, &endpoint, verbose)?;
 
     let valid_commits = run_git_command(
         "get valid commit range",
         &[
             "rev-list",
-            &format!("{}..{}", new_base, resolved_from.commit_oid),
+            &format!("{}..{}", new_base, request.source.commit_oid),
         ],
         &[],
         verbose,
@@ -131,7 +175,7 @@ fn prepare_review_plan(
                 "get commits after skip_to",
                 &[
                     "rev-list",
-                    &format!("{}..{}", skip_hash, resolved_from.commit_oid),
+                    &format!("{}..{}", skip_hash, request.source.commit_oid),
                 ],
                 &[],
                 verbose,
@@ -174,22 +218,9 @@ fn prepare_review_plan(
         None
     };
 
-    let map_selection_error = |error| match error {
-        ReviewBranchSelectionError::Git(error) => ReviewError::Git(error),
-        ReviewBranchSelectionError::Conflict(message) => ReviewError::Message(message),
-    };
-    let selection =
-        match find_existing_review_branch(&metadata, verbose).map_err(map_selection_error)? {
-            Some(branch) => ReviewBranchSelection::Existing(branch),
-            None => {
-                let base = resolve_new_review_branch_name(&metadata, verbose)
-                    .map_err(|error| ReviewError::Message(error.to_string()))?;
-                select_new_review_branch(&base, &metadata, verbose).map_err(map_selection_error)?
-            }
-        };
-    let (old_review, old_base) = match &selection {
-        ReviewBranchSelection::New(_) => (None, None),
-        ReviewBranchSelection::Existing(branch) => {
+    let (old_review, old_base) = match &branch {
+        PlannedReviewBranch::New(_) => (None, None),
+        PlannedReviewBranch::Existing(branch) => {
             let old_review = String::from_utf8_lossy(
                 &run_git_command(
                     "resolve previous review head",
@@ -216,10 +247,10 @@ fn prepare_review_plan(
         }
     };
     Ok(ReviewPlan {
-        metadata,
+        identity,
+        branch,
         new_base,
         auto_approve_parent,
-        selection,
         old_review,
         old_base,
         scope,
@@ -268,20 +299,20 @@ fn create_commit_from_tree(
 
 fn apply_review_plan(plan: ReviewPlan, verbose: bool) -> Result<ReviewPreparation, ReviewError> {
     let ReviewPlan {
-        metadata,
+        identity,
+        branch,
         new_base,
         auto_approve_parent,
-        selection,
         old_review,
         old_base,
         scope,
     } = plan;
-    let (review_branch, is_new) = match selection {
-        ReviewBranchSelection::Existing(name) => {
+    let (review_branch, is_new) = match branch {
+        PlannedReviewBranch::Existing(name) => {
             run_git_command("switch to review branch", &["switch", &name], &[], verbose)?;
             (name, false)
         }
-        ReviewBranchSelection::New(name) => {
+        PlannedReviewBranch::New(name) => {
             run_git_command(
                 "create review branch from merge-base",
                 &["checkout", "-b", &name, &new_base],
@@ -351,9 +382,7 @@ fn apply_review_plan(plan: ReviewPlan, verbose: bool) -> Result<ReviewPreparatio
         &[],
         verbose,
     )?;
-    if is_new {
-        write_review_metadata(&review_branch, &metadata, verbose)?;
-    }
+    write_review_identity_v2(&review_branch, &identity, verbose)?;
     write_review_scope(&review_branch, &scope, verbose)?;
     Ok(ReviewPreparation {
         has_unreviewed_changes: !is_clean(verbose)?,

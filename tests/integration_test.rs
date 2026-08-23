@@ -1924,11 +1924,7 @@ fn test_review_naming_hook_creates_non_prefixed_branch_and_receives_arguments() 
     assert_eq!(repo.current_branch(), "develop-into-main");
     assert_eq!(
         repo.review_metadata_values("develop-into-main"),
-        (
-            vec!["1".to_string()],
-            vec!["main".to_string()],
-            vec!["develop".to_string()]
-        )
+        (vec!["2".to_string()], Vec::new(), Vec::new())
     );
 }
 
@@ -3649,6 +3645,8 @@ fn test_status_shows_diff_stats() {
         String::from_utf8(output.stdout).expect("status stdout should be UTF-8"),
         concat!(
             "📋 Review status (current range):\n",
+            "  Target: origin/main\n",
+            "  Source: origin/develop\n",
             "  Remaining diff in current review range: 2 file(s), +3 insertion(s), -1 deletion(s)\n",
             "  Files remaining:\n",
             "    - added.txt\n",
@@ -3720,6 +3718,8 @@ fn test_status_escapes_newline_rename_paths() {
         String::from_utf8(output.stdout).expect("status stdout should be UTF-8"),
         concat!(
             "📋 Review status (current range):\n",
+            "  Target: origin/main\n",
+            "  Source: origin/develop\n",
             "  Remaining diff in current review range: 1 file(s), +0 insertion(s), -0 deletion(s)\n",
             "  Files remaining:\n",
             "    - R100 \"newline\\nold.txt\" -> \"newline\\nnew.txt\"\n",
@@ -3824,6 +3824,8 @@ fn test_status_displays_edited_rename_and_preserves_endpoint_hunks_without_index
         stdout,
         concat!(
             "📋 Review status (current range):\n",
+            "  Target: origin/main\n",
+            "  Source: origin/develop\n",
             "  Remaining diff in current review range: 1 file(s), +1 insertion(s), -1 deletion(s)\n",
             "  Files remaining:\n",
             "    - R098 before.txt -> after.txt\n",
@@ -4177,6 +4179,8 @@ fn test_status_after_partial_approval() {
         String::from_utf8(output.stdout).expect("status stdout should be UTF-8"),
         concat!(
             "📋 Review status (current range):\n",
+            "  Target: origin/main\n",
+            "  Source: origin/develop\n",
             "  Remaining diff in current review range: 1 file(s), +1 insertion(s), -1 deletion(s)\n",
             "  Files remaining:\n",
             "    - changed.txt\n",
@@ -4211,6 +4215,8 @@ fn test_status_after_partial_approval() {
         String::from_utf8(output.stdout).expect("status stdout should be UTF-8"),
         concat!(
             "📋 Review status (current range):\n",
+            "  Target: origin/main\n",
+            "  Source: origin/develop\n",
             "  Remaining diff in current review range: 0 file(s), +0 insertion(s), -0 deletion(s)\n",
         )
     );
@@ -4456,7 +4462,7 @@ fn test_review_with_stop_at_before_skip_to() {
     );
 }
 
-/// Test that `cresca review` records the exact CLI target and source values.
+/// Test that `cresca review` records canonical target and source identity.
 #[test]
 fn test_review_records_versioned_target_and_source_metadata() {
     let repo = TempGitRepo::new();
@@ -4487,11 +4493,32 @@ fn test_review_records_versioned_target_and_source_metadata() {
     );
     assert_eq!(
         repo.review_metadata_values("review-release-v1-feature_login-page"),
-        (
-            vec!["1".to_string()],
-            vec!["release-v1".to_string()],
-            vec!["feature/login-page".to_string()],
-        )
+        (vec!["2".to_string()], Vec::new(), Vec::new())
+    );
+    let branch = "review-release-v1-feature_login-page";
+    assert_eq!(
+        repo.git_config_values(&format!("branch.{branch}.cresca-target-kind")),
+        ["remote"]
+    );
+    assert_eq!(
+        repo.git_config_values(&format!("branch.{branch}.cresca-target-remote")),
+        ["origin"]
+    );
+    assert_eq!(
+        repo.git_config_values(&format!("branch.{branch}.cresca-target-ref")),
+        ["refs/heads/release-v1"]
+    );
+    assert_eq!(
+        repo.git_config_values(&format!("branch.{branch}.cresca-source-kind")),
+        ["remote"]
+    );
+    assert_eq!(
+        repo.git_config_values(&format!("branch.{branch}.cresca-source-remote")),
+        ["origin"]
+    );
+    assert_eq!(
+        repo.git_config_values(&format!("branch.{branch}.cresca-source-ref")),
+        ["refs/heads/feature/login-page"]
     );
     assert!(repo.cached_diff().is_empty());
     assert_eq!(
@@ -4547,17 +4574,13 @@ fn test_review_treats_orphan_base_metadata_as_occupied() {
         String::from_utf8_lossy(&output.stderr)
     );
 
-    let suffix = "review-main-develop-5ee67b20f1cad176";
+    let suffix = "review-main-develop-af53af9a1df04942";
     assert_eq!(repo.current_branch(), suffix);
     assert!(!repo.ref_exists(&format!("refs/heads/{base}")));
     assert_eq!(repo.review_metadata_values(base), orphan_metadata);
     assert_eq!(
         repo.review_metadata_values(suffix),
-        (
-            vec!["1".to_string()],
-            vec!["main".to_string()],
-            vec!["develop".to_string()],
-        )
+        (vec!["2".to_string()], Vec::new(), Vec::new())
     );
     assert!(repo.cached_diff().is_empty());
     let merge_base = repo.git_stdout(&["merge-base", "origin/main", "origin/develop"]);
@@ -4581,7 +4604,7 @@ fn test_review_fails_closed_when_orphan_metadata_occupies_suffix() {
     let base = "review-main-develop";
     repo.create_branch(base);
     repo.switch_branch("main");
-    let suffix = "review-main-develop-5ee67b20f1cad176";
+    let suffix = "review-main-develop-af53af9a1df04942";
     repo.git(&[
         "config",
         "--local",
@@ -4710,7 +4733,7 @@ fn test_review_does_not_materialize_orphan_metadata_when_config_write_fails() {
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("Failed to record review target"),
+        stderr.contains("Failed to record review target kind"),
         "expected metadata write failure, got: {stderr}"
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -4721,7 +4744,7 @@ fn test_review_does_not_materialize_orphan_metadata_when_config_write_fails() {
     assert!(!repo.ref_exists(&format!("refs/heads/{review_branch}")));
     assert_eq!(repo.review_metadata_values(review_branch), metadata_before);
 
-    let suffix = "review-main-develop-5ee67b20f1cad176";
+    let suffix = "review-main-develop-af53af9a1df04942";
     assert_eq!(
         repo.review_metadata_values(suffix),
         (Vec::new(), Vec::new(), Vec::new()),
@@ -4770,11 +4793,7 @@ fn test_review_does_not_reuse_branch_for_slash_underscore_collision() {
     );
     assert_eq!(
         repo.review_metadata_values(&second_branch),
-        (
-            vec!["1".to_string()],
-            vec!["main".to_string()],
-            vec!["feature_foo".to_string()],
-        )
+        (vec!["2".to_string()], Vec::new(), Vec::new())
     );
     assert!(repo.cached_diff().is_empty());
     let merge_base = repo.git_stdout(&["merge-base", "origin/main", "origin/feature_foo"]);
@@ -4834,11 +4853,7 @@ fn test_review_does_not_reuse_branch_for_ambiguous_pair_boundary() {
     );
     assert_eq!(
         repo.review_metadata_values(&second_branch),
-        (
-            vec!["1".to_string()],
-            vec!["release-v1".to_string()],
-            vec!["feature".to_string()],
-        )
+        (vec!["2".to_string()], Vec::new(), Vec::new())
     );
     assert!(repo.cached_diff().is_empty());
     let merge_base = repo.git_stdout(&["merge-base", "origin/release-v1", "origin/feature"]);
@@ -4885,11 +4900,7 @@ fn test_review_leaves_legacy_branch_untouched_and_creates_metadata_backed_branch
     );
     assert_eq!(
         repo.review_metadata_values(&metadata_branch),
-        (
-            vec!["1".to_string()],
-            vec!["main".to_string()],
-            vec!["develop".to_string()],
-        )
+        (vec!["2".to_string()], Vec::new(), Vec::new())
     );
     assert!(repo.cached_diff().is_empty());
     let merge_base = repo.git_stdout(&["merge-base", "origin/main", "origin/develop"]);
@@ -4953,7 +4964,7 @@ fn test_review_fails_atomically_when_base_and_identity_suffix_belong_to_other_re
     ]);
     assert_eq!(
         repo.git_config_values(&format!("branch.{suffixed_branch}.cresca-version")),
-        vec!["1".to_string()]
+        vec!["2".to_string()]
     );
 
     repo.switch_branch("main");
@@ -5172,6 +5183,8 @@ fn test_status_keeps_unbounded_review_tip_fixed_until_next_review() {
         run_status_stdout(&repo, &["status"]),
         concat!(
             "📋 Review status (current range):\n",
+            "  Target: origin/main\n",
+            "  Source: origin/develop\n",
             "  Remaining diff in current review range: 0 file(s), +0 insertion(s), -0 deletion(s)\n",
         )
     );
@@ -5230,6 +5243,8 @@ fn test_status_current_range_can_be_complete() {
         run_status_stdout(&repo, &["status"]),
         concat!(
             "📋 Review status (current range):\n",
+            "  Target: origin/main\n",
+            "  Source: origin/develop\n",
             "  Remaining diff in current review range: 0 file(s), +0 insertion(s), -0 deletion(s)\n",
         )
     );

@@ -486,6 +486,31 @@ pub fn resolve_branch(input: &str, verbose: bool) -> Result<ResolvedBranch, Bran
     }
 }
 
+pub fn resolve_existing_anchor(
+    anchor: &str,
+    verbose: bool,
+) -> Result<Option<CanonicalBranch>, BranchResolutionError> {
+    let Some(name) = anchor
+        .strip_prefix("refs/heads/")
+        .filter(|name| !name.is_empty())
+    else {
+        return Err(BranchResolutionError::Message(format!(
+            "Stored local anchor `{anchor}` is not a fully qualified local branch reference."
+        )));
+    };
+    validate_branch_name(name, anchor, verbose)?;
+    let local_probe = run_git_command(
+        &format!("check stored local anchor `{anchor}`"),
+        &["show-ref", "--verify", "--quiet", anchor],
+        &[1],
+        verbose,
+    )?;
+    if !local_probe.status.success() {
+        return Ok(None);
+    }
+    resolve_branch(name, verbose).map(|resolved| Some(resolved.canonical))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{parse_branch_request, BranchRequest};

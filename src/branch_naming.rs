@@ -1,4 +1,4 @@
-use crate::git::{run_git_command, ReviewMetadata};
+use crate::git::run_git_command;
 use serde::Deserialize;
 use std::fmt;
 use std::path::Path;
@@ -7,6 +7,12 @@ use std::process::Command;
 #[derive(Debug)]
 pub struct BranchNamingError {
     message: String,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct ReviewNamingInput<'a> {
+    pub target: &'a str,
+    pub source: &'a str,
 }
 
 impl BranchNamingError {
@@ -125,20 +131,20 @@ fn validate_branch_name(name: &str, verbose: bool) -> Result<(), BranchNamingErr
 }
 
 fn resolve_new_review_branch_name_at(
-    metadata: &ReviewMetadata,
+    input: ReviewNamingInput<'_>,
     verbose: bool,
     config_path: &Path,
 ) -> Result<String, BranchNamingError> {
     let Some(hook) = load_naming_hook(config_path)? else {
-        return Ok(format!("review-{}-{}", metadata.target, metadata.source).replace('/', "_"));
+        return Ok(format!("review-{}-{}", input.target, input.source).replace('/', "_"));
     };
     if verbose {
         println!("[review branch naming hook: {}]", hook.program);
     }
     let output = Command::new(&hook.program)
         .args(&hook.args)
-        .arg(&metadata.source)
-        .arg(&metadata.target)
+        .arg(input.source)
+        .arg(input.target)
         .output()
         .map_err(|error| {
             BranchNamingError::new(format!(
@@ -167,18 +173,19 @@ fn resolve_new_review_branch_name_at(
 }
 
 pub fn resolve_new_review_branch_name(
-    metadata: &ReviewMetadata,
+    input: ReviewNamingInput<'_>,
     verbose: bool,
 ) -> Result<String, BranchNamingError> {
     let home = dirs::home_dir()
         .ok_or_else(|| BranchNamingError::new("Cannot locate the user home directory."))?;
-    resolve_new_review_branch_name_at(metadata, verbose, &home.join(".cresca/config.toml"))
+    resolve_new_review_branch_name_at(input, verbose, &home.join(".cresca/config.toml"))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_config, parse_hook_stdout, resolve_new_review_branch_name_at};
-    use crate::git::ReviewMetadata;
+    use super::{
+        parse_config, parse_hook_stdout, resolve_new_review_branch_name_at, ReviewNamingInput,
+    };
     use tempfile::TempDir;
 
     #[test]
@@ -254,16 +261,43 @@ program = "  "
     #[test]
     fn missing_configuration_uses_default_name() {
         let home = TempDir::new().unwrap();
-        let metadata = ReviewMetadata {
-            target: "main".to_string(),
-            source: "feature/login".to_string(),
+        let input = ReviewNamingInput {
+            target: "main",
+            source: "feature/login",
         };
 
         let name =
-            resolve_new_review_branch_name_at(&metadata, false, &home.path().join("missing.toml"))
+            resolve_new_review_branch_name_at(input, false, &home.path().join("missing.toml"))
                 .unwrap();
 
         assert_eq!(name, "review-main-feature_login");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn new_review_hook_receives_exact_raw_source_then_target() {
+        let home = TempDir::new().unwrap();
+        let config_path = home.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            r#"[review_branch.naming_hook]
+program = "sh"
+args = ["-c", "[ \"$1\" = fixed ] && [ \"$2\" = refs/heads/feature/raw ] && [ \"$3\" = origin/main ] && printf 'raw-review\\n'", "hook", "fixed"]
+"#,
+        )
+        .unwrap();
+
+        let name = resolve_new_review_branch_name_at(
+            ReviewNamingInput {
+                target: "origin/main",
+                source: "refs/heads/feature/raw",
+            },
+            false,
+            &config_path,
+        )
+        .unwrap();
+
+        assert_eq!(name, "raw-review");
     }
 
     #[cfg(unix)]
@@ -279,12 +313,12 @@ args = ["-c", "printf '%s-%s-%s\\n' \"$1\" \"$2\" \"$3\"", "hook", "fixed"]
 "#,
         )
         .unwrap();
-        let metadata = ReviewMetadata {
-            target: "main".to_string(),
-            source: "feature/login".to_string(),
+        let input = ReviewNamingInput {
+            target: "main",
+            source: "feature/login",
         };
 
-        let name = resolve_new_review_branch_name_at(&metadata, false, &config_path).unwrap();
+        let name = resolve_new_review_branch_name_at(input, false, &config_path).unwrap();
 
         assert_eq!(name, "fixed-feature/login-main");
     }
@@ -302,12 +336,12 @@ args = ["-c", "printf 'naming failed\\n' >&2; exit 23"]
 "#,
         )
         .unwrap();
-        let metadata = ReviewMetadata {
-            target: "main".to_string(),
-            source: "develop".to_string(),
+        let input = ReviewNamingInput {
+            target: "main",
+            source: "develop",
         };
 
-        let error = resolve_new_review_branch_name_at(&metadata, false, &config_path)
+        let error = resolve_new_review_branch_name_at(input, false, &config_path)
             .expect_err("non-zero hook must fail");
 
         assert!(error.to_string().contains("naming failed"));
@@ -327,12 +361,12 @@ args = ["-c", "printf '@{-1}\\n'"]
 "#,
         )
         .unwrap();
-        let metadata = ReviewMetadata {
-            target: "main".to_string(),
-            source: "develop".to_string(),
+        let input = ReviewNamingInput {
+            target: "main",
+            source: "develop",
         };
 
-        let error = resolve_new_review_branch_name_at(&metadata, false, &config_path)
+        let error = resolve_new_review_branch_name_at(input, false, &config_path)
             .expect_err("checkout shorthand must not be accepted as a branch name");
 
         assert!(error.to_string().contains("valid Git branch name"));
