@@ -1,3 +1,8 @@
+#![allow(
+    dead_code,
+    reason = "each integration-test target uses a different subset of this shared test utility"
+)]
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::{Path, PathBuf};
@@ -17,11 +22,17 @@ pub struct RepoState {
     pub branch: String,
     pub head: String,
     pub local_heads: Vec<u8>,
+    pub remote_refs: Vec<u8>,
     pub status: Vec<u8>,
     pub cached_diff: Vec<u8>,
     pub worktree_diff: Vec<u8>,
     pub raw_local_config: Vec<u8>,
     pub raw_index: Vec<u8>,
+    pub fetch_head: Option<Vec<u8>>,
+    pub orig_head: Option<Vec<u8>>,
+    pub merge_head: Option<Vec<u8>>,
+    pub cherry_pick_head: Option<Vec<u8>>,
+    pub revert_head: Option<Vec<u8>>,
     pub directories: BTreeSet<PathBuf>,
     pub direct_worktree: BTreeMap<PathBuf, WorktreeEntryState>,
 }
@@ -134,6 +145,48 @@ impl TempGitRepo {
             .lines()
             .map(str::to_owned)
             .collect()
+    }
+
+    pub fn add_bare_remote(&self, name: &str) -> TempDir {
+        let remote = TempDir::new().expect("additional bare remote should be created");
+        let output = Command::new("git")
+            .args(["init", "--bare", "-b", "main"])
+            .current_dir(remote.path())
+            .output()
+            .expect("additional bare remote should initialize");
+        assert!(output.status.success());
+        self.git(&[
+            "remote",
+            "add",
+            name,
+            remote.path().to_str().expect("remote path should be UTF-8"),
+        ]);
+        remote
+    }
+
+    pub fn set_upstream(&self, local: &str, remote: &str, remote_branch: &str) {
+        self.git(&["config", &format!("branch.{local}.remote"), remote]);
+        self.git(&[
+            "config",
+            &format!("branch.{local}.merge"),
+            &format!("refs/heads/{remote_branch}"),
+        ]);
+    }
+
+    pub fn unset_upstream(&self, local: &str) {
+        for field in ["remote", "merge"] {
+            let output = self.git_maybe(&[
+                "config",
+                "--local",
+                "--unset-all",
+                &format!("branch.{local}.{field}"),
+            ]);
+            assert!(
+                output.status.success(),
+                "failed to unset branch.{local}.{field}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
     }
 
     pub fn review_metadata_values(&self, branch: &str) -> (Vec<String>, Vec<String>, Vec<String>) {
@@ -346,6 +399,14 @@ impl TempGitRepo {
                 "refs/heads/",
             ])
             .stdout;
+        let remote_refs = self
+            .git(&[
+                "for-each-ref",
+                "--sort=refname",
+                "--format=%(refname) %(objectname)",
+                "refs/remotes/",
+            ])
+            .stdout;
         let status = self
             .git_without_optional_locks(&[
                 "status",
@@ -358,6 +419,12 @@ impl TempGitRepo {
         let worktree_diff = self.worktree_diff();
         let raw_local_config = self.raw_local_config_bytes();
         let raw_index = self.real_index_bytes();
+        let read_admin = |name: &str| std::fs::read(self.git_path(name)).ok();
+        let fetch_head = read_admin("FETCH_HEAD");
+        let orig_head = read_admin("ORIG_HEAD");
+        let merge_head = read_admin("MERGE_HEAD");
+        let cherry_pick_head = read_admin("CHERRY_PICK_HEAD");
+        let revert_head = read_admin("REVERT_HEAD");
         let directories = self.directory_set();
         let direct_worktree = self.direct_worktree_state();
 
@@ -365,11 +432,17 @@ impl TempGitRepo {
             branch,
             head,
             local_heads,
+            remote_refs,
             status,
             cached_diff,
             worktree_diff,
             raw_local_config,
             raw_index,
+            fetch_head,
+            orig_head,
+            merge_head,
+            cherry_pick_head,
+            revert_head,
             directories,
             direct_worktree,
         }

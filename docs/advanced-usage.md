@@ -1,5 +1,49 @@
 # Advanced Usage
 
+## Branch Reference Resolution
+
+`cresca review <target> <source>` accepts three branch forms for both the target and source:
+
+| Form | Example | Meaning |
+|------|---------|---------|
+| Plain branch name | `dev` | Use a configured remote upstream, or discover one safe local or same-named remote branch. |
+| Explicit local branch | `refs/heads/dev` | Use exactly the local branch without querying remotes. |
+| Explicit remote branch | `origin/dev` | Verify and fetch exactly that branch from the selected remote. |
+
+`refs/remotes/origin/dev` is also accepted as an explicit remote spelling. A tracked plain branch uses its fetched upstream tip, so unpushed local commits are excluded. Use `refs/heads/dev` when you intentionally want the local tip.
+
+When a local branch has no valid remote upstream, Cresca checks every configured remote for a same-named branch and applies this table:
+
+| Local branch | Matching remote branches | Result |
+|--------------|--------------------------|--------|
+| exists | none | Use the local branch. |
+| exists | one or more | Stop because local and remote are ambiguous. |
+| absent | exactly one | Use that remote branch. |
+| absent | two or more | Stop because the remotes are ambiguous. |
+| absent | none | Stop because the branch was not found. |
+
+If local `main` tracks `origin/main` and local `dev` tracks `origin/dev`, all four of these commands continue the same review:
+
+```sh
+cresca review main dev
+cresca review main origin/dev
+cresca review origin/main dev
+cresca review origin/main origin/dev
+```
+
+This continuity also covers the usual local-to-remote workflow. You can review a local-only plain branch, approve changes, publish it with `git push -u`, and run the same plain-name review again. Cresca reuses the review and preserves approvals that still correspond safely; newly added or rewritten changes remain unreviewed.
+
+Plain names fail closed when more than one branch is possible. For example:
+
+```text
+error: Branch `dev` is ambiguous. Candidates: `refs/heads/dev`, `origin/dev`.
+Select one explicitly (local: `refs/heads/dev`; remote: `origin/dev`).
+```
+
+Use the displayed spelling in the corresponding target or source position, such as `cresca review main refs/heads/dev` or `cresca review main origin/dev`.
+
+Review naming hooks continue to receive the raw source and target arguments exactly as entered on the command line, even though Cresca resolves branch identity independently.
+
 ## Customizing Review Branch Names
 
 By default, Cresca creates review branches such as `review-main-develop`. To choose names with your own script, create the user-wide configuration file for your platform:
