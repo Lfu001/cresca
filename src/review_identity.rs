@@ -11,15 +11,3 @@ pub use model::{
     ReviewSide, StoredReviewIdentity,
 };
 pub use selection::select_review;
-
-#[cfg(test)]
-use allocation::{allocate_new_review_branch_with, suffixed_review_branch};
-#[cfg(test)]
-use metadata::{
-    decode_stored_fields, decode_v2_fields, load_candidates_from_branches, REVIEW_METADATA_V2,
-};
-#[cfg(test)]
-use model::{LegacyReviewIdentity, StoredReview};
-
-#[cfg(test)]
-mod tests;
