@@ -2,6 +2,7 @@ mod branch_naming;
 mod branch_ref;
 mod commands;
 mod git;
+mod progress;
 mod review;
 mod review_identity;
 
@@ -10,6 +11,7 @@ use clap::{builder::Styles, ArgAction, Args, Parser, Subcommand};
 use colored::Colorize;
 use commands::{approve_changes, get_review_status, prepare_review_branch};
 use git::{current_branch_name, current_review_metadata, read_review_scope, ReviewScopeError};
+use progress::WaitIndicator;
 use review_identity::{ReviewIdentityReadError, ReviewSide, StoredReviewIdentity};
 use std::process::exit;
 
@@ -97,24 +99,33 @@ fn run() -> Result<(), CliError> {
 
     match &cli.command {
         Commands::Approve => {
+            let indicator = WaitIndicator::start("Approving reviewed changes", cli.verbose);
             let metadata = match current_review_metadata(cli.verbose) {
                 Ok(metadata) => metadata,
                 Err(ReviewIdentityReadError::Git(error)) => return Err(error.into()),
-                Err(error) => exit_invalid_review_branch(error),
+                Err(error) => {
+                    indicator.finish();
+                    exit_invalid_review_branch(error)
+                }
             };
             let branch = current_branch_name(cli.verbose)?;
             match read_review_scope(&branch, cli.verbose) {
                 Ok(_) => {}
                 Err(ReviewScopeError::Git(error)) => return Err(error.into()),
-                Err(error) => exit_invalid_review_scope(error, &metadata),
+                Err(error) => {
+                    indicator.finish();
+                    exit_invalid_review_scope(error, &metadata)
+                }
             };
-            let res = approve_changes(cli.verbose);
-            match res? {
+            let approved = approve_changes(cli.verbose)?;
+            indicator.finish();
+            match approved {
                 false => println!("There are no reviewed changes to approve. Ending the review."),
                 true => println!("Reviewed changes were approved successfully."),
             };
         }
         Commands::Review(args) => {
+            let indicator = WaitIndicator::start("Preparing review branch", cli.verbose);
             let preparation = prepare_review_branch(
                 &args.to,
                 &args.from,
@@ -122,6 +133,7 @@ fn run() -> Result<(), CliError> {
                 args.stop_at.as_deref(),
                 cli.verbose,
             )?;
+            indicator.finish();
             if !preparation.has_unreviewed_changes {
                 println!("Review branch prepared successfully. However, it seems like there are no unreviewed changes.");
             } else {
@@ -129,18 +141,26 @@ fn run() -> Result<(), CliError> {
             }
         }
         Commands::Status => {
+            let indicator = WaitIndicator::start("Checking review status", cli.verbose);
             let metadata = match current_review_metadata(cli.verbose) {
                 Ok(metadata) => metadata,
                 Err(ReviewIdentityReadError::Git(error)) => return Err(error.into()),
-                Err(error) => exit_invalid_review_branch(error),
+                Err(error) => {
+                    indicator.finish();
+                    exit_invalid_review_branch(error)
+                }
             };
             let branch = current_branch_name(cli.verbose)?;
             let scope = match read_review_scope(&branch, cli.verbose) {
                 Ok(scope) => scope,
                 Err(ReviewScopeError::Git(error)) => return Err(error.into()),
-                Err(error) => exit_invalid_review_scope(error, &metadata),
+                Err(error) => {
+                    indicator.finish();
+                    exit_invalid_review_scope(error, &metadata)
+                }
             };
             let status = get_review_status(&scope.end_oid, "in current review range", cli.verbose)?;
+            indicator.finish();
             println!("📋 Review status (current range):");
             print_saved_review_identity(&metadata);
             println!(
