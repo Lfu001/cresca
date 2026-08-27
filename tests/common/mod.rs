@@ -1,3 +1,10 @@
+#![allow(
+    dead_code,
+    reason = "each integration-test target uses a different subset of this shared test utility"
+)]
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use tempfile::TempDir;
@@ -8,6 +15,34 @@ use tempfile::TempDir;
 pub struct TempGitRepo {
     pub dir: TempDir,
     pub remote_dir: TempDir,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct RepoState {
+    pub branch: String,
+    pub head: String,
+    pub local_heads: Vec<u8>,
+    pub remote_refs: Vec<u8>,
+    pub status: Vec<u8>,
+    pub cached_diff: Vec<u8>,
+    pub worktree_diff: Vec<u8>,
+    pub raw_local_config: Vec<u8>,
+    pub raw_index: Vec<u8>,
+    pub fetch_head: Option<Vec<u8>>,
+    pub orig_head: Option<Vec<u8>>,
+    pub merge_head: Option<Vec<u8>>,
+    pub cherry_pick_head: Option<Vec<u8>>,
+    pub revert_head: Option<Vec<u8>>,
+    pub directories: BTreeSet<PathBuf>,
+    pub direct_worktree: BTreeMap<PathBuf, WorktreeEntryState>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum WorktreeEntryState {
+    Directory { mode: u32 },
+    File { mode: u32, bytes: Vec<u8> },
+    Symlink { target: PathBuf },
+    Other { mode: u32 },
 }
 
 impl TempGitRepo {
@@ -54,11 +89,7 @@ impl TempGitRepo {
 
     /// Runs a git command in the repository.
     pub fn git(&self, args: &[&str]) -> Output {
-        let output = Command::new("git")
-            .args(args)
-            .current_dir(self.path())
-            .output()
-            .expect("Failed to execute git command");
+        let output = self.git_maybe(args);
 
         if !output.status.success() {
             panic!(
@@ -69,6 +100,352 @@ impl TempGitRepo {
         }
 
         output
+    }
+
+    /// Runs a git command in the repository without requiring it to succeed.
+    pub fn git_maybe(&self, args: &[&str]) -> Output {
+        Command::new("git")
+            .args(args)
+            .current_dir(self.path())
+            .output()
+            .expect("Failed to execute git command")
+    }
+
+    fn git_without_optional_locks(&self, args: &[&str]) -> Output {
+        let output = Command::new("git")
+            .args(args)
+            .env("GIT_OPTIONAL_LOCKS", "0")
+            .current_dir(self.path())
+            .output()
+            .expect("Failed to execute git command without optional locks");
+        assert!(
+            output.status.success(),
+            "Git command failed: git {}\nstderr: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output
+    }
+
+    /// Runs a git command and returns normalized UTF-8 stdout.
+    pub fn git_stdout(&self, args: &[&str]) -> String {
+        String::from_utf8(self.git(args).stdout)
+            .expect("git stdout should be UTF-8")
+            .trim()
+            .to_string()
+    }
+
+    pub fn git_config_values(&self, key: &str) -> Vec<String> {
+        let output = self.git_maybe(&["config", "--local", "--get-all", key]);
+        if !output.status.success() {
+            return Vec::new();
+        }
+        String::from_utf8(output.stdout)
+            .expect("git config value should be UTF-8")
+            .lines()
+            .map(str::to_owned)
+            .collect()
+    }
+
+    pub fn add_bare_remote(&self, name: &str) -> TempDir {
+        let remote = TempDir::new().expect("additional bare remote should be created");
+        let output = Command::new("git")
+            .args(["init", "--bare", "-b", "main"])
+            .current_dir(remote.path())
+            .output()
+            .expect("additional bare remote should initialize");
+        assert!(output.status.success());
+        self.git(&[
+            "remote",
+            "add",
+            name,
+            remote.path().to_str().expect("remote path should be UTF-8"),
+        ]);
+        remote
+    }
+
+    pub fn set_upstream(&self, local: &str, remote: &str, remote_branch: &str) {
+        self.git(&["config", &format!("branch.{local}.remote"), remote]);
+        self.git(&[
+            "config",
+            &format!("branch.{local}.merge"),
+            &format!("refs/heads/{remote_branch}"),
+        ]);
+    }
+
+    pub fn unset_upstream(&self, local: &str) {
+        for field in ["remote", "merge"] {
+            let output = self.git_maybe(&[
+                "config",
+                "--local",
+                "--unset-all",
+                &format!("branch.{local}.{field}"),
+            ]);
+            assert!(
+                output.status.success(),
+                "failed to unset branch.{local}.{field}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+
+    pub fn review_metadata_values(&self, branch: &str) -> (Vec<String>, Vec<String>, Vec<String>) {
+        (
+            self.git_config_values(&format!("branch.{branch}.cresca-version")),
+            self.git_config_values(&format!("branch.{branch}.cresca-target")),
+            self.git_config_values(&format!("branch.{branch}.cresca-source")),
+        )
+    }
+
+    pub fn review_scope_values(&self, branch: &str) -> Vec<String> {
+        self.git_config_values(&format!("branch.{branch}.cresca-scope"))
+    }
+
+    /// Resolves a revision to its object ID.
+    pub fn rev_parse(&self, revision: &str) -> String {
+        self.git_stdout(&["rev-parse", revision])
+    }
+
+    /// Returns whether a full ref exists.
+    pub fn ref_exists(&self, full_ref: &str) -> bool {
+        self.git_maybe(&["show-ref", "--verify", "--quiet", full_ref])
+            .status
+            .success()
+    }
+
+    /// Reads a UTF-8 file from the repository.
+    pub fn read_file(&self, name: &str) -> String {
+        std::fs::read_to_string(self.path().join(name)).expect("test file should be readable")
+    }
+
+    /// Returns a canonical binary-safe diff between two committed states.
+    pub fn diff(&self, old: &str, new: &str) -> Vec<u8> {
+        self.git(&[
+            "diff",
+            "--binary",
+            "--no-ext-diff",
+            "--no-renames",
+            old,
+            new,
+        ])
+        .stdout
+    }
+
+    /// Returns the canonical diff staged in the real index.
+    pub fn cached_diff(&self) -> Vec<u8> {
+        self.git(&[
+            "diff",
+            "--cached",
+            "--binary",
+            "--no-ext-diff",
+            "--no-renames",
+            "HEAD",
+        ])
+        .stdout
+    }
+
+    /// Returns the logical full worktree diff without mutating the real index.
+    pub fn worktree_diff(&self) -> Vec<u8> {
+        let index_dir = TempDir::new().expect("Failed to create temporary index directory");
+        let index_path = index_dir.path().join("index");
+
+        let run_with_index = |args: &[&str]| {
+            let output = Command::new("git")
+                .args(args)
+                .env("GIT_INDEX_FILE", &index_path)
+                .current_dir(self.path())
+                .output()
+                .expect("Failed to execute git command with temporary index");
+            assert!(
+                output.status.success(),
+                "git {} failed with temporary index: {}",
+                args.join(" "),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            output
+        };
+
+        run_with_index(&["read-tree", "HEAD"]);
+        run_with_index(&["add", "-A"]);
+        run_with_index(&[
+            "diff",
+            "--cached",
+            "--binary",
+            "--no-ext-diff",
+            "--no-renames",
+            "HEAD",
+        ])
+        .stdout
+    }
+
+    /// Returns the real index file contents without interpreting them.
+    pub fn real_index_bytes(&self) -> Vec<u8> {
+        std::fs::read(self.git_path("index")).expect("real git index should be readable")
+    }
+
+    /// Returns the local config file contents without Git normalization.
+    pub fn raw_local_config_bytes(&self) -> Vec<u8> {
+        std::fs::read(self.git_path("config")).expect("local Git config should be readable")
+    }
+
+    /// Returns every worktree directory, including empty directories.
+    pub fn directory_set(&self) -> BTreeSet<PathBuf> {
+        fn visit(root: &Path, directory: &Path, result: &mut BTreeSet<PathBuf>) {
+            for child in
+                std::fs::read_dir(directory).expect("worktree directory should be readable")
+            {
+                let child = child.expect("worktree entry should be readable");
+                if directory == root && child.file_name() == ".git" {
+                    continue;
+                }
+                let path = child.path();
+                let metadata = std::fs::symlink_metadata(&path)
+                    .expect("worktree entry metadata should be readable");
+                if metadata.is_dir() && !metadata.file_type().is_symlink() {
+                    let relative = path
+                        .strip_prefix(root)
+                        .expect("worktree directory must be under root")
+                        .to_path_buf();
+                    result.insert(relative);
+                    visit(root, &path, result);
+                }
+            }
+        }
+
+        let mut result = BTreeSet::new();
+        visit(self.path(), self.path(), &mut result);
+        result
+    }
+
+    /// Captures direct filesystem state, including ignored entries Git diffs cannot observe.
+    pub fn direct_worktree_state(&self) -> BTreeMap<PathBuf, WorktreeEntryState> {
+        fn visit(
+            root: &Path,
+            directory: &Path,
+            result: &mut BTreeMap<PathBuf, WorktreeEntryState>,
+        ) {
+            for child in
+                std::fs::read_dir(directory).expect("worktree directory should be readable")
+            {
+                let child = child.expect("worktree entry should be readable");
+                if directory == root && child.file_name() == ".git" {
+                    continue;
+                }
+                let path = child.path();
+                let relative = path
+                    .strip_prefix(root)
+                    .expect("worktree entry must be under root")
+                    .to_path_buf();
+                let metadata = std::fs::symlink_metadata(&path)
+                    .expect("worktree entry metadata should be readable");
+                let entry = if metadata.file_type().is_symlink() {
+                    WorktreeEntryState::Symlink {
+                        target: std::fs::read_link(&path)
+                            .expect("worktree symlink target should be readable"),
+                    }
+                } else if metadata.is_dir() {
+                    WorktreeEntryState::Directory {
+                        mode: metadata.mode(),
+                    }
+                } else if metadata.is_file() {
+                    WorktreeEntryState::File {
+                        mode: metadata.mode(),
+                        bytes: std::fs::read(&path).expect("worktree file should be readable"),
+                    }
+                } else {
+                    assert!(
+                        metadata.file_type().is_fifo()
+                            || metadata.file_type().is_socket()
+                            || metadata.file_type().is_block_device()
+                            || metadata.file_type().is_char_device(),
+                        "unexpected worktree entry type: {}",
+                        relative.display()
+                    );
+                    WorktreeEntryState::Other {
+                        mode: metadata.mode(),
+                    }
+                };
+                let recurse = matches!(entry, WorktreeEntryState::Directory { .. });
+                result.insert(relative, entry);
+                if recurse {
+                    visit(root, &path, result);
+                }
+            }
+        }
+
+        let mut result = BTreeMap::new();
+        visit(self.path(), self.path(), &mut result);
+        result
+    }
+
+    pub fn git_path(&self, name: &str) -> PathBuf {
+        let path = PathBuf::from(self.git_stdout(&["rev-parse", "--git-path", name]));
+        if path.is_absolute() {
+            path
+        } else {
+            self.path().join(path)
+        }
+    }
+
+    /// Captures the repository state used by integration-test assertions.
+    pub fn snapshot(&self) -> RepoState {
+        let branch = self.current_branch();
+        let head = self.rev_parse("HEAD");
+        let local_heads = self
+            .git(&[
+                "for-each-ref",
+                "--sort=refname",
+                "--format=%(refname) %(objectname)",
+                "refs/heads/",
+            ])
+            .stdout;
+        let remote_refs = self
+            .git(&[
+                "for-each-ref",
+                "--sort=refname",
+                "--format=%(refname) %(objectname)",
+                "refs/remotes/",
+            ])
+            .stdout;
+        let status = self
+            .git_without_optional_locks(&[
+                "status",
+                "--porcelain=v1",
+                "-z",
+                "--untracked-files=all",
+            ])
+            .stdout;
+        let cached_diff = self.cached_diff();
+        let worktree_diff = self.worktree_diff();
+        let raw_local_config = self.raw_local_config_bytes();
+        let raw_index = self.real_index_bytes();
+        let read_admin = |name: &str| std::fs::read(self.git_path(name)).ok();
+        let fetch_head = read_admin("FETCH_HEAD");
+        let orig_head = read_admin("ORIG_HEAD");
+        let merge_head = read_admin("MERGE_HEAD");
+        let cherry_pick_head = read_admin("CHERRY_PICK_HEAD");
+        let revert_head = read_admin("REVERT_HEAD");
+        let directories = self.directory_set();
+        let direct_worktree = self.direct_worktree_state();
+
+        RepoState {
+            branch,
+            head,
+            local_heads,
+            remote_refs,
+            status,
+            cached_diff,
+            worktree_diff,
+            raw_local_config,
+            raw_index,
+            fetch_head,
+            orig_head,
+            merge_head,
+            cherry_pick_head,
+            revert_head,
+            directories,
+            direct_worktree,
+        }
     }
 
     /// Writes a file to the repository.
@@ -97,8 +474,7 @@ impl TempGitRepo {
 
     /// Gets the current branch name.
     pub fn current_branch(&self) -> String {
-        let output = self.git(&["rev-parse", "--abbrev-ref", "HEAD"]);
-        String::from_utf8_lossy(&output.stdout).trim().to_string()
+        self.git_stdout(&["rev-parse", "--abbrev-ref", "HEAD"])
     }
 
     /// Returns the path to the cresca binary.
@@ -108,16 +484,24 @@ impl TempGitRepo {
 
     /// Runs cresca with the given arguments.
     pub fn run_cresca(&self, args: &[&str]) -> Output {
+        let home = TempDir::new().expect("isolated default Cresca home should be created");
         Command::new(Self::cresca_binary())
             .args(args)
+            .env("HOME", home.path())
+            .env("NO_COLOR", "1")
             .current_dir(self.path())
             .output()
             .expect("Failed to execute cresca")
     }
 
-    /// Checks if there are uncommitted changes.
-    pub fn has_uncommitted_changes(&self) -> bool {
-        let output = self.git(&["status", "--porcelain"]);
-        !output.stdout.is_empty()
+    /// Runs cresca with an isolated user home directory.
+    pub fn run_cresca_with_home(&self, args: &[&str], home: &Path) -> Output {
+        Command::new(Self::cresca_binary())
+            .args(args)
+            .env("HOME", home)
+            .env("NO_COLOR", "1")
+            .current_dir(self.path())
+            .output()
+            .expect("Failed to execute cresca with isolated home")
     }
 }

@@ -1,6 +1,202 @@
-use crate::progress::finish_active;
 use colored::Colorize;
-use std::process::{exit, Command, Output};
+use std::ffi::OsStr;
+use std::io::Write;
+use std::process::{Command, ExitStatus, Output, Stdio};
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct GitCommandError {
+    pub description: String,
+    pub args: Vec<String>,
+    pub status: Option<ExitStatus>,
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
+}
+
+pub const REVIEW_SCOPE_VERSION: &str = "1";
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct ReviewScope {
+    pub base_oid: String,
+    pub end_oid: String,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum ReviewScopeError {
+    Missing,
+    Duplicate,
+    UnsupportedVersion(String),
+    Invalid,
+    UnavailableCommit(String),
+    Git(GitCommandError),
+}
+
+pub(crate) fn review_config_key(branch: &str, field: &str) -> String {
+    format!("branch.{branch}.cresca-{field}")
+}
+
+pub(crate) fn review_config_values(
+    branch: &str,
+    field: &str,
+    verbose: bool,
+) -> Result<Vec<String>, GitCommandError> {
+    let key = review_config_key(branch, field);
+    let output = run_git_command(
+        "read review metadata",
+        &["config", "--local", "--get-all", &key],
+        &[1],
+        verbose,
+    )?;
+    if output.status.success() {
+        return Ok(String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .map(str::to_owned)
+            .collect());
+    }
+
+    if output.status.code() == Some(1) && output.stderr.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    Err(GitCommandError {
+        description: "read review metadata".to_string(),
+        args: vec![
+            "config".to_string(),
+            "--local".to_string(),
+            "--get-all".to_string(),
+            key,
+        ],
+        status: Some(output.status),
+        stdout: output.stdout,
+        stderr: output.stderr,
+    })
+}
+
+pub(crate) fn replace_review_config_value(
+    branch: &str,
+    field: &str,
+    value: &str,
+    description: &str,
+    verbose: bool,
+) -> Result<(), GitCommandError> {
+    let key = review_config_key(branch, field);
+    run_git_command(
+        description,
+        &["config", "--local", "--replace-all", &key, value],
+        &[],
+        verbose,
+    )?;
+    Ok(())
+}
+
+pub(crate) fn unset_review_config_values(
+    branch: &str,
+    field: &str,
+    description: &str,
+    verbose: bool,
+) -> Result<(), GitCommandError> {
+    let values = review_config_values(branch, field, verbose)?;
+    if values.is_empty() {
+        return Ok(());
+    }
+    let key = review_config_key(branch, field);
+    run_git_command(
+        description,
+        &["config", "--local", "--unset-all", &key],
+        &[],
+        verbose,
+    )?;
+    Ok(())
+}
+
+pub(crate) fn add_review_config_value(
+    branch: &str,
+    field: &str,
+    value: &str,
+    description: &str,
+    verbose: bool,
+) -> Result<(), GitCommandError> {
+    let key = review_config_key(branch, field);
+    run_git_command(
+        description,
+        &["config", "--local", "--add", &key, value],
+        &[],
+        verbose,
+    )?;
+    Ok(())
+}
+
+pub fn write_review_scope(
+    branch: &str,
+    scope: &ReviewScope,
+    verbose: bool,
+) -> Result<(), GitCommandError> {
+    let key = review_config_key(branch, "scope");
+    let value = format!(
+        "{}:{}:{}",
+        REVIEW_SCOPE_VERSION, scope.base_oid, scope.end_oid
+    );
+    run_git_command(
+        "record review range",
+        &["config", "--local", "--replace-all", &key, &value],
+        &[],
+        verbose,
+    )?;
+    Ok(())
+}
+
+pub fn read_review_scope(branch: &str, verbose: bool) -> Result<ReviewScope, ReviewScopeError> {
+    let values = review_config_values(branch, "scope", verbose).map_err(ReviewScopeError::Git)?;
+    let value = match values.as_slice() {
+        [] => return Err(ReviewScopeError::Missing),
+        [value] => value,
+        _ => return Err(ReviewScopeError::Duplicate),
+    };
+    let mut fields = value.split(':');
+    let (Some(version), Some(base_oid), Some(end_oid), None) =
+        (fields.next(), fields.next(), fields.next(), fields.next())
+    else {
+        return Err(ReviewScopeError::Invalid);
+    };
+    if version != REVIEW_SCOPE_VERSION {
+        return Err(ReviewScopeError::UnsupportedVersion(version.to_string()));
+    }
+    let valid_oid = |oid: &str| {
+        !oid.is_empty() && oid.len() == 40 && oid.bytes().all(|byte| byte.is_ascii_hexdigit())
+    };
+    if !valid_oid(base_oid) || !valid_oid(end_oid) {
+        return Err(ReviewScopeError::Invalid);
+    }
+    let revisions = format!("{base_oid}^{{commit}}\n{end_oid}^{{commit}}\n");
+    let output = run_git_command_with_input(
+        "validate review range endpoint",
+        &["cat-file", "--batch-check=%(objectname)"],
+        revisions.as_bytes(),
+        &[],
+        verbose,
+    )
+    .map_err(ReviewScopeError::Git)?;
+    let results: Vec<_> = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::to_owned)
+        .collect();
+    let expected = [base_oid, end_oid];
+    if let Some((_, missing_oid)) = results
+        .iter()
+        .zip(&expected)
+        .find(|(result, _)| result.ends_with(" missing"))
+    {
+        return Err(ReviewScopeError::UnavailableCommit(
+            (*missing_oid).to_string(),
+        ));
+    }
+    if results != expected {
+        return Err(ReviewScopeError::Invalid);
+    }
+    Ok(ReviewScope {
+        base_oid: base_oid.to_string(),
+        end_oid: end_oid.to_string(),
+    })
+}
 
 /// Run a git command and return the output
 ///
@@ -8,42 +204,156 @@ use std::process::{exit, Command, Output};
 ///
 /// * `description` - The description of the git command.
 /// * `args` - The arguments to pass to the git command.
-/// * `maybe_error` - Whether the git command might fail intentionally.
+/// * `allowed_exit_codes` - Exact nonzero exit codes accepted for an expected negative probe.
 /// * `verbose` - Whether to print the git command and its output.
 ///
 /// # Returns
 ///
-/// * `std::process::Output` - The output of the git command.
+/// * `Result<Output, GitCommandError>` - The output, or a fully captured Git failure.
 pub fn run_git_command(
     description: &str,
     args: &[&str],
-    maybe_error: bool,
+    allowed_exit_codes: &[i32],
     verbose: bool,
-) -> Output {
+) -> Result<Output, GitCommandError> {
     if verbose {
         println!("[git {}]", args.join(" ").yellow());
     }
-    let output = Command::new("git").args(args).output();
+    let mut command = Command::new("git");
+    command.args(args);
+    if args.first() == Some(&"status") {
+        command.env("GIT_OPTIONAL_LOCKS", "0");
+    }
+    evaluate_git_output(
+        description,
+        args,
+        allowed_exit_codes,
+        verbose,
+        true,
+        command.output(),
+    )
+}
+
+/// Run a command that returns machine-readable stdout. Verbose mode still logs the command, but
+/// never writes raw machine records to the terminal.
+pub fn run_git_command_machine_output(
+    description: &str,
+    args: &[&str],
+    allowed_exit_codes: &[i32],
+    verbose: bool,
+) -> Result<Output, GitCommandError> {
+    if verbose {
+        println!("[git {}]", args.join(" ").yellow());
+    }
+    let mut command = Command::new("git");
+    command.args(args);
+    evaluate_git_output(
+        description,
+        args,
+        allowed_exit_codes,
+        verbose,
+        false,
+        command.output(),
+    )
+}
+
+pub fn run_git_command_with_env(
+    description: &str,
+    args: &[&str],
+    env: &[(&str, &OsStr)],
+    allowed_exit_codes: &[i32],
+    verbose: bool,
+) -> Result<Output, GitCommandError> {
+    if verbose {
+        println!("[git {}]", args.join(" ").yellow());
+    }
+    let mut command = Command::new("git");
+    command.args(args);
+    for (key, value) in env {
+        command.env(key, value);
+    }
+    evaluate_git_output(
+        description,
+        args,
+        allowed_exit_codes,
+        verbose,
+        true,
+        command.output(),
+    )
+}
+
+pub fn run_git_command_with_input(
+    description: &str,
+    args: &[&str],
+    input: &[u8],
+    allowed_exit_codes: &[i32],
+    verbose: bool,
+) -> Result<Output, GitCommandError> {
+    if verbose {
+        println!("[git {}]", args.join(" ").yellow());
+    }
+    let mut command = Command::new("git");
+    command
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let output = match command.spawn() {
+        Ok(mut child) => {
+            let write_result = child
+                .stdin
+                .take()
+                .expect("piped Git stdin must be available")
+                .write_all(input);
+            match (write_result, child.wait_with_output()) {
+                (Err(error), Ok(output)) if output.status.success() => Err(error),
+                (_, output) => output,
+            }
+        }
+        Err(error) => Err(error),
+    };
+    evaluate_git_output(description, args, allowed_exit_codes, verbose, true, output)
+}
+
+fn evaluate_git_output(
+    description: &str,
+    args: &[&str],
+    allowed_exit_codes: &[i32],
+    verbose: bool,
+    print_success_stdout: bool,
+    output: std::io::Result<Output>,
+) -> Result<Output, GitCommandError> {
     match output {
         Ok(output) => {
-            if output.status.success() && !output.stdout.is_empty() && verbose {
+            if output.status.success()
+                && !output.stdout.is_empty()
+                && verbose
+                && print_success_stdout
+            {
                 println!("{}", String::from_utf8_lossy(&output.stdout));
             }
-            if !output.status.success() && !maybe_error {
-                finish_active();
-                eprintln!("{}: Failed to {}.", "error".red().bold(), description);
-                eprintln!("Original error from git:");
-                eprintln!("\t{}", String::from_utf8_lossy(&output.stderr));
-                exit(1);
+            let allowed = output
+                .status
+                .code()
+                .is_some_and(|code| allowed_exit_codes.contains(&code));
+            if !output.status.success() && !allowed {
+                return Err(GitCommandError {
+                    description: description.to_string(),
+                    args: args.iter().map(|arg| (*arg).to_string()).collect(),
+                    status: Some(output.status),
+                    stdout: output.stdout,
+                    stderr: output.stderr,
+                });
             }
-            output
+            Ok(output)
         }
-        Err(e) => {
-            finish_active();
-            eprintln!("{}: Failed to {}.", "error".red().bold(), description);
-            eprintln!("{}", e);
-            exit(1);
-        }
+        Err(e) => Err(GitCommandError {
+            description: description.to_string(),
+            args: args.iter().map(|arg| (*arg).to_string()).collect(),
+            status: None,
+            stdout: Vec::new(),
+            stderr: e.to_string().into_bytes(),
+        }),
     }
 }
 
@@ -52,199 +362,34 @@ pub fn run_git_command(
 /// # Arguments
 ///
 /// * `verbose` - Whether to print the git command and its output.
-pub fn is_clean(verbose: bool) -> bool {
-    run_git_command(
+pub fn is_clean(verbose: bool) -> Result<bool, GitCommandError> {
+    Ok(run_git_command(
         "check working directory status",
         &["status", "--porcelain"],
-        false,
+        &[],
         verbose,
-    )
+    )?
     .stdout
-    .is_empty()
+    .is_empty())
 }
 
-/// Check if the current branch is a review branch
-///
-/// # Arguments
-///
-/// * `verbose` - Whether to print the git command and its output.
-pub fn is_review_branch(verbose: bool) -> bool {
+pub fn current_branch_name(verbose: bool) -> Result<String, GitCommandError> {
     let output = run_git_command(
         "get current branch",
         &["rev-parse", "--abbrev-ref", "HEAD"],
-        false,
+        &[],
         verbose,
-    );
-    let branch_name = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    branch_name.starts_with("review")
+    )?;
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
-/// Get review branch info (to_branch, from_branch) from current branch name
-///
-/// # Arguments
-///
-/// * `verbose` - Whether to print the git command and its output.
-///
-/// # Returns
-///
-/// * `Option<(String, String)>` - (to_branch, from_branch) if on a review branch, None otherwise
-pub fn get_review_branch_info(verbose: bool) -> Option<(String, String)> {
-    let output = run_git_command(
-        "get current branch",
-        &["rev-parse", "--abbrev-ref", "HEAD"],
-        false,
-        verbose,
-    );
-    let branch_name = String::from_utf8_lossy(&output.stdout).trim().to_string();
-
-    if !branch_name.starts_with("review-") {
-        return None;
-    }
-
-    // Parse "review-{to}-{from}" format
-    let rest = branch_name.strip_prefix("review-")?;
-    let parts: Vec<&str> = rest.splitn(2, '-').collect();
-    if parts.len() == 2 {
-        Some((parts[0].to_string(), parts[1].to_string()))
-    } else {
-        None
-    }
-}
-
-/// Resolved remote tracking branch information.
-pub struct ResolvedBranch {
-    /// The remote name (e.g. "origin", "upstream")
-    pub remote: String,
-    /// The local branch name on the remote (e.g. "develop", "feature/login")
-    pub remote_branch: String,
-    /// The full tracking ref (e.g. "origin/develop")
-    pub tracking_ref: String,
-}
-
-/// Resolves a branch name to its remote tracking branch information.
-///
-/// It checks:
-/// 1. If it's already a valid remote tracking branch (e.g., origin/main).
-/// 2. If it's a local branch with an upstream configured (e.g., @{upstream}).
-/// 3. Fallback: assumes it's on 'origin' if it exists there.
-pub fn resolve_remote_tracking_branch(branch_or_ref: &str, verbose: bool) -> ResolvedBranch {
-    // 1. Check if it's already a valid remote-tracking branch
-    let verify_output = run_git_command(
-        "verify if branch is already a remote tracking branch",
-        &[
-            "rev-parse",
-            "--verify",
-            "--quiet",
-            &format!("refs/remotes/{}", branch_or_ref),
-        ],
-        true,
-        verbose,
-    );
-
-    if verify_output.status.success() {
-        // It's a remote tracking branch. We need to split it into remote and branch.
-        // Assuming format is <remote>/<branch_name>. We can get remotes to find the remote name.
-        let remotes_output = run_git_command("get remotes", &["remote"], false, verbose);
-        let remotes_str = String::from_utf8_lossy(&remotes_output.stdout);
-        let mut best_remote = String::new();
-        for remote in remotes_str.lines() {
-            let remote = remote.trim();
-            if branch_or_ref.starts_with(&format!("{}/", remote))
-                && remote.len() > best_remote.len()
-            {
-                best_remote = remote.to_string();
-            }
-        }
-
-        if !best_remote.is_empty() {
-            let remote_branch = branch_or_ref
-                .strip_prefix(&format!("{}/", best_remote))
-                .unwrap()
-                .to_string();
-            return ResolvedBranch {
-                remote: best_remote,
-                remote_branch,
-                tracking_ref: branch_or_ref.to_string(),
-            };
-        }
-    }
-
-    // 2. Check if it's a local branch with an upstream configured
-    let upstream_output = run_git_command(
-        "get upstream branch",
-        &[
-            "rev-parse",
-            "--abbrev-ref",
-            &format!("{}@{{upstream}}", branch_or_ref),
-        ],
-        true,
-        verbose,
-    );
-
-    if upstream_output.status.success() {
-        let tracking_ref = String::from_utf8_lossy(&upstream_output.stdout)
-            .trim()
-            .to_string();
-
-        // Extract remote and remote_branch from tracking_ref using the configured remote for the branch
-        let remote_output = run_git_command(
-            "get configured remote",
-            &["config", &format!("branch.{}.remote", branch_or_ref)],
-            true,
-            verbose,
-        );
-
-        let remote = if remote_output.status.success() {
-            String::from_utf8_lossy(&remote_output.stdout)
-                .trim()
-                .to_string()
-        } else {
-            "origin".to_string() // fallback if something is weird
-        };
-
-        let remote_branch = if tracking_ref.starts_with(&format!("{}/", remote)) {
-            tracking_ref
-                .strip_prefix(&format!("{}/", remote))
-                .unwrap()
-                .to_string()
-        } else {
-            branch_or_ref.to_string() // fallback
-        };
-
-        return ResolvedBranch {
-            remote,
-            remote_branch,
-            tracking_ref,
-        };
-    }
-
-    // 3. Fallback: check if the branch exists on any remote (default to 'origin' if it's there)
-    // First, let's just see if it exists on origin.
-    let ls_remote_output = run_git_command(
-        "check if branch exists on origin",
-        &[
-            "ls-remote",
-            "--exit-code",
-            "origin",
-            &format!("refs/heads/{}", branch_or_ref),
-        ],
-        true,
-        verbose,
-    );
-
-    if ls_remote_output.status.success() {
-        return ResolvedBranch {
-            remote: "origin".to_string(),
-            remote_branch: branch_or_ref.to_string(),
-            tracking_ref: format!("origin/{}", branch_or_ref),
-        };
-    }
-
-    // If we reach here, we can't reliably resolve it. Default to origin/branch and let git fail natively later
-    // if it's really invalid.
-    ResolvedBranch {
-        remote: "origin".to_string(),
-        remote_branch: branch_or_ref.to_string(),
-        tracking_ref: format!("origin/{}", branch_or_ref),
-    }
+pub fn current_review_metadata(
+    verbose: bool,
+) -> Result<
+    crate::review_identity::StoredReviewIdentity,
+    crate::review_identity::ReviewIdentityReadError,
+> {
+    let branch = current_branch_name(verbose)
+        .map_err(crate::review_identity::ReviewIdentityReadError::Git)?;
+    crate::review_identity::read_stored_review_identity(&branch, verbose)
 }
