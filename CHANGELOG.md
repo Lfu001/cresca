@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0](https://github.com/Lfu001/cresca/compare/v0.5.0...v0.6.0) - 2026-08-27
+
+### Added
+
+- *(review)* resolve canonical branch references ([#28](https://github.com/Lfu001/cresca/pull/28))
+- *(cli)* add wait indicators for long-running commands ([#30](https://github.com/Lfu001/cresca/pull/30))
+
 ## [0.5.0](https://github.com/Lfu001/cresca/compare/v0.4.0...v0.5.0) - 2026-08-20
 
 ### Added
