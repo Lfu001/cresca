@@ -1,3 +1,4 @@
+use crate::progress::finish_active;
 use colored::Colorize;
 use std::process::{exit, Command, Output};
 
@@ -29,6 +30,7 @@ pub fn run_git_command(
                 println!("{}", String::from_utf8_lossy(&output.stdout));
             }
             if !output.status.success() && !maybe_error {
+                finish_active();
                 eprintln!("{}: Failed to {}.", "error".red().bold(), description);
                 eprintln!("Original error from git:");
                 eprintln!("\t{}", String::from_utf8_lossy(&output.stderr));
@@ -37,6 +39,7 @@ pub fn run_git_command(
             output
         }
         Err(e) => {
+            finish_active();
             eprintln!("{}: Failed to {}.", "error".red().bold(), description);
             eprintln!("{}", e);
             exit(1);

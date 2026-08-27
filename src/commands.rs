@@ -1,4 +1,5 @@
 use crate::git::{resolve_remote_tracking_branch, run_git_command};
+use crate::progress::finish_active;
 use colored::Colorize;
 use std::ops::Not;
 use std::process::exit;
@@ -68,6 +69,7 @@ pub fn prepare_review_branch(
     if let Some(hash) = skip_to {
         let is_valid = valid_hashes.iter().any(|line| line.starts_with(hash));
         if !is_valid {
+            finish_active();
             eprintln!(
                 "{}: Commit {} is not in the range {}..{}",
                 "error".red().bold(),
@@ -84,6 +86,7 @@ pub fn prepare_review_branch(
         // stop_at must be in the valid range
         let is_valid = valid_hashes.iter().any(|line| line.starts_with(hash));
         if !is_valid {
+            finish_active();
             eprintln!(
                 "{}: Commit {} is not in the range {}..{}",
                 "error".red().bold(),
@@ -114,6 +117,7 @@ pub fn prepare_review_branch(
                 .any(|line| line.starts_with(hash) && line.starts_with(skip_hash));
 
             if !is_after_skip && !stop_at_equals_skip_to {
+                finish_active();
                 eprintln!(
                     "{}: --stop-at ({}) must be at or after --skip-to ({})",
                     "error".red().bold(),
@@ -165,7 +169,7 @@ pub fn prepare_review_branch(
         // Check if there are commits before skip_to
         let has_earlier = run_git_command(
             "check earlier commits",
-            &["rev-list", &format!("{}..{}", merge_base, &parent)],
+            &["rev-list", &format!("{}..{}", merge_base, parent)],
             true,
             verbose,
         );

@@ -2,6 +2,158 @@ mod common;
 
 use common::TempGitRepo;
 
+#[cfg(unix)]
+use std::ffi::OsString;
+#[cfg(unix)]
+use std::fs::File;
+#[cfg(unix)]
+use std::io::Read;
+#[cfg(unix)]
+use std::os::fd::FromRawFd;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+#[cfg(unix)]
+use std::path::PathBuf;
+#[cfg(unix)]
+use std::process::{Command, Output, Stdio};
+#[cfg(unix)]
+use std::sync::mpsc;
+#[cfg(unix)]
+use std::thread;
+#[cfg(unix)]
+use std::time::Duration;
+#[cfg(unix)]
+use tempfile::TempDir;
+
+#[cfg(unix)]
+struct SlowGit {
+    _directory: TempDir,
+    path: OsString,
+    real_path: OsString,
+    marker: PathBuf,
+}
+
+#[cfg(unix)]
+impl SlowGit {
+    fn new() -> Self {
+        let directory = TempDir::new().unwrap();
+        let wrapper_path = directory.path().join("git");
+        std::fs::write(
+            &wrapper_path,
+            "#!/bin/sh\nif [ ! -e \"$CRESCA_SLOW_GIT_MARKER\" ]; then\n  : > \"$CRESCA_SLOW_GIT_MARKER\"\n  sleep 0.35\nfi\nPATH=\"$CRESCA_REAL_PATH\" exec git \"$@\"\n",
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&wrapper_path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&wrapper_path, permissions).unwrap();
+
+        let mut path = directory.path().as_os_str().to_os_string();
+        path.push(":");
+        let real_path = std::env::var_os("PATH").unwrap();
+        path.push(&real_path);
+        let marker = directory.path().join("first-git-finished");
+
+        Self {
+            _directory: directory,
+            path,
+            real_path,
+            marker,
+        }
+    }
+}
+
+#[cfg(unix)]
+fn repo_with_reviewable_change(file_name: &str) -> TempGitRepo {
+    let repo = TempGitRepo::new();
+    repo.create_branch("develop");
+    repo.write_file(file_name, "new feature");
+    repo.git(&["add", "."]);
+    repo.commit("Add feature");
+    repo.git(&["push", "-u", "origin", "develop"]);
+    repo.switch_branch("main");
+    repo
+}
+
+#[cfg(unix)]
+fn run_cresca_with_stderr_pty(repo: &TempGitRepo, args: &[&str], slow_git: &SlowGit) -> Output {
+    run_cresca_with_stderr_pty_inner(repo, args, slow_git, false)
+}
+
+#[cfg(unix)]
+fn run_cresca_with_stderr_pty_inner(
+    repo: &TempGitRepo,
+    args: &[&str],
+    slow_git: &SlowGit,
+    interrupt_when_progress_is_visible: bool,
+) -> Output {
+    let mut master_fd = -1;
+    let mut slave_fd = -1;
+    let result = unsafe {
+        libc::openpty(
+            &mut master_fd,
+            &mut slave_fd,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    assert_eq!(result, 0, "failed to open a pseudo-terminal");
+
+    let mut master = unsafe { File::from_raw_fd(master_fd) };
+    let slave = unsafe { File::from_raw_fd(slave_fd) };
+    let (progress_sender, progress_receiver) = mpsc::channel();
+    let reader = thread::spawn(move || {
+        let mut output = Vec::new();
+        let mut buffer = [0; 1024];
+        let mut progress_reported = false;
+        loop {
+            match master.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(bytes_read) => {
+                    output.extend_from_slice(&buffer[..bytes_read]);
+                    if !progress_reported
+                        && output
+                            .windows("Preparing review branch".len())
+                            .any(|window| window == b"Preparing review branch")
+                    {
+                        progress_reported = true;
+                        let _ = progress_sender.send(());
+                    }
+                }
+                Err(error) if error.raw_os_error() == Some(libc::EIO) => break,
+                Err(error) => panic!("failed to read pseudo-terminal: {error}"),
+            }
+        }
+        output
+    });
+
+    let child = Command::new(TempGitRepo::cresca_binary())
+        .args(args)
+        .current_dir(repo.path())
+        .env("PATH", &slow_git.path)
+        .env("CRESCA_REAL_PATH", &slow_git.real_path)
+        .env("CRESCA_SLOW_GIT_MARKER", &slow_git.marker)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::from(slave))
+        .spawn()
+        .expect("Failed to execute cresca");
+    if interrupt_when_progress_is_visible {
+        progress_receiver
+            .recv_timeout(Duration::from_secs(2))
+            .expect("progress did not become visible before interrupt");
+        let result = unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGINT) };
+        assert_eq!(result, 0, "failed to interrupt cresca");
+    }
+    let output = child.wait_with_output().expect("Failed to wait for cresca");
+    let stderr = reader.join().expect("pseudo-terminal reader panicked");
+
+    Output {
+        status: output.status,
+        stdout: output.stdout,
+        stderr,
+    }
+}
+
 /// Test that `cresca review` creates a review branch with the correct name.
 #[test]
 fn test_review_creates_branch() {
@@ -29,6 +181,75 @@ fn test_review_creates_branch() {
     // Verify we're now on the review branch
     let current = repo.current_branch();
     assert_eq!(current, "review-main-develop");
+}
+
+/// Test that progress remains visible on an interactive stderr while stdout is piped.
+#[cfg(unix)]
+#[test]
+fn test_review_shows_progress_on_stderr_tty_when_stdout_is_piped() {
+    let repo = repo_with_reviewable_change("feature.txt");
+
+    let slow_git = SlowGit::new();
+    let output = run_cresca_with_stderr_pty(&repo, &["review", "main", "develop"], &slow_git);
+
+    assert!(
+        output.status.success(),
+        "cresca review should succeed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stdout.contains("Review branch prepared successfully"));
+    assert!(!stdout.contains("Preparing review branch"));
+    assert!(stderr.contains("⠋ Preparing review branch"));
+    assert!(stderr.ends_with("\r\x1b[2K"));
+}
+
+/// Test that verbose Git output replaces animated progress.
+#[cfg(unix)]
+#[test]
+fn test_review_verbose_mode_does_not_show_progress() {
+    let repo = repo_with_reviewable_change("feature.txt");
+
+    let slow_git = SlowGit::new();
+    let output = run_cresca_with_stderr_pty(
+        &repo,
+        &["--verbose", "review", "main", "develop"],
+        &slow_git,
+    );
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stdout.contains("[git status --porcelain]"));
+    assert!(!stdout.contains("Preparing review branch"));
+    assert!(!stderr.contains("Preparing review branch"));
+    assert!(!stderr.contains("\x1b[2K"));
+}
+
+/// Test that captured stderr never receives animated progress or control sequences.
+#[cfg(unix)]
+#[test]
+fn test_review_non_tty_stderr_does_not_show_progress() {
+    let repo = repo_with_reviewable_change("feature.txt");
+
+    let slow_git = SlowGit::new();
+    let output = Command::new(TempGitRepo::cresca_binary())
+        .args(["review", "main", "develop"])
+        .current_dir(repo.path())
+        .env("PATH", &slow_git.path)
+        .env("CRESCA_REAL_PATH", &slow_git.real_path)
+        .env("CRESCA_SLOW_GIT_MARKER", &slow_git.marker)
+        .output()
+        .expect("Failed to execute cresca");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(!stdout.contains("Preparing review branch"));
+    assert!(!stderr.contains("Preparing review branch"));
+    assert!(!stderr.contains("\x1b[2K"));
 }
 
 /// Test that `cresca review` shows the diff as unstaged changes.
@@ -113,6 +334,30 @@ fn test_approve_commits_staged() {
         !repo.has_uncommitted_changes(),
         "Working directory should be clean after approve"
     );
+}
+
+/// Test that `cresca approve` reports progress when its stderr is interactive.
+#[cfg(unix)]
+#[test]
+fn test_approve_shows_progress_on_stderr_tty() {
+    let repo = repo_with_reviewable_change("reviewed.txt");
+    repo.run_cresca(&["review", "main", "develop"]);
+    repo.git(&["add", "reviewed.txt"]);
+
+    let slow_git = SlowGit::new();
+    let output = run_cresca_with_stderr_pty(&repo, &["approve"], &slow_git);
+
+    assert!(
+        output.status.success(),
+        "cresca approve should succeed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stdout.contains("Reviewed changes were approved successfully"));
+    assert!(stderr.contains("⠋ Approving reviewed changes"));
+    assert!(stderr.ends_with("\r\x1b[2K"));
 }
 
 /// Test that `cresca approve` fails on a non-review branch.
@@ -350,6 +595,29 @@ fn test_status_shows_diff_stats() {
     assert!(stdout.contains("2 file(s)"), "Should show 2 files changed");
     assert!(stdout.contains("feature1.txt"), "Should list feature1.txt");
     assert!(stdout.contains("feature2.txt"), "Should list feature2.txt");
+}
+
+/// Test that `cresca status` reports progress when its stderr is interactive.
+#[cfg(unix)]
+#[test]
+fn test_status_shows_progress_on_stderr_tty() {
+    let repo = repo_with_reviewable_change("feature.txt");
+    repo.run_cresca(&["review", "main", "develop"]);
+
+    let slow_git = SlowGit::new();
+    let output = run_cresca_with_stderr_pty(&repo, &["status"], &slow_git);
+
+    assert!(
+        output.status.success(),
+        "cresca status should succeed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stdout.contains("Review status"));
+    assert!(stderr.contains("⠋ Checking review status"));
+    assert!(stderr.ends_with("\r\x1b[2K"));
 }
 
 /// Test that `cresca status` fails on a non-review branch.
@@ -600,6 +868,77 @@ fn test_review_with_invalid_stop_at() {
         "Should show error about invalid commit hash, got: {}",
         stderr
     );
+}
+
+/// Test that an error clears visible progress before printing diagnostics.
+#[cfg(unix)]
+#[test]
+fn test_review_clears_progress_before_error_output() {
+    let repo = repo_with_reviewable_change("feature.txt");
+
+    let slow_git = SlowGit::new();
+    let output = run_cresca_with_stderr_pty(
+        &repo,
+        &["review", "main", "develop", "--stop-at", "invalidhash"],
+        &slow_git,
+    );
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    let clear_position = stderr
+        .find("\r\x1b[2K")
+        .expect("visible progress should be cleared on failure");
+    let error_position = stderr
+        .find("error:")
+        .expect("error message should be printed");
+    assert!(
+        clear_position < error_position,
+        "progress must be cleared before diagnostics: {stderr:?}"
+    );
+    assert!(stderr.contains("invalidhash"));
+}
+
+/// Test that a Git failure clears visible progress before printing diagnostics.
+#[cfg(unix)]
+#[test]
+fn test_review_clears_progress_before_git_error_output() {
+    let repo = repo_with_reviewable_change("feature.txt");
+    repo.git(&["remote", "set-url", "origin", "/path/that/does/not/exist"]);
+
+    let slow_git = SlowGit::new();
+    let output = run_cresca_with_stderr_pty(&repo, &["review", "main", "develop"], &slow_git);
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    let clear_position = stderr
+        .find("\r\x1b[2K")
+        .expect("visible progress should be cleared on Git failure");
+    let error_position = stderr.find("error:").expect("Git error should be printed");
+    assert!(
+        clear_position < error_position,
+        "progress must be cleared before Git diagnostics: {stderr:?}"
+    );
+    assert!(stderr.contains("Failed to fetch target branch"));
+}
+
+/// Test that Ctrl-C clears visible progress before exiting.
+#[cfg(unix)]
+#[test]
+fn test_review_clears_progress_on_interrupt() {
+    let repo = repo_with_reviewable_change("feature.txt");
+
+    let slow_git = SlowGit::new();
+    let output =
+        run_cresca_with_stderr_pty_inner(&repo, &["review", "main", "develop"], &slow_git, true);
+
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(130),
+        "unexpected interrupt status; stderr: {stderr:?}"
+    );
+    assert!(stderr.contains("⠋ Preparing review branch"));
+    assert!(stderr.ends_with("\r\x1b[2K"));
 }
 
 /// Test that `cresca review` fails when --stop-at is before --skip-to.

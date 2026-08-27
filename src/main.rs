@@ -1,11 +1,13 @@
 mod commands;
 mod git;
+mod progress;
 
 use clap::builder::styling::{AnsiColor, Effects};
 use clap::{builder::Styles, ArgAction, Args, Parser, Subcommand};
 use colored::Colorize;
 use commands::{approve_changes, get_review_status, prepare_review_branch};
 use git::{get_review_branch_info, is_clean, is_review_branch};
+use progress::WaitIndicator;
 use std::process::exit;
 
 const STYLES: Styles = Styles::styled()
@@ -67,8 +69,10 @@ fn main() {
 
     match &cli.command {
         Commands::Approve => {
+            let indicator = WaitIndicator::start("Approving reviewed changes", cli.verbose);
             if is_review_branch(cli.verbose) {
                 let res = approve_changes(cli.verbose);
+                indicator.finish();
                 match res {
                     Err(_) => {
                         println!("There are no reviewed changes to approve. Ending the review.",)
@@ -76,6 +80,7 @@ fn main() {
                     Ok(_) => println!("Reviewed changes were approved successfully.",),
                 };
             } else {
+                indicator.finish();
                 eprintln!(
                     "{}: Not on a review branch; run `{}` to prepare a review branch.",
                     "error".red().bold(),
@@ -85,7 +90,9 @@ fn main() {
             }
         }
         Commands::Review(args) => {
+            let indicator = WaitIndicator::start("Preparing review branch", cli.verbose);
             if !is_clean(cli.verbose) {
+                indicator.finish();
                 eprintln!("{}: Uncommitted changes found. Please commit or stash them before starting review.", "error".red().bold());
                 exit(1);
             }
@@ -97,15 +104,19 @@ fn main() {
                 args.stop_at.as_deref(),
                 cli.verbose,
             );
-            if is_clean(cli.verbose) {
+            let is_clean = is_clean(cli.verbose);
+            indicator.finish();
+            if is_clean {
                 println!("Review branch prepared successfully. However, it seems like there are no unreviewed changes.");
             } else {
                 println!("Review branch prepared successfully. Stage the changes you have reviewed and run `{}` to approve them.", "cresca approve".green());
             }
         }
         Commands::Status => {
+            let indicator = WaitIndicator::start("Checking review status", cli.verbose);
             if let Some((_, from_branch)) = get_review_branch_info(cli.verbose) {
                 let status = get_review_status(&from_branch, cli.verbose);
+                indicator.finish();
                 println!("📋 Review status:");
                 println!(
                     "  Remaining diff to {}: {} file(s), {} insertion(s), {} deletion(s)",
@@ -128,6 +139,7 @@ fn main() {
                     }
                 }
             } else {
+                indicator.finish();
                 eprintln!(
                     "{}: Not on a review branch; run `{}` to prepare a review branch.",
                     "error".red().bold(),
