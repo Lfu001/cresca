@@ -4750,6 +4750,69 @@ fn test_review_with_skip_to_and_stop_at() {
     assert!(!repo.path().join("d.txt").exists());
 }
 
+// Production break caught: treating the target tip as the merge base while
+// auto-approving pre-skip changes drops cleanly merged target-only content from
+// the review HEAD, so that content incorrectly reappears as an unreviewed diff.
+#[test]
+fn test_skip_to_before_clean_target_merge_keeps_target_changes_out_of_review() {
+    let repo = TempGitRepo::new();
+
+    repo.create_branch("develop");
+    repo.write_file("approved-source.txt", "source change before review range\n");
+    repo.git(&["add", "approved-source.txt"]);
+    repo.commit("Add source change before review range");
+
+    repo.write_file("reviewed-source.txt", "source change in review range\n");
+    repo.git(&["add", "reviewed-source.txt"]);
+    repo.commit("Add source change in review range");
+    let skip_to = repo.rev_parse("HEAD");
+
+    repo.switch_branch("main");
+    repo.write_file("target-only.txt", "clean target-only change\n");
+    repo.git(&["add", "target-only.txt"]);
+    repo.commit("Advance target before clean merge");
+    repo.git(&["push", "origin", "main"]);
+
+    repo.switch_branch("develop");
+    repo.git(&["merge", "--no-ff", "--no-edit", "main"]);
+    let stop_at = repo.rev_parse("HEAD");
+    repo.git(&["push", "-u", "origin", "develop"]);
+    repo.switch_branch("main");
+
+    let output = repo.run_cresca(&[
+        "review",
+        "main",
+        "develop",
+        "--skip-to",
+        &skip_to,
+        "--stop-at",
+        &stop_at,
+    ]);
+    assert!(
+        output.status.success(),
+        "cresca review across a clean target merge should succeed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    assert_eq!(
+        repo.git_stdout(&["show", "HEAD:approved-source.txt"]),
+        "source change before review range"
+    );
+    assert_eq!(
+        repo.git_stdout(&["show", "HEAD:target-only.txt"]),
+        "clean target-only change"
+    );
+    assert!(!repo
+        .git_maybe(&["cat-file", "-e", "HEAD:reviewed-source.txt"])
+        .status
+        .success());
+    assert_eq!(
+        repo.git_stdout(&["status", "--porcelain", "--untracked-files=all"]),
+        "?? reviewed-source.txt"
+    );
+}
+
 #[test]
 fn test_review_with_skip_to_and_stop_at_same_commit_includes_that_commit() {
     let (repo, range) = setup_linear_range();
