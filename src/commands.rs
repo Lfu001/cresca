@@ -267,12 +267,13 @@ fn merge_auto_approved_tree(
     auto_approve_parent: &str,
     verbose: bool,
 ) -> Result<String, ReviewError> {
+    let merge_base = find_unique_merge_base(base, auto_approve_parent, verbose)?;
     let output = run_git_command(
         "compose explicitly auto-approved tree",
         &[
             "merge-tree",
             "--write-tree",
-            &format!("--merge-base={base}"),
+            &format!("--merge-base={merge_base}"),
             "-Xtheirs",
             "-Xfind-renames=100%",
             "--no-messages",
