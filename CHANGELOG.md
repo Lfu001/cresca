@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.1](https://github.com/Lfu001/cresca/compare/v0.6.0...v0.6.1) - 2026-08-31
+
+### Fixed
+
+- *(review)* preserve target changes across skipped merge ranges ([#31](https://github.com/Lfu001/cresca/pull/31))
+
 ## [0.6.0](https://github.com/Lfu001/cresca/compare/v0.5.0...v0.6.0) - 2026-08-27
 
 ### Added
