@@ -45,6 +45,7 @@ pub fn prepare_review_branch(
     skip_to: Option<&str>,
     stop_at: Option<&str>,
     verbose: bool,
+    progress: &dyn Fn(u8),
 ) -> Result<ReviewPreparation, ReviewError> {
     let root = ReviewTransaction::repository_root(verbose)?;
     std::env::set_current_dir(&root).map_err(|error| {
@@ -60,9 +61,12 @@ pub fn prepare_review_branch(
         ));
     }
 
-    let plan = prepare_review_plan(to_branch, from_branch, skip_to, stop_at, verbose)?;
+    progress(10);
+    let plan = prepare_review_plan(to_branch, from_branch, skip_to, stop_at, verbose, progress)?;
+    progress(50);
     let mut transaction = ReviewTransaction::begin(root, verbose)?;
-    transaction.execute(|| apply_review_plan(plan, verbose))
+    progress(65);
+    transaction.execute(|| apply_review_plan(plan, verbose, progress))
 }
 
 fn prepare_review_plan(
@@ -71,9 +75,11 @@ fn prepare_review_plan(
     skip_to: Option<&str>,
     stop_at: Option<&str>,
     verbose: bool,
+    progress: &dyn Fn(u8),
 ) -> Result<ReviewPlan, ReviewError> {
     let resolved_to = resolve_branch(to_branch, verbose)?;
     let resolved_from = resolve_branch(from_branch, verbose)?;
+    progress(30);
     if resolved_to.canonical == resolved_from.canonical {
         return Err(ReviewError::Message(
             "Target and source resolve to the same branch. Choose two distinct branch identities."
@@ -120,6 +126,7 @@ fn prepare_review_plan(
         }
     };
 
+    progress(40);
     let scope_end_revision = stop_at.unwrap_or(&request.source.commit_oid);
     let scope_end_commit = format!("{scope_end_revision}^{{commit}}");
     let scope_end_output = run_git_command(
@@ -302,7 +309,11 @@ fn create_commit_from_tree(
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
-fn apply_review_plan(plan: ReviewPlan, verbose: bool) -> Result<ReviewPreparation, ReviewError> {
+fn apply_review_plan(
+    plan: ReviewPlan,
+    verbose: bool,
+    progress: &dyn Fn(u8),
+) -> Result<ReviewPreparation, ReviewError> {
     let ReviewPlan {
         identity,
         branch,
@@ -346,6 +357,7 @@ fn apply_review_plan(plan: ReviewPlan, verbose: bool) -> Result<ReviewPreparatio
         approved_tree = merge_auto_approved_tree(&new_base, &approved_tree, auto_parent, verbose)?;
     }
 
+    progress(80);
     let new_review = if !is_new || auto_approve_parent.is_some() {
         let message = if is_new {
             "Auto-approve earlier commits"
@@ -387,6 +399,7 @@ fn apply_review_plan(plan: ReviewPlan, verbose: bool) -> Result<ReviewPreparatio
         &[],
         verbose,
     )?;
+    progress(95);
     write_review_identity_v2(&review_branch, &identity, verbose)?;
     write_review_scope(&review_branch, &scope, verbose)?;
     Ok(ReviewPreparation {
