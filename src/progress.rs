@@ -192,11 +192,10 @@ impl WaitIndicator {
                     let percent = current.percent;
                     let line = match percent {
                         Some(percent) => format!(
-                            "\r\x1b[2K{} {} {} {}%",
+                            "\r\x1b[2K{} {} {}",
                             FRAMES[frame_index],
                             current.label,
-                            progress_bar(percent),
-                            percent
+                            progress_bar(percent)
                         ),
                         None => format!("\r{} {}", FRAMES[frame_index], current.label),
                     };
@@ -420,10 +419,10 @@ mod tests {
         indicator.complete();
 
         let output = String::from_utf8(writer.bytes()).unwrap();
-        assert!(output.contains("Preparing review branch [========>           ] 40%"));
+        assert!(output.contains("Preparing review branch [========>           ]"));
+        assert!(!output.contains("40%"));
         assert!(!output.contains("Validating review range"));
         assert!(!output.contains("\x1b]9;4;1;10\x07"));
-        assert!(!output.contains("] 10%"));
         assert!(output.contains("\x1b]9;4;1;100\x07"));
         assert!(output.ends_with("\r\x1b[2K\x1b]9;4;0;0\x07"));
     }

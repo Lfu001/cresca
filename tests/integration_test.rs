@@ -194,6 +194,7 @@ fn test_review_shows_progress_on_stderr_tty_when_stdout_is_piped() {
     assert!(stderr.contains("\x1b]9;4;1;"));
     assert!(stderr.contains("\x1b]9;4;1;100\x07"));
     assert!(stderr.contains("Preparing review branch ["));
+    assert!(!stderr.contains('%'));
     assert!(!stderr.contains("Resolving branches"));
     assert!(stderr.ends_with("\x1b]9;4;0;0\x07"));
 }
