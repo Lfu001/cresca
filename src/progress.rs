@@ -180,6 +180,7 @@ impl WaitIndicator {
             const FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
             let mut frame_index = 0;
             let mut rendered = false;
+            let mut cursor_hidden = false;
             let mut reported = None;
 
             if !stopped_before_delay {
@@ -210,6 +211,12 @@ impl WaitIndicator {
                         }
                     }
                     if config.show_line {
+                        if config.percent.is_some() && !cursor_hidden {
+                            if writer.write_all(b"\x1b[?25l").is_err() {
+                                break;
+                            }
+                            cursor_hidden = true;
+                        }
                         if writer.write_all(line.as_bytes()).is_err() {
                             break;
                         }
@@ -240,6 +247,9 @@ impl WaitIndicator {
             }
             if rendered {
                 let _ = write!(writer, "\r\x1b[2K");
+            }
+            if cursor_hidden {
+                let _ = writer.write_all(b"\x1b[?25h");
             }
             if config.report_osc && reported.is_some() {
                 let _ = writer.write_all(b"\x1b]9;4;0;0\x07");
@@ -419,11 +429,13 @@ mod tests {
         indicator.complete();
 
         let output = String::from_utf8(writer.bytes()).unwrap();
+        assert!(output.contains("\x1b[?25l"));
+        assert!(output.contains("\r\x1b[2K\x1b[?25h"));
         assert!(output.contains("Preparing review branch [========>           ]"));
         assert!(!output.contains("40%"));
         assert!(!output.contains("Validating review range"));
         assert!(!output.contains("\x1b]9;4;1;10\x07"));
         assert!(output.contains("\x1b]9;4;1;100\x07"));
-        assert!(output.ends_with("\r\x1b[2K\x1b]9;4;0;0\x07"));
+        assert!(output.ends_with("\r\x1b[2K\x1b[?25h\x1b]9;4;0;0\x07"));
     }
 }

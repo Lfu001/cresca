@@ -194,6 +194,8 @@ fn test_review_shows_progress_on_stderr_tty_when_stdout_is_piped() {
     assert!(stderr.contains("\x1b]9;4;1;"));
     assert!(stderr.contains("\x1b]9;4;1;100\x07"));
     assert!(stderr.contains("Preparing review branch ["));
+    assert!(stderr.contains("\x1b[?25l"));
+    assert!(stderr.contains("\r\x1b[2K\x1b[?25h"));
     assert!(!stderr.contains('%'));
     assert!(!stderr.contains("Resolving branches"));
     assert!(stderr.ends_with("\x1b]9;4;0;0\x07"));
@@ -217,6 +219,7 @@ fn test_review_verbose_mode_shows_only_osc_progress() {
     assert!(!stdout.contains("Preparing review branch"));
     assert!(!stderr.contains("Preparing review branch"));
     assert!(!stderr.contains("\x1b[2K"));
+    assert!(!stderr.contains("\x1b[?25l"));
     assert!(stderr.contains("\x1b]9;4;1;100\x07"));
     assert!(stderr.ends_with("\x1b]9;4;0;0\x07"));
 }
@@ -313,6 +316,10 @@ fn test_review_clears_progress_before_error_output() {
         "progress must be cleared before diagnostics: {stderr:?}"
     );
     assert!(
+        stderr.find("\x1b[?25h").unwrap() < error_position,
+        "cursor must be restored before diagnostics: {stderr:?}"
+    );
+    assert!(
         stderr.find("\x1b]9;4;0;0\x07").unwrap() < error_position,
         "terminal progress must be removed before diagnostics: {stderr:?}"
     );
@@ -338,6 +345,10 @@ fn test_review_clears_progress_before_git_error_output() {
         "progress must be cleared before Git diagnostics: {stderr:?}"
     );
     assert!(
+        stderr.find("\x1b[?25h").unwrap() < error_position,
+        "cursor must be restored before Git diagnostics: {stderr:?}"
+    );
+    assert!(
         stderr.find("\x1b]9;4;0;0\x07").unwrap() < error_position,
         "terminal progress must be removed before Git diagnostics: {stderr:?}"
     );
@@ -358,6 +369,7 @@ fn test_review_clears_progress_on_interrupt() {
         "unexpected interrupt status; stderr: {stderr:?}"
     );
     assert!(stderr.contains("⠋ Preparing review branch"));
+    assert!(stderr.contains("\x1b[?25h"));
     assert!(stderr.ends_with("\x1b]9;4;0;0\x07"));
 }
 
