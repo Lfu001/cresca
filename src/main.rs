@@ -125,15 +125,16 @@ fn run() -> Result<(), CliError> {
             };
         }
         Commands::Review(args) => {
-            let indicator = WaitIndicator::start("Preparing review branch", cli.verbose);
+            let indicator = WaitIndicator::start_review(cli.verbose);
             let preparation = prepare_review_branch(
                 &args.to,
                 &args.from,
                 args.skip_to.as_deref(),
                 args.stop_at.as_deref(),
                 cli.verbose,
+                &|percent| indicator.update(percent),
             )?;
-            indicator.finish();
+            indicator.complete();
             if !preparation.has_unreviewed_changes {
                 println!("Review branch prepared successfully. However, it seems like there are no unreviewed changes.");
             } else {

@@ -47,11 +47,20 @@ struct SlowGit {
 
 impl SlowGit {
     fn new() -> Self {
+        Self::with_materialization_failure(false)
+    }
+
+    fn with_materialization_failure(fail: bool) -> Self {
         let directory = tempfile::TempDir::new().unwrap();
         let wrapper_path = directory.path().join("git");
+        let failure = if fail {
+            "if [ \"$1\" = read-tree ] && [ \"$2\" = --reset ]; then\n  echo injected read-tree failure >&2\n  exit 1\nfi\n"
+        } else {
+            ""
+        };
         std::fs::write(
             &wrapper_path,
-            "#!/bin/sh\nif [ ! -e \"$CRESCA_SLOW_GIT_MARKER\" ]; then\n  : > \"$CRESCA_SLOW_GIT_MARKER\"\n  sleep 0.35\nfi\nPATH=\"$CRESCA_REAL_PATH\" exec git \"$@\"\n",
+            format!("#!/bin/sh\nif [ ! -e \"$CRESCA_SLOW_GIT_MARKER\" ]; then\n  : > \"$CRESCA_SLOW_GIT_MARKER\"\n  sleep 0.35\nfi\n{failure}PATH=\"$CRESCA_REAL_PATH\" exec git \"$@\"\n"),
         )
         .unwrap();
         let mut permissions = std::fs::metadata(&wrapper_path).unwrap().permissions();
@@ -182,11 +191,15 @@ fn test_review_shows_progress_on_stderr_tty_when_stdout_is_piped() {
     assert!(stdout.contains("Review branch prepared successfully"));
     assert!(!stdout.contains("Preparing review branch"));
     assert!(stderr.contains("⠋ Preparing review branch"));
-    assert!(stderr.ends_with("\r\x1b[2K"));
+    assert!(stderr.contains("\x1b]9;4;1;"));
+    assert!(stderr.contains("\x1b]9;4;1;100\x07"));
+    assert!(stderr.contains("Preparing review branch ["));
+    assert!(!stderr.contains("Resolving branches"));
+    assert!(stderr.ends_with("\x1b]9;4;0;0\x07"));
 }
 
 #[test]
-fn test_review_verbose_mode_does_not_show_progress() {
+fn test_review_verbose_mode_shows_only_osc_progress() {
     let repo = repo_with_reviewable_change("feature.txt");
     let slow_git = SlowGit::new();
 
@@ -203,6 +216,8 @@ fn test_review_verbose_mode_does_not_show_progress() {
     assert!(!stdout.contains("Preparing review branch"));
     assert!(!stderr.contains("Preparing review branch"));
     assert!(!stderr.contains("\x1b[2K"));
+    assert!(stderr.contains("\x1b]9;4;1;100\x07"));
+    assert!(stderr.ends_with("\x1b]9;4;0;0\x07"));
 }
 
 #[test]
@@ -227,6 +242,7 @@ fn test_review_non_tty_stderr_does_not_show_progress() {
     assert!(!stdout.contains("Preparing review branch"));
     assert!(!stderr.contains("Preparing review branch"));
     assert!(!stderr.contains("\x1b[2K"));
+    assert!(!stderr.contains("\x1b]9;4;"));
 }
 
 #[test]
@@ -295,6 +311,10 @@ fn test_review_clears_progress_before_error_output() {
         clear_position < error_position,
         "progress must be cleared before diagnostics: {stderr:?}"
     );
+    assert!(
+        stderr.find("\x1b]9;4;0;0\x07").unwrap() < error_position,
+        "terminal progress must be removed before diagnostics: {stderr:?}"
+    );
     assert!(stderr.contains("invalidhash"));
 }
 
@@ -316,6 +336,10 @@ fn test_review_clears_progress_before_git_error_output() {
         clear_position < error_position,
         "progress must be cleared before Git diagnostics: {stderr:?}"
     );
+    assert!(
+        stderr.find("\x1b]9;4;0;0\x07").unwrap() < error_position,
+        "terminal progress must be removed before Git diagnostics: {stderr:?}"
+    );
 }
 
 #[test]
@@ -333,7 +357,25 @@ fn test_review_clears_progress_on_interrupt() {
         "unexpected interrupt status; stderr: {stderr:?}"
     );
     assert!(stderr.contains("⠋ Preparing review branch"));
-    assert!(stderr.ends_with("\r\x1b[2K"));
+    assert!(stderr.ends_with("\x1b]9;4;0;0\x07"));
+}
+
+#[test]
+fn test_review_removes_progress_before_rollback_failure_diagnostics() {
+    let repo = repo_with_reviewable_change("feature.txt");
+    let slow_git = SlowGit::with_materialization_failure(true);
+
+    let output = run_cresca_with_stderr_pty(&repo, &["review", "main", "develop"], &slow_git);
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("Preparing review branch ["));
+    assert!(!stderr.contains("Restoring repository"));
+    let removed = stderr
+        .find("\x1b]9;4;0;0\x07")
+        .expect("terminal progress should be removed");
+    let error = stderr.find("error:").expect("Git error should be shown");
+    assert!(removed < error, "{stderr:?}");
 }
 
 fn isolated_cresca_home(repo: &TempGitRepo) -> PathBuf {
