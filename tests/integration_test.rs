@@ -1082,6 +1082,101 @@ fn test_changed_entry_beneath_restrictive_directory_is_restored() {
 }
 
 #[test]
+fn test_ignored_file_with_only_changed_permissions_is_restored() {
+    let (repo, _) = setup_linear_range();
+    add_ignored_paths(&repo, "cache/\n");
+    repo.write_file("cache/readonly.txt", "unchanged content\n");
+    std::fs::set_permissions(
+        repo.path().join("cache/readonly.txt"),
+        std::fs::Permissions::from_mode(0o444),
+    )
+    .unwrap();
+    let before = repo.snapshot();
+    let wrapper = install_git_wrapper(
+        &repo,
+        "#!/bin/sh\ncase \"$*\" in\n  *'config --local --replace-all branch.review-main-develop.cresca-scope'*)\n    \"$CRESCA_REAL_GIT\" \"$@\" || exit $?\n    /bin/chmod 644 cache/readonly.txt || exit $?\n    printf 'injected permission-only failure\\n' >&2\n    exit 63\n    ;;\nesac\nexec \"$CRESCA_REAL_GIT\" \"$@\"\n",
+    );
+
+    let output = run_cresca_with_git_wrapper(&repo, &wrapper, &["review", "main", "develop"]);
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("injected permission-only failure"),
+        "{stderr}"
+    );
+    assert!(
+        !stderr.contains("Rollback or verification also failed"),
+        "{stderr}"
+    );
+    assert_eq!(repo.snapshot(), before);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn test_failed_rereview_preserves_unchanged_immutable_ignored_file() {
+    struct ClearImmutableFlag(PathBuf);
+    impl Drop for ClearImmutableFlag {
+        fn drop(&mut self) {
+            let result = Command::new("/usr/bin/chflags")
+                .arg("nouchg")
+                .arg(&self.0)
+                .status();
+            if !matches!(result, Ok(status) if status.success()) {
+                if std::thread::panicking() {
+                    eprintln!("immutable fixture cleanup failed: {result:?}");
+                } else {
+                    panic!("immutable fixture cleanup failed: {result:?}");
+                }
+            }
+        }
+    }
+
+    let repo = TempGitRepo::new();
+    repo.git(&["remote", "remove", "origin"]);
+    repo.create_branch("develop");
+    repo.write_file("approved.txt", "approved\n");
+    repo.git(&["add", "approved.txt"]);
+    repo.commit("Add approved content");
+    let args = ["review", "refs/heads/main", "refs/heads/develop"];
+    assert!(repo.run_cresca(&args).status.success());
+    repo.git(&["add", "approved.txt"]);
+    assert!(repo.run_cresca(&["approve"]).status.success());
+
+    std::fs::write(repo.git_path("info/exclude"), "cache/\n").unwrap();
+    repo.write_file("cache/locked.bin", "unchanged cached content\n");
+    let path = repo.path().join("cache/locked.bin");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let _flag_guard = ClearImmutableFlag(path.clone());
+    assert!(Command::new("/usr/bin/chflags")
+        .arg("uchg")
+        .arg(&path)
+        .status()
+        .unwrap()
+        .success());
+    assert!(std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).is_err());
+    let before = repo.snapshot();
+    let wrapper = install_git_wrapper(
+        &repo,
+        "#!/bin/sh\ncase \" $* \" in\n  *' merge-tree '*' -Xours '*)\n    printf 'injected preparation failure\\n' >&2\n    exit 63\n    ;;\nesac\nexec \"$CRESCA_REAL_GIT\" \"$@\"\n",
+    );
+
+    let output = run_cresca_with_git_wrapper(&repo, &wrapper, &args);
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("reconstruct approved tree"), "{stderr}");
+    assert!(stderr.contains("injected preparation failure"), "{stderr}");
+    assert!(
+        !stderr.contains("Rollback or verification also failed"),
+        "{stderr}"
+    );
+    // Includes review refs, metadata, raw index, worktree contents and modes.
+    assert_eq!(repo.snapshot(), before);
+    assert!(std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).is_err());
+}
+
+#[test]
 fn test_failed_backup_copy_restores_widened_file_mode_and_continues() {
     let (repo, _) = setup_linear_range();
     add_ignored_paths(&repo, "copy-failure/\n");
