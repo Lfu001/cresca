@@ -1120,19 +1120,21 @@ fn reconcile_worktree(
             Entry::Directory { .. } | Entry::Other { .. } => {}
             Entry::File { mode } => {
                 let mut widened_existing_file = false;
-                let existing_regular = matches!(
-                    fs::symlink_metadata(&path),
-                    Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink()
-                );
-                if existing_regular {
+                let existing_regular = fs::symlink_metadata(&path)
+                    .ok()
+                    .filter(|metadata| metadata.is_file() && !metadata.file_type().is_symlink());
+                if let Some(metadata) = existing_regular {
                     if matches!(files_equal(&path, &backup_root.join(relative)), Ok(true)) {
-                        if let Err(error) =
-                            fs::set_permissions(&path, fs::Permissions::from_mode(*mode))
-                        {
-                            diagnostics.push(format!(
-                                "restore mode for `{}`: {error}",
-                                relative.display()
-                            ));
+                        // Even a no-op chmod can fail on an immutable file.
+                        if metadata.mode() != *mode {
+                            if let Err(error) =
+                                fs::set_permissions(&path, fs::Permissions::from_mode(*mode))
+                            {
+                                diagnostics.push(format!(
+                                    "restore mode for `{}`: {error}",
+                                    relative.display()
+                                ));
+                            }
                         }
                         continue;
                     }
