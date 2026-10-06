@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.1](https://github.com/Lfu001/cresca/compare/v0.7.0...v0.7.1) - 2026-10-06
+
+### Fixed
+
+- *(review)* skip unchanged file permissions during rollback ([#36](https://github.com/Lfu001/cresca/pull/36))
+
 ## [0.7.0](https://github.com/Lfu001/cresca/compare/v0.6.1...v0.7.0) - 2026-09-24
 
 ### Added
