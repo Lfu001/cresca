@@ -2362,10 +2362,15 @@ fn test_review_rejects_duplicate_metadata_matches_without_mutation() {
 }
 
 #[test]
-fn test_review_naming_hook_creates_non_prefixed_branch_and_receives_arguments() {
+fn test_review_naming_hook_creates_non_prefixed_branch_and_receives_json() {
     let (repo, _) = setup_linear_range();
     let home = cresca_home_with_naming_hook(
-        b"#!/bin/sh\n[ \"$1\" = fixed ] || exit 31\nprintf '%s-into-%s\\n' \"$2\" \"$3\"\n",
+        br#"#!/bin/sh
+[ "$#" = 1 ] && [ "$1" = fixed ] || exit 31
+input=$(cat)
+[ "$input" = '{"request":{},"branches":{"target":"main","source":"develop"},"metadata":{}}' ] || exit 32
+printf 'develop-into-main\n'
+"#,
         &["fixed"],
     );
 

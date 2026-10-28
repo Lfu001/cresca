@@ -1,9 +1,11 @@
-use crate::branch_naming::{resolve_new_review_branch_name, ReviewNamingInput};
+use crate::branch_naming::resolve_new_review_branch_name;
 use crate::branch_ref::{resolve_branch, resolve_existing_anchor};
 use crate::git::{
     is_clean, read_review_scope, run_git_command, run_git_command_machine_output,
     write_review_scope, ReviewScope, ReviewScopeError,
 };
+use crate::hooks::ReviewHookData;
+use crate::pr_resolution::resolve_pr;
 use crate::review::{
     find_unique_merge_base, reconstruct_approval_tree, ReviewError, ReviewPreparation,
     ReviewTransaction,
@@ -30,18 +32,14 @@ struct ReviewPlan {
     scope: ReviewScope,
 }
 
-/// Prepare a review branch with explicit approval-tree reconstruction.
-///
-/// # Arguments
-///
-/// * `to_branch` - The branch where the PR is planned to be merged into.
-/// * `from_branch` - The development branch to be reviewed.
-/// * `skip_to` - Optional commit hash to skip to (auto-approve earlier commits).
-/// * `stop_at` - Optional commit hash to stop at (exclude later commits from review).
-/// * `verbose` - Whether to print the git command and its output.
+pub enum ReviewInput<'a> {
+    Branches { target: &'a str, source: &'a str },
+    Pr(&'a str),
+}
+
+/// Resolve invocation context, then use the shared review identity and approval path.
 pub fn prepare_review_branch(
-    to_branch: &str,
-    from_branch: &str,
+    input: ReviewInput<'_>,
     skip_to: Option<&str>,
     stop_at: Option<&str>,
     verbose: bool,
@@ -54,6 +52,30 @@ pub fn prepare_review_branch(
         ))
     })?;
 
+    ensure_clean_review_worktree(verbose)?;
+    let hook_data = match input {
+        ReviewInput::Branches { target, source } => ReviewHookData::positional(target, source),
+        ReviewInput::Pr(identifier) => {
+            let data = resolve_pr(identifier, verbose)
+                .map_err(|error| ReviewError::Message(error.to_string()))?;
+            // A trusted resolver can change Git state or files; recheck before preparation.
+            std::env::set_current_dir(&root).map_err(|error| {
+                ReviewError::Message(format!("failed to return to repository root: {error}"))
+            })?;
+            ensure_clean_review_worktree(verbose)?;
+            data
+        }
+    };
+
+    progress(10);
+    let plan = prepare_review_plan(&hook_data, skip_to, stop_at, verbose, progress)?;
+    progress(50);
+    let mut transaction = ReviewTransaction::begin(root, verbose)?;
+    progress(65);
+    transaction.execute(|| apply_review_plan(plan, verbose, progress))
+}
+
+fn ensure_clean_review_worktree(verbose: bool) -> Result<(), ReviewError> {
     if !is_clean(verbose)? {
         return Err(ReviewError::Message(
             "Uncommitted changes found. Please commit or stash them before starting review."
@@ -61,22 +83,18 @@ pub fn prepare_review_branch(
         ));
     }
 
-    progress(10);
-    let plan = prepare_review_plan(to_branch, from_branch, skip_to, stop_at, verbose, progress)?;
-    progress(50);
-    let mut transaction = ReviewTransaction::begin(root, verbose)?;
-    progress(65);
-    transaction.execute(|| apply_review_plan(plan, verbose, progress))
+    Ok(())
 }
 
 fn prepare_review_plan(
-    to_branch: &str,
-    from_branch: &str,
+    hook_data: &ReviewHookData,
     skip_to: Option<&str>,
     stop_at: Option<&str>,
     verbose: bool,
     progress: &dyn Fn(u8),
 ) -> Result<ReviewPlan, ReviewError> {
+    let to_branch = hook_data.branches.target.as_str();
+    let from_branch = hook_data.branches.source.as_str();
     let resolved_to = resolve_branch(to_branch, verbose)?;
     let resolved_from = resolve_branch(from_branch, verbose)?;
     progress(30);
@@ -112,14 +130,8 @@ fn prepare_review_plan(
             PlannedReviewBranch::Existing(existing.branch),
         ),
         ReviewSelection::New { identity } => {
-            let base = resolve_new_review_branch_name(
-                ReviewNamingInput {
-                    target: to_branch,
-                    source: from_branch,
-                },
-                verbose,
-            )
-            .map_err(|error| ReviewError::Message(error.to_string()))?;
+            let base = resolve_new_review_branch_name(hook_data, verbose)
+                .map_err(|error| ReviewError::Message(error.to_string()))?;
             let branch = allocate_new_review_branch(&base, &identity, verbose)
                 .map_err(map_selection_error)?;
             (identity, PlannedReviewBranch::New(branch))

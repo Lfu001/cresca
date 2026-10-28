@@ -2,6 +2,8 @@ mod branch_naming;
 mod branch_ref;
 mod commands;
 mod git;
+mod hooks;
+mod pr_resolution;
 mod progress;
 mod review;
 mod review_identity;
@@ -9,7 +11,7 @@ mod review_identity;
 use clap::builder::styling::{AnsiColor, Effects};
 use clap::{builder::Styles, ArgAction, Args, Parser, Subcommand};
 use colored::Colorize;
-use commands::{approve_changes, get_review_status, prepare_review_branch};
+use commands::{approve_changes, get_review_status, prepare_review_branch, ReviewInput};
 use git::{current_branch_name, current_review_metadata, read_review_scope, ReviewScopeError};
 use progress::WaitIndicator;
 use review_identity::{ReviewIdentityReadError, ReviewSide, StoredReviewIdentity};
@@ -74,9 +76,18 @@ enum Commands {
 #[derive(Args)]
 struct ReviewArgs {
     /// Target as a plain branch name, `refs/heads/<name>`, or `<remote>/<name>`.
-    to: String,
+    #[arg(
+        required_unless_present = "pr",
+        requires = "from",
+        conflicts_with = "pr"
+    )]
+    to: Option<String>,
     /// Source as a plain branch name, `refs/heads/<name>`, or `<remote>/<name>`.
-    from: String,
+    #[arg(required_unless_present = "pr", requires = "to", conflicts_with = "pr")]
+    from: Option<String>,
+    /// Resolve a provider-specific PR identifier using the configured PR hook.
+    #[arg(long, value_parser = clap::builder::NonEmptyStringValueParser::new())]
+    pr: Option<String>,
     /// Skip to this commit (auto-approve earlier commits).
     /// Use `git log --oneline <to>..<from>` to see available commits.
     #[arg(long = "skip-to")]
@@ -126,9 +137,13 @@ fn run() -> Result<(), CliError> {
         }
         Commands::Review(args) => {
             let indicator = WaitIndicator::start_review(cli.verbose);
+            let input = match (&args.pr, &args.to, &args.from) {
+                (Some(pr), None, None) => ReviewInput::Pr(pr),
+                (None, Some(target), Some(source)) => ReviewInput::Branches { target, source },
+                _ => unreachable!("clap validates the two exclusive review input modes"),
+            };
             let preparation = prepare_review_branch(
-                &args.to,
-                &args.from,
+                input,
                 args.skip_to.as_deref(),
                 args.stop_at.as_deref(),
                 cli.verbose,
