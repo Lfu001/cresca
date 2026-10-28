@@ -34,7 +34,7 @@ Also You need to have `git` installed.
 
 ## Documentation
 
-See [Advanced Usage](docs/advanced-usage.md) for review range options, review progress, and custom review branch naming.
+See [Advanced Usage](docs/advanced-usage.md) for reviewing by PR identifier with `--pr`, review range options, review progress, and custom review branch naming.
 
 ## License
 
