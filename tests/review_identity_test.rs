@@ -96,6 +96,95 @@ fn clean_and_switch(repo: &TempGitRepo, branch: &str) {
     repo.switch_branch(branch);
 }
 
+#[test]
+fn candidate_scan_preserves_config_value_and_branch_name_semantics() {
+    for (versions, reuse) in [
+        (vec!["2"], true),
+        (vec!["2\r"], true),
+        (vec!["2\n"], false),
+        (vec!["2", "2"], false),
+        (vec![""], false),
+    ] {
+        let repo = TempGitRepo::new();
+        repo.create_branch("dev");
+        repo.write_file("change.txt", "change\n");
+        repo.git(&["add", "."]);
+        repo.commit("Add local change");
+        repo.switch_branch("main");
+        let args = ["review", "refs/heads/main", "refs/heads/dev"];
+        assert_cresca_success(&repo.run_cresca(&args));
+        approve_all(&repo);
+
+        let review = "Review.Mixed.cresca-version/quote\"日本語";
+        repo.git(&["branch", "-m", review]);
+        let version_key = format!("branch.{review}.cresca-version");
+        repo.git(&["config", "--unset-all", &version_key]);
+        for version in &versions {
+            repo.git(&["config", "--add", &version_key, version]);
+        }
+        // The old per-key reader splits multiline values and retains duplicates.
+        repo.git(&[
+            "config",
+            "--replace-all",
+            &format!("branch.{review}.cresca-source-anchor"),
+            "refs/heads/dev\nrefs/heads/dev",
+        ]);
+        repo.git(&[
+            "config",
+            "--add",
+            &format!("branch.{review}.cresca-source-anchor"),
+            "refs/heads/dev",
+        ]);
+        // Subsection names remain case-sensitive, and config without a live ref
+        // must not become an extra review candidate.
+        repo.git(&[
+            "config",
+            "--add",
+            &format!("branch.{}.cresca-version", review.to_lowercase()),
+            "99",
+        ]);
+        write_version_one_identity(&repo, "orphan", "refs/heads/main", "refs/heads/dev");
+        repo.switch_branch("main");
+
+        assert_cresca_success(&repo.run_cresca(&args));
+        assert_eq!(
+            repo.current_branch() == review,
+            reuse,
+            "versions: {versions:?}"
+        );
+        assert_eq!(
+            repo.git(&["status", "--porcelain"]).stdout.is_empty(),
+            reuse
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn candidate_scan_reads_config_once_for_unrelated_branches() {
+    let repo = TempGitRepo::new();
+    repo.git(&["branch", "dev"]);
+    for number in 0..20 {
+        repo.git(&["branch", &format!("unrelated-{number}")]);
+    }
+    let (wrapper, real_git) = install_git_wrapper(
+        b"#!/bin/sh\ncase \"$*\" in\n  *'--get-all branch.unrelated-'*) exit 97 ;;\nesac\nif [ \"$*\" = 'config --local --null --list' ]; then\n  printf 'snapshot\\n' >> \"$CRESCA_CONFIG_READ_LOG\"\nfi\nexec \"$CRESCA_REAL_GIT\" \"$@\"\n",
+    );
+    let log = wrapper.path().join("reads");
+    let home = tempfile::TempDir::new().unwrap();
+    let output = Command::new(TempGitRepo::cresca_binary())
+        .args(["review", "refs/heads/main", "refs/heads/dev"])
+        .env("HOME", home.path())
+        .env("PATH", wrapper.path())
+        .env("CRESCA_REAL_GIT", real_git)
+        .env("CRESCA_CONFIG_READ_LOG", &log)
+        .current_dir(repo.path())
+        .output()
+        .unwrap();
+    assert_cresca_success(&output);
+    assert_eq!(std::fs::read_to_string(log).unwrap(), "snapshot\n");
+}
+
 fn setup_version_one_approved_review(target: &str, source: &str) -> (TempGitRepo, String) {
     let repo = TempGitRepo::new();
     repo.create_branch(source);

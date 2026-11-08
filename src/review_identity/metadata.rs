@@ -132,12 +132,49 @@ pub fn load_review_candidates(verbose: bool) -> Result<Vec<StoredReview>, Review
                 .to_string(),
         )
     })?;
+    let config = run_git_command_machine_output(
+        "read review metadata",
+        &["config", "--local", "--null", "--list"],
+        &[],
+        verbose,
+    )?;
+    let mut fields_by_branch: BTreeMap<&str, BTreeMap<String, Vec<String>>> = BTreeMap::new();
+    for record in config.stdout.split(|byte| *byte == 0) {
+        let mut parts = record.splitn(2, |byte| *byte == b'\n');
+        let key = parts.next().unwrap_or_default();
+        let Ok(key) = std::str::from_utf8(key) else {
+            // Candidate branch names were validated as UTF-8 above.
+            continue;
+        };
+        let Some((branch, field)) = key
+            .strip_prefix("branch.")
+            .and_then(|key| key.rsplit_once(".cresca-"))
+        else {
+            continue;
+        };
+        if !V2_FIELDS.contains(&field) && !["target", "source"].contains(&field) {
+            continue;
+        }
+        // Match the existing --get-all reader, including its treatment of empty,
+        // multiline, CRLF and non-UTF-8 values. Git appends a newline to each value.
+        let mut value = parts.next().unwrap_or_default().to_vec();
+        value.push(b'\n');
+        fields_by_branch
+            .entry(branch)
+            .or_default()
+            .entry(field.to_string())
+            .or_default()
+            .extend(String::from_utf8_lossy(&value).lines().map(str::to_owned));
+    }
     load_candidates_from_branches(
         branches
             .lines()
             .filter(|branch| !branch.is_empty())
             .map(str::to_string),
-        |branch| read_stored_review_identity(branch, verbose),
+        |branch| match fields_by_branch.get(branch) {
+            Some(fields) => decode_stored_fields(fields),
+            None => Err(ReviewIdentityReadError::Missing),
+        },
     )
 }
 
