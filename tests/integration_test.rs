@@ -5324,7 +5324,7 @@ fn test_review_fails_closed_when_metadata_config_read_fails() {
     let shim_dir = tempfile::TempDir::new().expect("git shim directory should be created");
     let shim_path = shim_dir.path().join("git");
     let shim = format!(
-        "#!/bin/sh\nif [ \"$1\" = config ] && [ \"$2\" = --local ] && [ \"$3\" = --get-all ] && [ \"$4\" = branch.review-main-develop.cresca-version ]; then\n  echo injected metadata read failure >&2\n  exit 2\nfi\nexec '{git_path}' \"$@\"\n"
+        "#!/bin/sh\nif [ \"$1\" = config ] && [ \"$2\" = --local ] && [ \"$3\" = --null ] && [ \"$4\" = --list ]; then\n  echo injected metadata read failure >&2\n  exit 2\nfi\nexec '{git_path}' \"$@\"\n"
     );
     std::fs::write(&shim_path, shim).expect("git shim should be writable");
     let mut permissions = std::fs::metadata(&shim_path)
