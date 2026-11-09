@@ -492,6 +492,90 @@ fn add_ignored_paths(repo: &TempGitRepo, patterns: &str) {
     repo.git(&["push", "origin", "main"]);
 }
 
+#[test]
+fn test_review_restores_every_ignored_backup_after_late_failure() {
+    let (repo, _) = setup_linear_range();
+    add_ignored_paths(&repo, "cache/\n");
+    for number in 0..128 {
+        repo.write_file(
+            &format!("cache/group-{}/file-{number}", number / 16),
+            &format!("original contents {number}\n"),
+        );
+    }
+    std::fs::set_permissions(
+        repo.path().join("cache/group-0/file-0"),
+        std::fs::Permissions::from_mode(0o444),
+    )
+    .unwrap();
+    std::fs::set_permissions(
+        repo.path().join("cache/group-7/file-127"),
+        std::fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+    std::fs::create_dir(repo.path().join("cache/empty")).unwrap();
+    std::os::unix::fs::symlink("group-0/file-0", repo.path().join("cache/link")).unwrap();
+    let before = repo.snapshot();
+    let wrapper = install_git_wrapper(
+        &repo,
+        "#!/bin/sh\nif [ \"$1\" = read-tree ] && [ \"$2\" = --reset ]; then\n  \"$CRESCA_REAL_GIT\" \"$@\" || exit $?\n  /bin/rm -rf cache\n  printf 'late failure after removing ignored files\\n' >&2\n  exit 65\nfi\nexec \"$CRESCA_REAL_GIT\" \"$@\"\n",
+    );
+
+    let output = run_cresca_with_git_wrapper(&repo, &wrapper, &["review", "main", "develop"]);
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("late failure after removing ignored files"),
+        "{stderr}"
+    );
+    assert_eq!(repo.snapshot(), before);
+    assert!(std::fs::read_dir(repo.path().join(".git"))
+        .unwrap()
+        .all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with("cresca-review-")
+        }));
+}
+
+#[test]
+fn test_backup_copy_failure_joins_workers_before_scratch_cleanup() {
+    if unsafe { libc::geteuid() } == 0 {
+        return; // Root can read the deliberately unreadable file.
+    }
+    let (repo, _) = setup_linear_range();
+    add_ignored_paths(&repo, "cache/\n");
+    for number in 0..128 {
+        repo.write_file(&format!("cache/file-{number:03}"), "original contents\n");
+    }
+    let before = repo.snapshot();
+    let unreadable = repo.path().join("cache/file-000");
+    let permissions = std::fs::metadata(&unreadable).unwrap().permissions();
+    std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+    let output = repo.run_cresca(&["review", "main", "develop"]);
+
+    std::fs::set_permissions(&unreadable, permissions).unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("failed to stream worktree backup"),
+        "{stderr}"
+    );
+    assert_eq!(repo.snapshot(), before);
+    assert!(std::fs::read_dir(repo.path().join(".git"))
+        .unwrap()
+        .all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with("cresca-review-")
+        }));
+}
+
 #[derive(Debug, PartialEq, Eq)]
 enum TreeEntry {
     Directory(u32),

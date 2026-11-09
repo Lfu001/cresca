@@ -493,24 +493,51 @@ impl ReviewTransaction {
             ReviewError::Message(format!("failed to snapshot worktree: {error}"))
         })?;
         let backup_root = scratch.path().join("worktree");
+        let mut backup_directories = BTreeSet::new();
+        let mut files = Vec::new();
         for (relative, entry) in &worktree {
             if matches!(entry, Entry::File { .. }) {
                 let destination = backup_root.join(relative);
                 if let Some(parent) = destination.parent() {
-                    fs::create_dir_all(parent).map_err(|error| {
-                        ReviewError::Message(format!(
-                            "failed to create worktree backup directory: {error}"
-                        ))
-                    })?;
+                    if !backup_directories.contains(parent) {
+                        fs::create_dir_all(parent).map_err(|error| {
+                            ReviewError::Message(format!(
+                                "failed to create worktree backup directory: {error}"
+                            ))
+                        })?;
+                        backup_directories.insert(parent.to_path_buf());
+                    }
                 }
-                fs::copy(root.join(relative), destination).map_err(|error| {
+                files.push(relative);
+            }
+        }
+        let copy_files = |paths: &[&PathBuf]| -> Result<(), ReviewError> {
+            for relative in paths {
+                fs::copy(root.join(relative), backup_root.join(relative)).map_err(|error| {
                     ReviewError::Message(format!(
                         "failed to stream worktree backup for `{}`: {error}",
                         relative.display()
                     ))
                 })?;
             }
-        }
+            Ok(())
+        };
+        // Bound filesystem concurrency and join every worker before mutation or
+        // scratch cleanup, including when one of the copies fails.
+        std::thread::scope(|scope| -> Result<(), ReviewError> {
+            let mut workers = Vec::new();
+            for chunk in files.chunks(files.len().div_ceil(4).max(1)) {
+                let copy_files = &copy_files;
+                match std::thread::Builder::new().spawn_scoped(scope, move || copy_files(chunk)) {
+                    Ok(worker) => workers.push(worker),
+                    Err(_) => copy_files(chunk)?,
+                }
+            }
+            for worker in workers {
+                worker.join().expect("worktree backup worker panicked")?;
+            }
+            Ok(())
+        })?;
 
         Ok(Self {
             root,
