@@ -13,7 +13,7 @@ publish = true
 publish_no_verify = false
 publish_timeout = "10m"
 release_always = false
-release_commits = '(?m)^(?:(?:feat|fix)(?:\([^)]+\))?!?:|[a-z][a-z0-9-]*(?:\([^)]+\))?!:|BREAKING[ -]CHANGE:)'
+release_commits = '(?m)^(?:(?:feat|fix|perf)(?:\([^)]+\))?!?:|[a-z][a-z0-9-]*(?:\([^)]+\))?!:|BREAKING[ -]CHANGE:)'
 semver_check = false
 
 [changelog]
