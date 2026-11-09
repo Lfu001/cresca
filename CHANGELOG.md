@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.1](https://github.com/Lfu001/cresca/compare/v0.8.0...v0.8.1) - 2026-11-09
+
+### Fixed
+
+- *(ci)* include performance changes in release triggers ([#42](https://github.com/Lfu001/cresca/pull/42))
+
+### Other
+
+- *(review)* batch candidate metadata reads ([#40](https://github.com/Lfu001/cresca/pull/40))
+- *(review)* bound and parallelize worktree backup copies ([#41](https://github.com/Lfu001/cresca/pull/41))
+
 ## [0.8.0](https://github.com/Lfu001/cresca/compare/v0.7.1...v0.8.0) - 2026-10-28
 
 ### Added
